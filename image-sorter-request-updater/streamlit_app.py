@@ -24,6 +24,32 @@ st.set_page_config(
     layout="wide"
 )
 
+
+def check_password():
+    """パスワード認証"""
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    if st.session_state.authenticated:
+        return True
+
+    st.title("🔐 ログイン")
+    password = st.text_input("パスワードを入力してください", type="password")
+
+    if st.button("ログイン", type="primary"):
+        if password == st.secrets.get("password", ""):
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("パスワードが正しくありません")
+
+    return False
+
+
+# 認証チェック
+if not check_password():
+    st.stop()
+
 # 定数
 RAKUTEN_RMS_SHEET = "Rakuten RMS"
 IRAI_BUN_SHEET = "依頼分"
