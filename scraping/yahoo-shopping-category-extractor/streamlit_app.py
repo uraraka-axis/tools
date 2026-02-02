@@ -386,6 +386,9 @@ class YahooCategoryScraper:
         # 現在のカテゴリIDの最後の部分を取得（フィルタリング用）
         current_last_id = self.get_last_category_id(current_category_id) if current_category_id else ""
 
+        # 現在のカテゴリパスの階層数（親カテゴリ除外用）
+        current_depth = len(current_category_id.split('/')) if current_category_id else 0
+
         # カテゴリリンクのパターン: /category/数字/list または /category/数字/数字/list など
         category_pattern = re.compile(r'/category/([\d/]+)/list')
 
@@ -398,6 +401,13 @@ class YahooCategoryScraper:
 
             category_path = match.group(1).rstrip('/')
             last_id = self.get_last_category_id(category_path)
+
+            # カテゴリパスの階層数
+            link_depth = len(category_path.split('/'))
+
+            # 親カテゴリ（階層が浅い）は除外
+            if link_depth <= current_depth:
+                continue
 
             # 自分自身は除外
             if last_id == current_last_id:
@@ -431,11 +441,16 @@ class YahooCategoryScraper:
 
             # 件数を取得（リンクの近くにある数字）
             count = 0
-            count_text = link.find_next(string=re.compile(r'[\d,]+件?'))
-            if count_text:
-                count_match = re.search(r'([\d,]+)', count_text)
-                if count_match:
-                    count = int(count_match.group(1).replace(',', ''))
+            try:
+                count_text = link.find_next(string=re.compile(r'[\d,]+件?'))
+                if count_text:
+                    count_match = re.search(r'([\d,]+)', str(count_text))
+                    if count_match:
+                        count_str = count_match.group(1).replace(',', '')
+                        if count_str:
+                            count = int(count_str)
+            except (ValueError, AttributeError):
+                count = 0
 
             subcategories.append({
                 'name': name,
@@ -837,34 +852,13 @@ def main():
                 help="1〜10階層まで指定可能"
             )
 
-    # 停止リクエスト用セッションステート
-    if "stop_requested" not in st.session_state:
-        st.session_state.stop_requested = False
-
     # ボタンエリア
-    col1, col2, col3 = st.columns([1, 1, 4])
-
-    with col1:
-        start_disabled = st.session_state.is_running
-        start_clicked = st.button("🚀 抽出開始", disabled=start_disabled, type="primary", use_container_width=True)
-
-    with col2:
-        # 停止ボタン（チェックボックス方式で処理中も操作可能）
-        stop_requested = st.checkbox(
-            "⏹ 停止リクエスト",
-            value=st.session_state.stop_requested,
-            disabled=not st.session_state.is_running,
-            help="チェックすると次のページ取得後に停止します"
-        )
-        if stop_requested != st.session_state.stop_requested:
-            st.session_state.stop_requested = stop_requested
-            if st.session_state.scraper and stop_requested:
-                st.session_state.scraper.stop()
+    start_disabled = st.session_state.is_running
+    start_clicked = st.button("🚀 抽出開始", disabled=start_disabled, type="primary")
 
     # 抽出処理
     if start_clicked and url:
         st.session_state.is_running = True
-        st.session_state.stop_requested = False
         st.session_state.excel_data = None
         st.session_state.log_messages = []
         st.session_state.total_categories = 0
@@ -880,32 +874,24 @@ def main():
         def update_progress(count, path):
             st.session_state.total_categories = count
             status_text.text(f"取得中: {count}件 | {' > '.join(path)}")
-            # 停止リクエストをチェック
-            if st.session_state.stop_requested:
-                scraper.stop()
 
         try:
-            with st.spinner("カテゴリを取得中...（停止するには上のチェックボックスをON）"):
+            with st.spinner("カテゴリを取得中..."):
                 categories = scraper.scrape(url, max_depth=depth, progress_callback=update_progress)
 
             st.session_state.log_messages = scraper.log_messages
 
-            if scraper.stop_flag:
-                st.warning(f"⏹ 停止しました（{len(categories)}件取得済み）")
-            elif categories:
-                st.success(f"✅ {len(categories)}件のカテゴリを取得しました！")
-            else:
-                st.warning("カテゴリが取得できませんでした")
-
             if categories:
                 st.session_state.excel_data = scraper.export_to_excel()
                 st.session_state.total_categories = len(categories)
+                st.success(f"✅ {len(categories)}件のカテゴリを取得しました！")
+            else:
+                st.warning("カテゴリが取得できませんでした")
 
         except Exception as e:
             st.error(f"エラーが発生しました: {e}")
         finally:
             st.session_state.is_running = False
-            st.session_state.stop_requested = False
             st.rerun()
 
     elif start_clicked and not url:
