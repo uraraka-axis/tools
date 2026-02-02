@@ -138,6 +138,18 @@ def get_sheet_id(sheets_service, file_id: str, sheet_name: str) -> Optional[int]
         return None
 
 
+def list_all_sheets(sheets_service, file_id: str) -> List[str]:
+    """スプレッドシート内の全シート名を取得"""
+    try:
+        spreadsheet = sheets_service.spreadsheets().get(
+            spreadsheetId=file_id
+        ).execute()
+
+        return [sheet['properties']['title'] for sheet in spreadsheet['sheets']]
+    except Exception as e:
+        return [f"エラー: {e}"]
+
+
 def download_file_from_drive(drive_service, file_id: str) -> bytes:
     """Google Driveからファイルをダウンロード"""
     request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
@@ -228,32 +240,53 @@ def parse_input_file(df: pd.DataFrame, log_container) -> List[Dict]:
     return data_list
 
 
-def list_files_in_folder(drive_service, folder_id: str) -> Dict[str, Dict]:
+def list_files_in_folder(drive_service, folder_id: str, include_modified_time: bool = False) -> Dict[str, Dict]:
     """フォルダ内のファイル一覧を取得"""
     files = {}
     page_token = None
+
+    fields = 'nextPageToken, files(id, name, mimeType'
+    if include_modified_time:
+        fields += ', modifiedTime'
+    fields += ')'
 
     while True:
         response = drive_service.files().list(
             q=f"'{folder_id}' in parents and trashed=false",
             spaces='drive',
-            fields='nextPageToken, files(id, name, mimeType)',
+            fields=fields,
             pageToken=page_token,
             supportsAllDrives=True,
             includeItemsFromAllDrives=True
         ).execute()
 
         for file in response.get('files', []):
-            files[file['name']] = {
+            file_data = {
                 'id': file['id'],
                 'mimeType': file['mimeType']
             }
+            if include_modified_time:
+                file_data['modifiedTime'] = file.get('modifiedTime', '')
+            files[file['name']] = file_data
 
         page_token = response.get('nextPageToken')
         if not page_token:
             break
 
     return files
+
+
+def get_file_modified_time(drive_service, file_id: str) -> str:
+    """ファイルの更新日時を取得"""
+    try:
+        file_info = drive_service.files().get(
+            fileId=file_id,
+            fields='modifiedTime',
+            supportsAllDrives=True
+        ).execute()
+        return file_info.get('modifiedTime', '')
+    except Exception:
+        return ''
 
 
 def get_parent_folder_id(drive_service, folder_id: str) -> Optional[str]:
@@ -312,20 +345,22 @@ def copy_images(drive_service, data_list: List[Dict], input_folder_id: str,
         'total': len(data_list),
         'success': 0,
         'not_found': 0,
-        'failed': 0
+        'failed': 0,
+        'skipped': 0
     }
 
     success_comic_nos = []
 
     log_message(f"📋 処理対象: {len(data_list)}件", log_container)
 
-    # 入力フォルダのファイル一覧を取得
+    # 入力フォルダのファイル一覧を取得（更新日時付き）
     log_message("📁 入力フォルダのファイル一覧を取得中...", log_container)
-    input_files = list_files_in_folder(drive_service, input_folder_id)
+    input_files = list_files_in_folder(drive_service, input_folder_id, include_modified_time=True)
     log_message(f"   {len(input_files)}ファイル発見", log_container)
 
-    # フォルダキャッシュ
+    # フォルダキャッシュ（フォルダIDと既存ファイル一覧）
     folder_cache = {}
+    dest_files_cache = {}
 
     log_message("🚀 コピー開始...", log_container)
 
@@ -363,10 +398,43 @@ def copy_images(drive_service, data_list: List[Dict], input_folder_id: str,
                         dest_folder_id = main_folder_id
 
                     folder_cache[cache_key] = dest_folder_id
+                    # 出力先フォルダの既存ファイル一覧を取得（更新日時付き）
+                    dest_files_cache[cache_key] = list_files_in_folder(
+                        drive_service, dest_folder_id, include_modified_time=True
+                    )
 
                 dest_folder_id = folder_cache[cache_key]
+                dest_files = dest_files_cache[cache_key]
             else:
                 dest_folder_id = output_folder_id
+                cache_key = "_root_"
+                if cache_key not in dest_files_cache:
+                    dest_files_cache[cache_key] = list_files_in_folder(
+                        drive_service, output_folder_id, include_modified_time=True
+                    )
+                dest_files = dest_files_cache[cache_key]
+
+            # 出力先に同名ファイルが存在するかチェック
+            if source_name in dest_files:
+                source_modified = source_file.get('modifiedTime', '')
+                dest_modified = dest_files[source_name].get('modifiedTime', '')
+
+                # 日付比較（ISO 8601形式なので文字列比較で可）
+                if source_modified and dest_modified and source_modified <= dest_modified:
+                    # ソースが同じか古い場合はスキップ
+                    stats['skipped'] += 1
+                    success_comic_nos.append(comic_no)  # スキップしてもコミックNoは成功扱い
+                    progress_bar.progress(i / stats['total'])
+                    continue
+                else:
+                    # ソースが新しい場合は古いファイルを削除
+                    try:
+                        drive_service.files().delete(
+                            fileId=dest_files[source_name]['id'],
+                            supportsAllDrives=True
+                        ).execute()
+                    except Exception:
+                        pass  # 削除失敗しても続行
 
             # ファイルをコピー
             file_metadata = {
@@ -374,11 +442,18 @@ def copy_images(drive_service, data_list: List[Dict], input_folder_id: str,
                 'parents': [dest_folder_id]
             }
 
-            drive_service.files().copy(
+            new_file = drive_service.files().copy(
                 fileId=source_file['id'],
                 body=file_metadata,
                 supportsAllDrives=True
             ).execute()
+
+            # キャッシュを更新
+            dest_files[source_name] = {
+                'id': new_file['id'],
+                'mimeType': new_file.get('mimeType', ''),
+                'modifiedTime': source_file.get('modifiedTime', '')
+            }
 
             stats['success'] += 1
             success_comic_nos.append(comic_no)
@@ -393,7 +468,7 @@ def copy_images(drive_service, data_list: List[Dict], input_folder_id: str,
 
         progress_bar.progress(i / stats['total'])
 
-    log_message(f"✅ 完了: 成功={stats['success']}, 未発見={stats['not_found']}, 失敗={stats['failed']}", log_container)
+    log_message(f"✅ 完了: 成功={stats['success']}, スキップ={stats['skipped']}, 未発見={stats['not_found']}, 失敗={stats['failed']}", log_container)
     return stats, success_comic_nos
 
 
@@ -816,6 +891,10 @@ def main():
             log_message("📥 処理開始", log_container)
             log_message("=" * 50, log_container)
             log_message(f"📋 スプレッドシートID: {spreadsheet_id}", log_container)
+
+            # スプレッドシートのシート一覧を確認
+            available_sheets = list_all_sheets(sheets_service, spreadsheet_id)
+            log_message(f"📑 利用可能なシート: {available_sheets}", log_container)
 
             # 入力ファイル読み込み
             input_df = get_input_data(drive_service, input_file_id, log_container)
