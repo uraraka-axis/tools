@@ -231,9 +231,19 @@ class YahooCategoryScraper:
             if not categories:
                 ptah_data = page_props.get('ptahV2InitialData', {})
                 if ptah_data:
-                    self.log(f"    [DEBUG] ptahV2InitialData keys: {list(ptah_data.keys())[:10]}")
-                    # ptahV2InitialData内を探索
-                    categories = self._search_categories_in_ptah(ptah_data)
+                    # ptahV2InitialDataが文字列の場合はJSONとしてパース
+                    if isinstance(ptah_data, str):
+                        try:
+                            ptah_data = json.loads(ptah_data)
+                            self.log(f"    [DEBUG] ptahV2InitialData parsed from string")
+                        except json.JSONDecodeError:
+                            self.log(f"    [DEBUG] ptahV2InitialData is not valid JSON")
+                            ptah_data = {}
+
+                    if isinstance(ptah_data, dict):
+                        self.log(f"    [DEBUG] ptahV2InitialData keys: {list(ptah_data.keys())[:10]}")
+                        # ptahV2InitialData内を探索
+                        categories = self._search_categories_in_ptah(ptah_data)
 
         except Exception as e:
             self.log(f"    [DEBUG] JSON構造解析エラー: {e}")
@@ -299,18 +309,39 @@ class YahooCategoryScraper:
         return categories
 
     def _extract_categories_fallback(self, json_data: dict) -> List[Dict]:
-        """フォールバック: 別のパスでカテゴリを探す"""
+        """フォールバック: 別のパスでカテゴリを探す（suggestedCategories + toggleAreaCategoryItems）"""
         categories = []
 
         def find_categories(obj, depth=0):
-            """再帰的にカテゴリ配列を探す"""
+            """再帰的にカテゴリ配列を探す（両方のリストを返す）"""
             if depth > 10:
                 return None
             if isinstance(obj, dict):
-                # suggestedCategories を探す
+                # suggestedCategories を探す（toggleAreaCategoryItemsも一緒に取得）
                 if 'suggestedCategories' in obj:
-                    return obj['suggestedCategories']
+                    result = []
+                    suggested = obj['suggestedCategories']
+                    if isinstance(suggested, list):
+                        result.extend(suggested)
+                    # toggleAreaCategoryItems も取得（「もっと見る」のカテゴリ）
+                    toggle_items = obj.get('toggleAreaCategoryItems', [])
+                    if isinstance(toggle_items, list):
+                        result.extend(toggle_items)
+                    if result:
+                        return result
                 # categories キーを探す
+                if 'categories' in obj and isinstance(obj['categories'], dict):
+                    cat_data = obj['categories']
+                    result = []
+                    suggested = cat_data.get('suggestedCategories', [])
+                    if isinstance(suggested, list):
+                        result.extend(suggested)
+                    toggle_items = cat_data.get('toggleAreaCategoryItems', [])
+                    if isinstance(toggle_items, list):
+                        result.extend(toggle_items)
+                    if result:
+                        return result
+                # categories が配列の場合
                 if 'categories' in obj and isinstance(obj['categories'], list):
                     items = obj['categories']
                     if items and isinstance(items[0], dict) and 'text' in items[0]:
@@ -331,6 +362,7 @@ class YahooCategoryScraper:
             found = find_categories(json_data)
             if found:
                 categories = found
+                self.log(f"    [DEBUG] フォールバックで suggestedCategories + toggleAreaCategoryItems を取得")
         except Exception as e:
             self.log(f"    [DEBUG] フォールバック探索エラー: {e}")
 
