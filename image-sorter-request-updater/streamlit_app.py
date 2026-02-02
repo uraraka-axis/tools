@@ -165,7 +165,7 @@ def download_file_from_drive(drive_service, file_id: str) -> bytes:
 
 
 def get_input_data(drive_service, file_id: str, log_container) -> pd.DataFrame:
-    """Google DriveのExcel/CSVファイルからデータ取得"""
+    """Google DriveのExcel/CSV/Google Sheetsファイルからデータ取得"""
     log_message("📊 入力ファイル読み込み中...", log_container)
 
     try:
@@ -175,20 +175,11 @@ def get_input_data(drive_service, file_id: str, log_container) -> pd.DataFrame:
         mime_type = file_info.get('mimeType', '')
 
         log_message(f"   ファイル名: {file_name}", log_container)
+        log_message(f"   MIMEタイプ: {mime_type}", log_container)
 
-        # ファイルダウンロード
-        file_content = download_file_from_drive(drive_service, file_id)
-
-        # ファイル形式に応じて読み込み
-        if 'spreadsheet' in mime_type or file_name.endswith(('.xlsx', '.xls')):
-            df = pd.read_excel(io.BytesIO(file_content), header=None, engine='openpyxl')
-        elif 'csv' in mime_type or file_name.endswith('.csv'):
-            try:
-                df = pd.read_csv(io.BytesIO(file_content), header=None, encoding='utf-8')
-            except:
-                df = pd.read_csv(io.BytesIO(file_content), header=None, encoding='cp932')
-        else:
-            # Google Sheets形式の場合はエクスポート
+        # Google Sheets形式の場合はエクスポート
+        if mime_type == 'application/vnd.google-apps.spreadsheet':
+            log_message("   → Google Sheetsとしてエクスポート", log_container)
             request = drive_service.files().export_media(
                 fileId=file_id,
                 mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
@@ -200,6 +191,21 @@ def get_input_data(drive_service, file_id: str, log_container) -> pd.DataFrame:
                 _, done = downloader.next_chunk()
             buffer.seek(0)
             df = pd.read_excel(buffer, header=None, engine='openpyxl')
+        else:
+            # Excel/CSVファイルはダウンロード
+            file_content = download_file_from_drive(drive_service, file_id)
+
+            # ファイル形式に応じて読み込み
+            if 'spreadsheet' in mime_type or file_name.endswith(('.xlsx', '.xls')):
+                df = pd.read_excel(io.BytesIO(file_content), header=None, engine='openpyxl')
+            elif 'csv' in mime_type or file_name.endswith('.csv'):
+                try:
+                    df = pd.read_csv(io.BytesIO(file_content), header=None, encoding='utf-8')
+                except:
+                    df = pd.read_csv(io.BytesIO(file_content), header=None, encoding='cp932')
+            else:
+                # その他の形式はExcelとして試行
+                df = pd.read_excel(io.BytesIO(file_content), header=None, engine='openpyxl')
 
         log_message(f"✅ 読み込み完了: {len(df)}行 × {len(df.columns)}列", log_container)
         return df
