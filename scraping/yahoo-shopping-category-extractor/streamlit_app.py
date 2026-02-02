@@ -130,7 +130,8 @@ class YahooCategoryScraper:
         next_data_script = soup.find('script', id='__NEXT_DATA__')
         if not next_data_script:
             self.log("    [DEBUG] __NEXT_DATA__ が見つかりません")
-            return []
+            # HTMLフォールバックを試す
+            return self._extract_categories_from_html(soup, current_category_id)
 
         try:
             json_data = json.loads(next_data_script.string)
@@ -152,8 +153,17 @@ class YahooCategoryScraper:
                 categories_data = self._extract_categories_fallback(json_data)
                 if categories_data:
                     self.log(f"    [DEBUG] フォールバックで {len(categories_data)} 件取得")
-                else:
-                    return []
+
+            # JSONから1件以下の場合はHTMLフォールバックを試す
+            if len(categories_data) <= 1:
+                self.log("    [DEBUG] JSON結果が不十分、HTMLフォールバックを試行")
+                html_categories = self._extract_categories_from_html(soup, current_category_id)
+                if len(html_categories) > len(categories_data):
+                    self.log(f"    [DEBUG] HTMLから {len(html_categories)} 件取得")
+                    return html_categories
+
+            if not categories_data:
+                return []
 
             self.log(f"    [DEBUG] JSONから {len(categories_data)} 件のカテゴリを検出")
 
@@ -367,6 +377,76 @@ class YahooCategoryScraper:
             self.log(f"    [DEBUG] フォールバック探索エラー: {e}")
 
         return categories
+
+    def _extract_categories_from_html(self, soup: BeautifulSoup, current_category_id: str) -> List[Dict]:
+        """HTMLから直接カテゴリリンクを抽出（JSONが不十分な場合のフォールバック）"""
+        subcategories = []
+        seen_ids = set()
+
+        # 現在のカテゴリIDの最後の部分を取得（フィルタリング用）
+        current_last_id = self.get_last_category_id(current_category_id) if current_category_id else ""
+
+        # カテゴリリンクのパターン: /category/数字/list または /category/数字/数字/list など
+        category_pattern = re.compile(r'/category/([\d/]+)/list')
+
+        # すべてのリンクを探索
+        for link in soup.find_all('a', href=True):
+            href = link.get('href', '')
+            match = category_pattern.search(href)
+            if not match:
+                continue
+
+            category_path = match.group(1).rstrip('/')
+            last_id = self.get_last_category_id(category_path)
+
+            # 自分自身は除外
+            if last_id == current_last_id:
+                continue
+
+            # 重複除去
+            if last_id in seen_ids:
+                continue
+            seen_ids.add(last_id)
+
+            # リンクテキストを取得
+            name = link.get_text(strip=True)
+            if not name:
+                continue
+
+            # 数字だけの場合はスキップ（件数表示など）
+            if name.isdigit() or re.match(r'^[\d,]+件?$', name):
+                continue
+
+            # 「もっと見る」「すべて見る」などはスキップ
+            if name in ['もっと見る', 'すべて見る', '詳細を見る', '閉じる']:
+                continue
+
+            url = href
+            if not url.startswith('http'):
+                url = self.BASE_URL + url
+
+            url = re.sub(r'\?.*$', '', url)
+            if not url.endswith('/list'):
+                url = url.rstrip('/') + '/list'
+
+            # 件数を取得（リンクの近くにある数字）
+            count = 0
+            count_text = link.find_next(string=re.compile(r'[\d,]+件?'))
+            if count_text:
+                count_match = re.search(r'([\d,]+)', count_text)
+                if count_match:
+                    count = int(count_match.group(1).replace(',', ''))
+
+            subcategories.append({
+                'name': name,
+                'url': url,
+                'category_id': category_path,
+                'last_id': last_id,
+                'count': count
+            })
+
+        self.log(f"    [DEBUG] HTMLから {len(subcategories)} 件のカテゴリリンクを検出")
+        return subcategories
 
     def scrape_categories_recursive(
         self,
