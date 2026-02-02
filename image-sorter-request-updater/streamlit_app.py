@@ -12,7 +12,6 @@ import io
 import time
 from datetime import datetime
 from typing import Optional, List, Dict, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -301,30 +300,12 @@ def find_or_create_folder(drive_service, parent_id: str, folder_name: str) -> st
     return folder.get('id')
 
 
-def copy_single_file(drive_service, source_file_id: str, source_name: str,
-                     dest_folder_id: str, comic_no: str) -> Tuple[bool, str, Optional[str]]:
-    """単一ファイルをコピー（並列処理用）"""
-    try:
-        file_metadata = {
-            'name': source_name,
-            'parents': [dest_folder_id]
-        }
-        drive_service.files().copy(
-            fileId=source_file_id,
-            body=file_metadata,
-            supportsAllDrives=True
-        ).execute()
-        return (True, comic_no, None)
-    except Exception as e:
-        return (False, comic_no, str(e))
-
-
 def copy_images(drive_service, data_list: List[Dict], input_folder_id: str,
                 output_folder_id: str, log_container, progress_bar) -> Tuple[Dict, List[str]]:
-    """画像ファイルをGoogle Drive内で振り分けコピー（並列処理版）"""
+    """画像ファイルをGoogle Drive内で振り分けコピー"""
     log_message("", log_container)
     log_message("=" * 50, log_container)
-    log_message("🖼️ 画像ファイル振り分け（並列処理）", log_container)
+    log_message("🖼️ 画像ファイル振り分け", log_container)
     log_message("=" * 50, log_container)
 
     stats = {
@@ -346,11 +327,9 @@ def copy_images(drive_service, data_list: List[Dict], input_folder_id: str,
     # フォルダキャッシュ
     folder_cache = {}
 
-    # Phase 1: コピータスクを準備（フォルダ作成は順次処理）
-    log_message("📂 フォルダ構成を準備中...", log_container)
-    copy_tasks = []
+    log_message("🚀 コピー開始...", log_container)
 
-    for data in data_list:
+    for i, data in enumerate(data_list, 1):
         comic_no = data['comic_no']
         main_folder = data['main_folder']
         sub_folder = data['sub_folder']
@@ -367,9 +346,10 @@ def copy_images(drive_service, data_list: List[Dict], input_folder_id: str,
 
         if not source_file:
             stats['not_found'] += 1
+            progress_bar.progress(i / stats['total'])
             continue
 
-        # 出力先フォルダを取得/作成（順次処理）
+        # 出力先フォルダを取得/作成
         try:
             if main_folder:
                 cache_key = f"{main_folder}/{sub_folder}" if sub_folder else main_folder
@@ -388,63 +368,30 @@ def copy_images(drive_service, data_list: List[Dict], input_folder_id: str,
             else:
                 dest_folder_id = output_folder_id
 
-            copy_tasks.append({
-                'comic_no': comic_no,
-                'source_file_id': source_file['id'],
-                'source_name': source_name,
-                'dest_folder_id': dest_folder_id
-            })
+            # ファイルをコピー
+            file_metadata = {
+                'name': source_name,
+                'parents': [dest_folder_id]
+            }
 
-        except Exception as e:
-            log_message(f"   ❌ {comic_no}: フォルダ作成失敗 - {e}", log_container)
-            stats['failed'] += 1
+            drive_service.files().copy(
+                fileId=source_file['id'],
+                body=file_metadata,
+                supportsAllDrives=True
+            ).execute()
 
-    log_message(f"   📦 コピー対象: {len(copy_tasks)}件", log_container)
-
-    if not copy_tasks:
-        log_message(f"✅ 完了: 成功={stats['success']}, 未発見={stats['not_found']}, 失敗={stats['failed']}", log_container)
-        return stats, success_comic_nos
-
-    # Phase 2: 並列でファイルコピー
-    log_message("🚀 並列コピー開始（10並列）...", log_container)
-
-    total_tasks = len(copy_tasks)
-    results = []
-    errors = []
-
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {
-            executor.submit(
-                copy_single_file,
-                drive_service,
-                task['source_file_id'],
-                task['source_name'],
-                task['dest_folder_id'],
-                task['comic_no']
-            ): task for task in copy_tasks
-        }
-
-        for future in as_completed(futures):
-            results.append(future.result())
-
-    # 結果を集計（UI更新はメインスレッドで）
-    for success, comic_no, error in results:
-        if success:
             stats['success'] += 1
             success_comic_nos.append(comic_no)
-        else:
+
+            # 50件ごとに進捗表示
+            if stats['success'] % 50 == 0:
+                log_message(f"   📦 {stats['success']}件コピー完了...", log_container)
+
+        except Exception as e:
+            log_message(f"   ❌ {comic_no}: コピー失敗 - {e}", log_container)
             stats['failed'] += 1
-            errors.append(f"{comic_no}: {error}")
 
-    # エラーがあれば表示
-    if errors:
-        log_message(f"   ❌ {len(errors)}件のエラー:", log_container)
-        for err in errors[:5]:  # 最初の5件のみ表示
-            log_message(f"      {err}", log_container)
-        if len(errors) > 5:
-            log_message(f"      ... 他{len(errors) - 5}件", log_container)
-
-    progress_bar.progress((stats['not_found'] + len(results)) / stats['total'])
+        progress_bar.progress(i / stats['total'])
 
     log_message(f"✅ 完了: 成功={stats['success']}, 未発見={stats['not_found']}, 失敗={stats['failed']}", log_container)
     return stats, success_comic_nos
