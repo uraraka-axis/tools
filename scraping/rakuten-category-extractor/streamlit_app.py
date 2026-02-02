@@ -244,12 +244,19 @@ class RakutenCategoryScraper:
         subcategories = []
         seen_ids = set()
 
-        # カテゴリリンクのパターン
-        category_pattern = re.compile(r'/category/(\d+)/?')
+        # カテゴリリンクのパターン（絶対URL・相対URLの両方に対応）
+        category_pattern = re.compile(r'category/(\d+)/?')
 
-        # すべてのカテゴリリンクを探す
-        for link in soup.find_all('a', href=category_pattern):
+        # すべてのリンクを探す
+        all_links = soup.find_all('a', href=True)
+        self.log(f"    [DEBUG] 全リンク数: {len(all_links)}")
+
+        # カテゴリリンクを探す
+        for link in all_links:
             href = link.get('href', '')
+            if 'category/' not in href:
+                continue
+
             match = category_pattern.search(href)
             if not match:
                 continue
