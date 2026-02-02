@@ -713,7 +713,10 @@ class YahooCategoryScraper:
             col_letter = get_column_letter(3 + i)
             ws.column_dimensions[col_letter].width = 22
         ws.column_dimensions[get_column_letter(3 + max_level)].width = 18
-        ws.column_dimensions[get_column_letter(4 + max_level)].width = 50
+        # URL列の幅を最長URLに合わせて調整
+        max_url_length = max((len(cat.url) for cat in self.categories), default=50)
+        url_col_width = min(max(max_url_length * 1.1, 50), 120)  # 最小50、最大120
+        ws.column_dimensions[get_column_letter(4 + max_level)].width = url_col_width
         ws.column_dimensions[get_column_letter(5 + max_level)].width = 3
         ws.column_dimensions[get_column_letter(summary_level_col)].width = 12
         ws.column_dimensions[get_column_letter(summary_count_col)].width = 12
