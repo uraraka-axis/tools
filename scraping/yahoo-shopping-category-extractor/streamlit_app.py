@@ -208,23 +208,93 @@ class YahooCategoryScraper:
         categories = []
 
         try:
-            initial_state = json_data.get('props', {}).get('pageProps', {}).get('initialState', {})
-            bff = initial_state.get('bff', {})
-            advanced_filter = bff.get('advancedFilter', {})
-            sections = advanced_filter.get('sections', {})
-            category_section = sections.get('category', {})
-            categories_data = category_section.get('categories', {})
+            page_props = json_data.get('props', {}).get('pageProps', {})
 
-            suggested = categories_data.get('suggestedCategories', [])
-            if suggested:
-                categories.extend(suggested)
+            # パス1: initialState.bff.advancedFilter経由（従来方式）
+            initial_state = page_props.get('initialState', {})
+            if initial_state:
+                bff = initial_state.get('bff', {})
+                advanced_filter = bff.get('advancedFilter', {})
+                sections = advanced_filter.get('sections', {})
+                category_section = sections.get('category', {})
+                categories_data = category_section.get('categories', {})
 
-            toggle_items = categories_data.get('toggleAreaCategoryItems', [])
-            if toggle_items:
-                categories.extend(toggle_items)
+                suggested = categories_data.get('suggestedCategories', [])
+                if suggested:
+                    categories.extend(suggested)
+
+                toggle_items = categories_data.get('toggleAreaCategoryItems', [])
+                if toggle_items:
+                    categories.extend(toggle_items)
+
+            # パス2: ptahV2InitialData経由（新方式）
+            if not categories:
+                ptah_data = page_props.get('ptahV2InitialData', {})
+                if ptah_data:
+                    self.log(f"    [DEBUG] ptahV2InitialData keys: {list(ptah_data.keys())[:10]}")
+                    # ptahV2InitialData内を探索
+                    categories = self._search_categories_in_ptah(ptah_data)
 
         except Exception as e:
             self.log(f"    [DEBUG] JSON構造解析エラー: {e}")
+
+        return categories
+
+    def _search_categories_in_ptah(self, ptah_data: dict) -> List[Dict]:
+        """ptahV2InitialData内からカテゴリを探索"""
+        categories = []
+
+        def search(obj, depth=0):
+            if depth > 15:
+                return []
+            found = []
+
+            if isinstance(obj, dict):
+                # advancedFilterセクションを探す
+                if 'advancedFilter' in obj:
+                    af = obj['advancedFilter']
+                    if isinstance(af, dict) and 'sections' in af:
+                        sections = af['sections']
+                        if isinstance(sections, dict) and 'category' in sections:
+                            cat_section = sections['category']
+                            if isinstance(cat_section, dict) and 'categories' in cat_section:
+                                cat_data = cat_section['categories']
+                                if isinstance(cat_data, dict):
+                                    suggested = cat_data.get('suggestedCategories', [])
+                                    toggle = cat_data.get('toggleAreaCategoryItems', [])
+                                    found.extend(suggested)
+                                    found.extend(toggle)
+                                    if found:
+                                        return found
+
+                # suggestedCategoriesを直接探す
+                if 'suggestedCategories' in obj:
+                    items = obj['suggestedCategories']
+                    if isinstance(items, list) and items:
+                        if isinstance(items[0], dict) and 'text' in items[0]:
+                            found.extend(items)
+                            toggle = obj.get('toggleAreaCategoryItems', [])
+                            found.extend(toggle)
+                            return found
+
+                # 再帰探索
+                for v in obj.values():
+                    result = search(v, depth + 1)
+                    if result:
+                        return result
+
+            elif isinstance(obj, list):
+                for item in obj:
+                    result = search(item, depth + 1)
+                    if result:
+                        return result
+
+            return found
+
+        try:
+            categories = search(ptah_data)
+        except Exception as e:
+            self.log(f"    [DEBUG] ptah探索エラー: {e}")
 
         return categories
 
