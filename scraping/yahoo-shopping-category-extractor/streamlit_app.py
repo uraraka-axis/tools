@@ -40,10 +40,21 @@ class YahooCategoryScraper:
 
     def __init__(self):
         self.session = requests.Session()
+        # より完全なブラウザヘッダーを設定（bot検出回避）
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'ja,en-US;q=0.7,en;q=0.3',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Cache-Control': 'max-age=0',
+            'Sec-Ch-Ua': '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
+            'Sec-Ch-Ua-Mobile': '?0',
+            'Sec-Ch-Ua-Platform': '"Windows"',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Upgrade-Insecure-Requests': '1',
         })
         self.stop_flag = False
         self.categories: List[Category] = []
@@ -123,11 +134,26 @@ class YahooCategoryScraper:
 
         try:
             json_data = json.loads(next_data_script.string)
+
+            # デバッグ: JSONの構造を確認
+            props = json_data.get('props', {})
+            page_props = props.get('pageProps', {})
+            initial_state = page_props.get('initialState', {})
+
+            self.log(f"    [DEBUG] props keys: {list(props.keys())[:5]}")
+            self.log(f"    [DEBUG] pageProps keys: {list(page_props.keys())[:5]}")
+            self.log(f"    [DEBUG] initialState keys: {list(initial_state.keys())[:5]}")
+
             categories_data = self._extract_categories_from_json(json_data)
 
             if not categories_data:
                 self.log("    [DEBUG] JSONからカテゴリデータを取得できませんでした")
-                return []
+                # フォールバック: 別のパスを試す
+                categories_data = self._extract_categories_fallback(json_data)
+                if categories_data:
+                    self.log(f"    [DEBUG] フォールバックで {len(categories_data)} 件取得")
+                else:
+                    return []
 
             self.log(f"    [DEBUG] JSONから {len(categories_data)} 件のカテゴリを検出")
 
@@ -199,6 +225,44 @@ class YahooCategoryScraper:
 
         except Exception as e:
             self.log(f"    [DEBUG] JSON構造解析エラー: {e}")
+
+        return categories
+
+    def _extract_categories_fallback(self, json_data: dict) -> List[Dict]:
+        """フォールバック: 別のパスでカテゴリを探す"""
+        categories = []
+
+        def find_categories(obj, depth=0):
+            """再帰的にカテゴリ配列を探す"""
+            if depth > 10:
+                return None
+            if isinstance(obj, dict):
+                # suggestedCategories を探す
+                if 'suggestedCategories' in obj:
+                    return obj['suggestedCategories']
+                # categories キーを探す
+                if 'categories' in obj and isinstance(obj['categories'], list):
+                    items = obj['categories']
+                    if items and isinstance(items[0], dict) and 'text' in items[0]:
+                        return items
+                # 再帰的に探索
+                for v in obj.values():
+                    result = find_categories(v, depth + 1)
+                    if result:
+                        return result
+            elif isinstance(obj, list) and obj:
+                for item in obj:
+                    result = find_categories(item, depth + 1)
+                    if result:
+                        return result
+            return None
+
+        try:
+            found = find_categories(json_data)
+            if found:
+                categories = found
+        except Exception as e:
+            self.log(f"    [DEBUG] フォールバック探索エラー: {e}")
 
         return categories
 
