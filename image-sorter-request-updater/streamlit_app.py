@@ -140,7 +140,7 @@ def get_sheet_id(sheets_service, file_id: str, sheet_name: str) -> Optional[int]
 
 def download_file_from_drive(drive_service, file_id: str) -> bytes:
     """Google Driveからファイルをダウンロード"""
-    request = drive_service.files().get_media(fileId=file_id)
+    request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
     buffer = io.BytesIO()
     downloader = MediaIoBaseDownload(buffer, request)
 
@@ -158,7 +158,7 @@ def get_input_data(drive_service, file_id: str, log_container) -> pd.DataFrame:
 
     try:
         # ファイル情報取得
-        file_info = drive_service.files().get(fileId=file_id, fields='name,mimeType').execute()
+        file_info = drive_service.files().get(fileId=file_id, fields='name,mimeType', supportsAllDrives=True).execute()
         file_name = file_info.get('name', '')
         mime_type = file_info.get('mimeType', '')
 
@@ -238,7 +238,9 @@ def list_files_in_folder(drive_service, folder_id: str) -> Dict[str, Dict]:
             q=f"'{folder_id}' in parents and trashed=false",
             spaces='drive',
             fields='nextPageToken, files(id, name, mimeType)',
-            pageToken=page_token
+            pageToken=page_token,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
         ).execute()
 
         for file in response.get('files', []):
@@ -260,7 +262,9 @@ def find_or_create_folder(drive_service, parent_id: str, folder_name: str) -> st
     response = drive_service.files().list(
         q=f"'{parent_id}' in parents and name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false",
         spaces='drive',
-        fields='files(id, name)'
+        fields='files(id, name)',
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True
     ).execute()
 
     files = response.get('files', [])
@@ -275,7 +279,8 @@ def find_or_create_folder(drive_service, parent_id: str, folder_name: str) -> st
     }
     folder = drive_service.files().create(
         body=file_metadata,
-        fields='id'
+        fields='id',
+        supportsAllDrives=True
     ).execute()
 
     return folder.get('id')
@@ -356,7 +361,8 @@ def copy_images(drive_service, data_list: List[Dict], input_folder_id: str,
 
             drive_service.files().copy(
                 fileId=source_file['id'],
-                body=file_metadata
+                body=file_metadata,
+                supportsAllDrives=True
             ).execute()
 
             stats['success'] += 1
