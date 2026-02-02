@@ -423,6 +423,11 @@ class YahooCategoryScraper:
             if not name:
                 continue
 
+            # 件数を名前から除去 (例: "ソフト8,186件" → "ソフト")
+            name = re.sub(r'[\d,]+件$', '', name).strip()
+            if not name:
+                continue
+
             # 数字だけの場合はスキップ（件数表示など）
             if name.isdigit() or re.match(r'^[\d,]+件?$', name):
                 continue
