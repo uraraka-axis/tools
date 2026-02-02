@@ -256,6 +256,20 @@ def list_files_in_folder(drive_service, folder_id: str) -> Dict[str, Dict]:
     return files
 
 
+def get_parent_folder_id(drive_service, folder_id: str) -> Optional[str]:
+    """フォルダの親フォルダIDを取得"""
+    try:
+        file_info = drive_service.files().get(
+            fileId=folder_id,
+            fields='parents',
+            supportsAllDrives=True
+        ).execute()
+        parents = file_info.get('parents', [])
+        return parents[0] if parents else None
+    except Exception:
+        return None
+
+
 def find_or_create_folder(drive_service, parent_id: str, folder_name: str) -> str:
     """フォルダを検索、なければ作成"""
     # 既存フォルダを検索
@@ -330,7 +344,6 @@ def copy_images(drive_service, data_list: List[Dict], input_folder_id: str,
 
         if not source_file:
             stats['not_found'] += 1
-            log_message(f"   ⚠️ [{i}] {comic_no}: 画像未発見", log_container)
             progress_bar.progress(i / stats['total'])
             continue
 
@@ -367,6 +380,10 @@ def copy_images(drive_service, data_list: List[Dict], input_folder_id: str,
 
             stats['success'] += 1
             success_comic_nos.append(comic_no)
+
+            # 10件ごとに進捗表示
+            if stats['success'] % 10 == 0:
+                log_message(f"   📦 {stats['success']}件コピー完了...", log_container)
 
         except Exception as e:
             log_message(f"   ❌ {comic_no}: コピー失敗 - {e}", log_container)
@@ -448,7 +465,6 @@ def update_rakuten_rms(sheets_service, file_id: str, data_list: List[Dict],
             sub_folder = data['sub_folder']
 
             if comic_no in existing_comic_nos:
-                log_message(f"   ⏭️ [{i}] {comic_no}: すでに存在するためスキップ", log_container)
                 stats['duplicate'] += 1
                 progress_bar.progress(i / stats['total']) if stats['total'] > 0 else None
                 continue
@@ -500,6 +516,7 @@ def update_rakuten_rms(sheets_service, file_id: str, data_list: List[Dict],
                 # 10件ごとにバッチ実行
                 if len(requests) >= 10:
                     execute_batch_update(sheets_service, file_id, requests, values_to_update)
+                    log_message(f"   📝 {stats['success']}件挿入完了...", log_container)
                     requests = []
                     values_to_update = []
 
@@ -595,7 +612,6 @@ def delete_processed_rows(sheets_service, file_id: str, success_comic_nos: List[
 
                 if c_val and c_val in success_set:
                     rows_to_delete.append(i)
-                    log_message(f"   🗑️ 削除対象: {i + 1}行目（コミックNo: {c_val}）", log_container)
 
         if not rows_to_delete:
             log_message("⚠️ 削除対象の行がありません", log_container)
@@ -700,9 +716,22 @@ def update_comic_db(sheets_service, file_id: str, data_list: List[Dict],
     return stats
 
 
+def init_session_state():
+    """セッション状態の初期化"""
+    if "saved_spreadsheet_url" not in st.session_state:
+        st.session_state.saved_spreadsheet_url = ""
+    if "saved_input_file_url" not in st.session_state:
+        st.session_state.saved_input_file_url = ""
+    if "saved_input_folder_url" not in st.session_state:
+        st.session_state.saved_input_folder_url = ""
+
+
 def main():
     st.title("🖼️ 画像振り分け・依頼リスト更新ツール")
     st.caption("Google Drive上のファイルを操作し、依頼リストを更新します")
+
+    # セッション状態初期化
+    init_session_state()
 
     # サービス取得
     sheets_service, drive_service = get_google_services()
@@ -716,33 +745,28 @@ def main():
     # 設定入力
     st.subheader("設定")
 
-    col1, col2 = st.columns(2)
+    spreadsheet_url = st.text_input(
+        "依頼リストURL",
+        value=st.session_state.saved_spreadsheet_url,
+        placeholder="GoogleスプレッドシートのURL または ファイルID",
+        help="Rakuten RMS、依頼分、コミック画像DB一覧シートを含むスプレッドシート"
+    )
 
-    with col1:
-        spreadsheet_url = st.text_input(
-            "依頼リストURL",
-            placeholder="GoogleスプレッドシートのURL または ファイルID",
-            help="Rakuten RMS、依頼分、コミック画像DB一覧シートを含むスプレッドシート"
-        )
+    input_file_url = st.text_input(
+        "振り分けマップ（Excel/CSV）",
+        value=st.session_state.saved_input_file_url,
+        placeholder="Google DriveのファイルURL または ファイルID",
+        help="E列=コミックNo, K列=メインフォルダ, L列=サブフォルダ"
+    )
 
-        input_file_url = st.text_input(
-            "振り分けマップ（Excel/CSV）",
-            placeholder="Google DriveのファイルURL または ファイルID",
-            help="E列=コミックNo, K列=メインフォルダ, L列=サブフォルダ"
-        )
+    input_folder_url = st.text_input(
+        "入力画像フォルダ",
+        value=st.session_state.saved_input_folder_url,
+        placeholder="Google DriveのフォルダURL または フォルダID",
+        help="コピー元の画像が格納されているフォルダ（同階層に出力フォルダを自動作成）"
+    )
 
-    with col2:
-        input_folder_url = st.text_input(
-            "入力画像フォルダ",
-            placeholder="Google DriveのフォルダURL または フォルダID",
-            help="コピー元の画像が格納されているフォルダ"
-        )
-
-        output_folder_url = st.text_input(
-            "出力画像フォルダ",
-            placeholder="Google DriveのフォルダURL または フォルダID",
-            help="画像のコピー先フォルダ（サブフォルダが自動作成されます）"
-        )
+    st.info("📁 出力フォルダは入力フォルダと同じ階層に「出力_yyyymmdd」として自動作成されます")
 
     st.divider()
 
@@ -761,16 +785,16 @@ def main():
             st.error("入力画像フォルダを入力してください")
             st.stop()
 
-        if not output_folder_url:
-            st.error("出力画像フォルダを入力してください")
-            st.stop()
+        # 入力値を保存
+        st.session_state.saved_spreadsheet_url = spreadsheet_url
+        st.session_state.saved_input_file_url = input_file_url
+        st.session_state.saved_input_folder_url = input_folder_url
 
         # ID抽出
         try:
             spreadsheet_id = extract_file_id(spreadsheet_url)
             input_file_id = extract_file_id(input_file_url)
             input_folder_id = extract_file_id(input_folder_url)
-            output_folder_id = extract_file_id(output_folder_url)
         except ValueError as e:
             st.error(str(e))
             st.stop()
@@ -798,6 +822,17 @@ def main():
             if not data_list:
                 st.error("入力データがありません")
                 st.stop()
+
+            # 出力フォルダを自動作成
+            log_message("📁 出力フォルダを作成中...", log_container)
+            parent_folder_id = get_parent_folder_id(drive_service, input_folder_id)
+            if not parent_folder_id:
+                st.error("入力フォルダの親フォルダが取得できません")
+                st.stop()
+
+            output_folder_name = f"出力_{datetime.now().strftime('%Y%m%d')}"
+            output_folder_id = find_or_create_folder(drive_service, parent_folder_id, output_folder_name)
+            log_message(f"   出力フォルダ: {output_folder_name}", log_container)
 
             # 画像コピー
             image_stats, success_comic_nos = copy_images(
