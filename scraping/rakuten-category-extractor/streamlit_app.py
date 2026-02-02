@@ -102,7 +102,18 @@ class RakutenCategoryScraper:
             response = self.session.get(url, timeout=30)
             response.raise_for_status()
 
-            return BeautifulSoup(response.text, 'html.parser')
+            html_text = response.text
+            self.log(f"    [DEBUG] HTML長さ: {len(html_text)} 文字")
+            self.log(f"    [DEBUG] ステータス: {response.status_code}")
+
+            # HTMLの一部を確認
+            if 'category/' in html_text:
+                self.log(f"    [DEBUG] 'category/' がHTMLに含まれています")
+            else:
+                self.log(f"    [DEBUG] 'category/' がHTMLに含まれていません")
+                self.log(f"    [DEBUG] HTML先頭500文字: {html_text[:500]}")
+
+            return BeautifulSoup(html_text, 'html.parser')
 
         except Exception as e:
             self.log(f"  ⚠️ ページ取得エラー: {e}")
