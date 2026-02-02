@@ -13,7 +13,6 @@ import time
 from datetime import datetime
 from typing import Optional, List, Dict, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -409,9 +408,9 @@ def copy_images(drive_service, data_list: List[Dict], input_folder_id: str,
     # Phase 2: 並列でファイルコピー
     log_message("🚀 並列コピー開始（10並列）...", log_container)
 
-    completed = 0
     total_tasks = len(copy_tasks)
-    lock = threading.Lock()
+    results = []
+    errors = []
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = {
@@ -426,22 +425,26 @@ def copy_images(drive_service, data_list: List[Dict], input_folder_id: str,
         }
 
         for future in as_completed(futures):
-            success, comic_no, error = future.result()
+            results.append(future.result())
 
-            with lock:
-                completed += 1
-                if success:
-                    stats['success'] += 1
-                    success_comic_nos.append(comic_no)
-                else:
-                    stats['failed'] += 1
-                    log_message(f"   ❌ {comic_no}: コピー失敗 - {error}", log_container)
+    # 結果を集計（UI更新はメインスレッドで）
+    for success, comic_no, error in results:
+        if success:
+            stats['success'] += 1
+            success_comic_nos.append(comic_no)
+        else:
+            stats['failed'] += 1
+            errors.append(f"{comic_no}: {error}")
 
-                # 20件ごとに進捗表示
-                if completed % 20 == 0 or completed == total_tasks:
-                    log_message(f"   📦 {completed}/{total_tasks}件完了（成功: {stats['success']}）", log_container)
+    # エラーがあれば表示
+    if errors:
+        log_message(f"   ❌ {len(errors)}件のエラー:", log_container)
+        for err in errors[:5]:  # 最初の5件のみ表示
+            log_message(f"      {err}", log_container)
+        if len(errors) > 5:
+            log_message(f"      ... 他{len(errors) - 5}件", log_container)
 
-                progress_bar.progress((stats['not_found'] + completed) / stats['total'])
+    progress_bar.progress((stats['not_found'] + len(results)) / stats['total'])
 
     log_message(f"✅ 完了: 成功={stats['success']}, 未発見={stats['not_found']}, 失敗={stats['failed']}", log_container)
     return stats, success_comic_nos
