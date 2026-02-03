@@ -10,7 +10,10 @@ import base64
 import xml.etree.ElementTree as ET
 import pandas as pd
 import time
+import zipfile
+import random
 from io import BytesIO
+from bs4 import BeautifulSoup
 from openpyxl.styles import Font, Border, Side, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
@@ -111,6 +114,188 @@ def style_excel(ws, num_columns=4, url_column=None):
             ws.column_dimensions[column_letter].width = 70
         else:
             ws.column_dimensions[column_letter].width = min(max_length * 1.5 + 2, 40)
+
+
+def merge_csv_data(is_df, cl_df):
+    """IS検索とCL検索の結果をマージ"""
+    # comic_list.csvから辞書を作成（N列=CNO, S列=出版社, Y列=シリーズ）
+    cl_dict = {}
+    for i in range(1, len(cl_df)):
+        try:
+            cno = str(cl_df.iloc[i, 13]).strip() if len(cl_df.columns) > 13 else ''  # N列
+            publisher = str(cl_df.iloc[i, 18]).strip() if len(cl_df.columns) > 18 else ''  # S列
+            series = str(cl_df.iloc[i, 24]).strip() if len(cl_df.columns) > 24 else ''  # Y列
+
+            if cno and cno != 'nan':
+                cl_dict[cno] = {
+                    'publisher': publisher if publisher != 'nan' else '',
+                    'series': series if series != 'nan' else ''
+                }
+        except Exception:
+            continue
+
+    # is_list.csvの出版社とシリーズを置換
+    for i in range(1, len(is_df)):
+        try:
+            cno = str(is_df.iloc[i, 6]).strip() if len(is_df.columns) > 6 else ''  # G列（コミックNo）
+            if cno in cl_dict:
+                if cl_dict[cno]['publisher'] and len(is_df.columns) > 11:
+                    is_df.iloc[i, 11] = cl_dict[cno]['publisher']  # L列
+                if cl_dict[cno]['series'] and len(is_df.columns) > 13:
+                    is_df.iloc[i, 13] = cl_dict[cno]['series']  # N列
+        except Exception:
+            continue
+
+    return is_df
+
+
+def extract_first_volumes(merged_df):
+    """1巻のみを抽出して整形"""
+    first_vol_dict = {}
+    latest_vol_dict = {}
+    processed_comic_nos = set()
+    result_data = []
+
+    for i in range(1, len(merged_df)):
+        try:
+            comic_no = str(merged_df.iloc[i, 6]).strip() if len(merged_df.columns) > 6 else ''  # G列
+            if not comic_no or comic_no == 'nan':
+                continue
+
+            # JAN情報
+            jan_code = str(merged_df.iloc[i, 5]).strip() if len(merged_df.columns) > 5 else ''  # F列
+            if jan_code and jan_code != 'nan':
+                latest_vol_dict[comic_no] = jan_code
+
+            # 1巻チェック（J列）
+            volume = str(merged_df.iloc[i, 9]).strip() if len(merged_df.columns) > 9 else ''
+            if volume == '1' or volume == '1.0':
+                if comic_no not in first_vol_dict:
+                    first_vol_dict[comic_no] = jan_code
+
+            if comic_no not in processed_comic_nos:
+                processed_comic_nos.add(comic_no)
+
+                first_jan = first_vol_dict.get(comic_no, latest_vol_dict.get(comic_no, ''))
+
+                row_data = {
+                    'kaikatsu_narabi': str(merged_df.iloc[i, 3]).strip() if len(merged_df.columns) > 3 else '',
+                    'first_isbn': str(merged_df.iloc[i, 4]).strip() if len(merged_df.columns) > 4 else '',
+                    'first_jan': first_jan,
+                    'comic_no': comic_no,
+                    'genre': str(merged_df.iloc[i, 7]).strip() if len(merged_df.columns) > 7 else '',
+                    'title': str(merged_df.iloc[i, 8]).strip() if len(merged_df.columns) > 8 else '',
+                    'publisher': str(merged_df.iloc[i, 11]).strip() if len(merged_df.columns) > 11 else '',
+                    'author': str(merged_df.iloc[i, 12]).strip() if len(merged_df.columns) > 12 else '',
+                    'series': str(merged_df.iloc[i, 13]).strip() if len(merged_df.columns) > 13 else '',
+                }
+                result_data.append(row_data)
+        except Exception:
+            continue
+
+    # 快活並びでソート
+    result_data.sort(key=lambda x: int(float(x['kaikatsu_narabi'])) if x['kaikatsu_narabi'] and x['kaikatsu_narabi'] != 'nan' else 999999)
+    return result_data
+
+
+def add_folder_hierarchy_info(result_data, hierarchy_df):
+    """フォルダ階層情報を付与"""
+    hierarchy_list = []
+    for i in range(1, len(hierarchy_df)):
+        try:
+            row = hierarchy_df.iloc[i]
+            hierarchy_list.append({
+                'genre': str(row[0]).strip() if pd.notna(row[0]) else '',
+                'publisher': str(row[1]).strip() if pd.notna(row[1]) else '',
+                'series': str(row[2]).strip() if len(row) > 2 and pd.notna(row[2]) else '',
+                'main_folder': str(row[3]).strip() if len(row) > 3 and pd.notna(row[3]) else '',
+                'sub_folder': str(row[4]).strip() if len(row) > 4 and pd.notna(row[4]) else ''
+            })
+        except Exception:
+            continue
+
+    for data in result_data:
+        matched = False
+        for h in hierarchy_list:
+            if data['genre'] == h['genre'] and data['publisher'] == h['publisher']:
+                if data['series'] and h['series']:
+                    if data['series'] == h['series']:
+                        data['main_folder'] = h['main_folder']
+                        data['sub_folder'] = h['sub_folder']
+                        matched = True
+                        break
+                elif not h['series']:
+                    data['main_folder'] = h['main_folder']
+                    data['sub_folder'] = h['sub_folder']
+                    matched = True
+                    break
+        if not matched:
+            data['main_folder'] = ''
+            data['sub_folder'] = ''
+
+    return result_data
+
+
+def get_bookoff_image(jan_code, session):
+    """ブックオフから画像URL取得"""
+    url = f"https://shopping.bookoff.co.jp/search/keyword/{jan_code}"
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+
+    NO_IMAGE_URLS = ['item_ll.gif', 'no_image', 'noimage']
+
+    try:
+        response = session.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.content, 'html.parser')
+        img_tag = soup.select_one('.productItem__image img, .js-gridImg')
+
+        if img_tag and img_tag.get('src'):
+            image_url = img_tag['src']
+            if any(no_img in image_url.lower() for no_img in NO_IMAGE_URLS):
+                return None
+            return image_url
+        return None
+    except Exception:
+        return None
+
+
+def get_amazon_image(jan_code, session):
+    """Amazonから画像URL取得"""
+    search_url = f"https://www.amazon.co.jp/s?k={jan_code}&i=stripbooks"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+    }
+
+    try:
+        response = session.get(search_url, headers=headers, timeout=15)
+        if response.status_code == 503:
+            return None
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.content, 'html.parser')
+        img_tag = soup.select_one('.s-image')
+
+        if img_tag and img_tag.get('src'):
+            image_url = img_tag['src']
+            if '_AC_' in image_url:
+                image_url = image_url.split('._AC_')[0] + '._SY466_.jpg'
+            return image_url
+        return None
+    except Exception:
+        return None
+
+
+def download_image(image_url, session):
+    """画像をダウンロードしてバイトデータを返す"""
+    try:
+        response = session.get(image_url, timeout=10)
+        response.raise_for_status()
+        return response.content
+    except Exception:
+        return None
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -736,13 +921,162 @@ elif mode == "📥 不足画像取得":
     if is_list_file:
         st.markdown("### is_list.csv プレビュー")
         try:
-            df_is = pd.read_csv(is_list_file, encoding='cp932', header=None)
-            st.dataframe(df_is.head(10), use_container_width=True, height=200)
-            st.info(f"読み込み件数: {len(df_is)}行")
+            is_list_file.seek(0)
+            df_is_preview = pd.read_csv(is_list_file, encoding='cp932', header=None)
+            st.dataframe(df_is_preview.head(10), use_container_width=True, height=200)
+            st.info(f"読み込み件数: {len(df_is_preview)}行")
         except Exception as e:
             st.error(f"CSVの読み込みエラー: {e}")
 
     st.divider()
 
     st.markdown("### ステップ2: 画像取得")
-    st.warning("この機能は開発中です。近日公開予定。")
+
+    # 全ファイルがアップロードされているかチェック
+    all_files_uploaded = is_list_file and comic_list_file and hierarchy_file
+
+    if not all_files_uploaded:
+        st.info("3つのファイルをすべてアップロードしてください。")
+    else:
+        # 画像取得ボタン
+        if st.button("🖼️ 画像取得開始", type="primary"):
+            try:
+                # ファイル読み込み
+                is_list_file.seek(0)
+                comic_list_file.seek(0)
+                hierarchy_file.seek(0)
+
+                with st.spinner("ファイルを読み込み中..."):
+                    df_is = pd.read_csv(is_list_file, encoding='cp932', header=None)
+                    df_cl = pd.read_csv(comic_list_file, encoding='cp932', header=None)
+                    df_hierarchy = pd.read_excel(hierarchy_file, sheet_name="フォルダ階層リスト", header=None)
+
+                st.success(f"ファイル読み込み完了: IS={len(df_is)}行, CL={len(df_cl)}行, 階層={len(df_hierarchy)}行")
+
+                # データ統合
+                with st.spinner("データを統合中..."):
+                    merged_df = merge_csv_data(df_is.copy(), df_cl)
+                    result_data = extract_first_volumes(merged_df)
+                    result_data = add_folder_hierarchy_info(result_data, df_hierarchy)
+
+                st.success(f"データ統合完了: {len(result_data)}件")
+
+                # 画像ダウンロード
+                st.markdown("### 画像ダウンロード中...")
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+                session = requests.Session()
+                downloaded_images = []
+                stats = {'total': len(result_data), 'success': 0, 'bookoff': 0, 'amazon': 0, 'failed': 0}
+
+                for i, data in enumerate(result_data):
+                    jan_code = data['first_jan']
+                    comic_no = data['comic_no']
+
+                    progress_bar.progress((i + 1) / len(result_data))
+                    status_text.text(f"処理中: {comic_no} ({i + 1}/{len(result_data)})")
+
+                    if not jan_code or jan_code == 'nan':
+                        stats['failed'] += 1
+                        continue
+
+                    # ブックオフで検索
+                    image_url = get_bookoff_image(jan_code, session)
+                    source = 'bookoff'
+
+                    if not image_url:
+                        # Amazonで検索
+                        time.sleep(random.uniform(0.5, 1.0))
+                        image_url = get_amazon_image(jan_code, session)
+                        source = 'amazon'
+
+                    if image_url:
+                        image_data = download_image(image_url, session)
+                        if image_data:
+                            downloaded_images.append({
+                                'filename': f"{comic_no}.jpg",
+                                'data': image_data,
+                                'comic_no': comic_no,
+                                'jan': jan_code,
+                                'title': data['title']
+                            })
+                            stats['success'] += 1
+                            if source == 'bookoff':
+                                stats['bookoff'] += 1
+                            else:
+                                stats['amazon'] += 1
+                        else:
+                            stats['failed'] += 1
+                    else:
+                        stats['failed'] += 1
+
+                    time.sleep(0.3)
+
+                progress_bar.empty()
+                status_text.empty()
+
+                # 結果サマリー
+                st.markdown("### 結果")
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("総数", stats['total'])
+                col2.metric("成功", stats['success'])
+                col3.metric("ブックオフ", stats['bookoff'])
+                col4.metric("Amazon", stats['amazon'])
+
+                if stats['failed'] > 0:
+                    st.warning(f"取得できなかった画像: {stats['failed']}件")
+
+                # ZIPダウンロード
+                if downloaded_images:
+                    st.divider()
+                    st.markdown("### ダウンロード")
+
+                    # ZIP作成
+                    zip_buffer = BytesIO()
+                    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                        for img in downloaded_images:
+                            zf.writestr(img['filename'], img['data'])
+                    zip_buffer.seek(0)
+
+                    st.download_button(
+                        label=f"📥 画像ZIPダウンロード ({len(downloaded_images)}件)",
+                        data=zip_buffer,
+                        file_name="comic_images.zip",
+                        mime="application/zip"
+                    )
+
+                    # 振り分けマップExcel作成
+                    excel_data = []
+                    for i, data in enumerate(result_data, 1):
+                        excel_data.append({
+                            '連番': i,
+                            'コミックNo': data['comic_no'],
+                            '1巻JAN': data['first_jan'],
+                            'タイトル': data['title'],
+                            'ジャンル': data['genre'],
+                            '出版社': data['publisher'],
+                            '著者': data['author'],
+                            'シリーズ': data['series'],
+                            'メインフォルダ': data.get('main_folder', ''),
+                            'サブフォルダ': data.get('sub_folder', '')
+                        })
+
+                    df_excel = pd.DataFrame(excel_data)
+                    excel_buffer = BytesIO()
+                    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                        df_excel.to_excel(writer, index=False, sheet_name='振り分けマップ')
+                        style_excel(writer.sheets['振り分けマップ'], num_columns=10)
+                    excel_buffer.seek(0)
+
+                    st.download_button(
+                        label="📥 振り分けマップExcel",
+                        data=excel_buffer,
+                        file_name="振り分けマップ.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+
+            except Exception as e:
+                st.error(f"エラーが発生しました: {e}")
+                import traceback
+                st.code(traceback.format_exc())
