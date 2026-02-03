@@ -10,6 +10,7 @@ import base64
 import xml.etree.ElementTree as ET
 import pandas as pd
 import time
+from io import BytesIO
 
 # ページ設定
 st.set_page_config(
@@ -398,7 +399,7 @@ if mode == "📂 画像一覧取得":
                 diff = expected_total - actual_count
 
                 if diff == 0:
-                    st.success(f"📷 {actual_count} 件の画像（全フォルダ） ✅ 期待値と一致")
+                    st.success(f"📷 {actual_count} 件の画像（全フォルダ） ✅ 予定していた全ファイルの情報を取得しました。")
                 else:
                     st.warning(f"📷 {actual_count} 件の画像（期待値: {expected_total}件、差分: {diff}件）")
 
@@ -423,13 +424,15 @@ if mode == "📂 画像一覧取得":
 
                 st.dataframe(df, use_container_width=True, height=500)
 
-                # CSVダウンロード
-                csv_data = df.to_csv(index=False, encoding='utf-8-sig')
+                # Excelダウンロード
+                excel_buffer = BytesIO()
+                df.to_excel(excel_buffer, index=False, engine='openpyxl')
+                excel_buffer.seek(0)
                 st.download_button(
-                    label="📥 全データをCSVでダウンロード",
-                    data=csv_data,
-                    file_name="rcabinet_all_files.csv",
-                    mime="text/csv"
+                    label="📥 全データをExcelでダウンロード",
+                    data=excel_buffer,
+                    file_name="rcabinet_all_files.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
             else:
                 st.warning("画像がありません。")
@@ -461,13 +464,15 @@ if mode == "📂 画像一覧取得":
 
                 st.dataframe(df, use_container_width=True, height=500)
 
-                # CSVダウンロード
-                csv_data = df.to_csv(index=False, encoding='utf-8-sig')
+                # Excelダウンロード
+                excel_buffer = BytesIO()
+                df.to_excel(excel_buffer, index=False, engine='openpyxl')
+                excel_buffer.seek(0)
                 st.download_button(
-                    label="📥 CSVでダウンロード",
-                    data=csv_data,
-                    file_name=f"rcabinet_{selected_folder['FolderName']}.csv",
-                    mime="text/csv"
+                    label="📥 Excelでダウンロード",
+                    data=excel_buffer,
+                    file_name=f"rcabinet_{selected_folder['FolderName']}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
             else:
                 st.warning("このフォルダに画像はありません。")
@@ -580,12 +585,15 @@ elif mode == "🔍 画像存在チェック":
 
         st.dataframe(df_display, use_container_width=True, height=400)
 
-        csv_data = df_results.to_csv(index=False, encoding='utf-8-sig')
+        # Excelダウンロード
+        excel_buffer = BytesIO()
+        df_results.to_excel(excel_buffer, index=False, engine='openpyxl')
+        excel_buffer.seek(0)
         st.download_button(
-            label="📥 結果をCSVでダウンロード",
-            data=csv_data,
-            file_name="rcabinet_check_result.csv",
-            mime="text/csv"
+            label="📥 結果をExcelでダウンロード",
+            data=excel_buffer,
+            file_name="rcabinet_check_result.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
         # 結果クリアボタン
