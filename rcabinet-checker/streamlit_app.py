@@ -107,9 +107,8 @@ def get_all_folders():
                 'FileCount': safe_int(folder.findtext('FileCount', '0')),
             })
 
-        # 全件取得したかチェック
-        folder_all_count = safe_int(root.findtext('.//folderAllCount', '0'))
-        if folder_all_count == 0 or offset + limit > folder_all_count:
+        # 取得件数がlimit未満なら終了（最終ページ）
+        if len(folders) < limit:
             break
         offset += limit
         time.sleep(0.3)
@@ -160,8 +159,8 @@ def get_folder_files(folder_id: int):
                 'TimeStamp': f.findtext('TimeStamp', ''),
             })
 
-        file_all_count = safe_int(root.findtext('.//fileAllCount', '0'))
-        if file_all_count == 0 or offset + limit > file_all_count:
+        # 取得件数がlimit未満なら終了（最終ページ）
+        if len(files) < limit:
             break
         offset += limit
         time.sleep(0.3)
