@@ -11,7 +11,7 @@ import xml.etree.ElementTree as ET
 import pandas as pd
 import time
 from io import BytesIO
-from openpyxl.styles import Font, Border, Side
+from openpyxl.styles import Font, Border, Side, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
 # ページ設定
@@ -68,10 +68,11 @@ def safe_int(value, default=0):
         return default
 
 
-def style_excel(ws, num_columns=4):
+def style_excel(ws, num_columns=4, url_column=None):
     """Excelワークシートにスタイルを適用"""
     # フォント設定
     meiryo_font = Font(name='Meiryo UI')
+    header_font = Font(name='Meiryo UI', bold=True, color='FFFFFF')
     # 罫線設定
     thin_border = Border(
         left=Side(style='thin'),
@@ -79,12 +80,21 @@ def style_excel(ws, num_columns=4):
         top=Side(style='thin'),
         bottom=Side(style='thin')
     )
+    # ヘッダー背景色（濃い青）
+    header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
 
     # 全セルにフォントと罫線を適用
     for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=num_columns):
         for cell in row:
             cell.font = meiryo_font
             cell.border = thin_border
+
+    # ヘッダー行のスタイル（1行目）
+    for cell in ws[1]:
+        if cell.column <= num_columns:
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal='center', vertical='center')
 
     # 列幅を自動調整
     for col_idx in range(1, num_columns + 1):
@@ -96,8 +106,11 @@ def style_excel(ws, num_columns=4):
                     cell_length = len(str(cell.value))
                     if cell_length > max_length:
                         max_length = cell_length
-        # 日本語を考慮して幅を調整（1.5倍 + 余白）
-        ws.column_dimensions[column_letter].width = min(max_length * 1.5 + 2, 60)
+        # URL列は固定幅、それ以外は自動調整
+        if url_column and col_idx == url_column:
+            ws.column_dimensions[column_letter].width = 70
+        else:
+            ws.column_dimensions[column_letter].width = min(max_length * 1.5 + 2, 40)
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -462,7 +475,7 @@ if mode == "📂 画像一覧取得":
                 excel_buffer = BytesIO()
                 with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
                     df.to_excel(writer, index=False, sheet_name='Sheet1')
-                    style_excel(writer.sheets['Sheet1'], num_columns=5)
+                    style_excel(writer.sheets['Sheet1'], num_columns=5, url_column=3)
                 excel_buffer.seek(0)
                 st.download_button(
                     label="📥 全データをExcelでダウンロード",
@@ -504,7 +517,7 @@ if mode == "📂 画像一覧取得":
                 excel_buffer = BytesIO()
                 with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
                     df.to_excel(writer, index=False, sheet_name='Sheet1')
-                    style_excel(writer.sheets['Sheet1'], num_columns=4)
+                    style_excel(writer.sheets['Sheet1'], num_columns=4, url_column=2)
                 excel_buffer.seek(0)
                 st.download_button(
                     label="📥 Excelでダウンロード",
@@ -627,7 +640,7 @@ elif mode == "🔍 画像存在チェック":
         excel_buffer = BytesIO()
         with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
             df_results.to_excel(writer, index=False, sheet_name='Sheet1')
-            style_excel(writer.sheets['Sheet1'], num_columns=5)
+            style_excel(writer.sheets['Sheet1'], num_columns=5, url_column=5)
         excel_buffer.seek(0)
         st.download_button(
             label="📥 結果をExcelでダウンロード",
