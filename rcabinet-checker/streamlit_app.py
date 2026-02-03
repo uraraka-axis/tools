@@ -262,30 +262,20 @@ if mode == "📂 画像一覧取得":
         st.session_state.folders_loaded = False
         st.session_state.folders_data = None
         st.session_state.folders_error = None
+    if "images_loaded" not in st.session_state:
+        st.session_state.images_loaded = False
+        st.session_state.images_data = None
 
-    # フォルダ一覧取得ボタン
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        fetch_btn = st.button("📂 フォルダ一覧を取得", type="primary")
-    with col2:
-        if st.session_state.folders_loaded:
-            if st.button("🔄 再取得"):
-                st.cache_data.clear()
-                st.session_state.folders_loaded = False
-                st.session_state.folders_data = None
-                st.rerun()
-
-    if fetch_btn:
-        with st.spinner("フォルダ一覧を取得中..."):
-            folders, error = get_all_folders()
-        st.session_state.folders_data = folders
-        st.session_state.folders_error = error
-        st.session_state.folders_loaded = True
-        st.rerun()
-
-    # フォルダ未取得の場合は停止
+    # ステップ1: フォルダ一覧を取得（まだの場合）
     if not st.session_state.folders_loaded:
-        st.info("「フォルダ一覧を取得」ボタンを押してください。")
+        st.markdown("### ステップ1: フォルダ一覧を取得")
+        if st.button("📂 フォルダ一覧を取得", type="primary"):
+            with st.spinner("フォルダ一覧を取得中..."):
+                folders, error = get_all_folders()
+            st.session_state.folders_data = folders
+            st.session_state.folders_error = error
+            st.session_state.folders_loaded = True
+            st.rerun()
         st.stop()
 
     folders = st.session_state.folders_data
@@ -293,44 +283,76 @@ if mode == "📂 画像一覧取得":
 
     if error:
         st.error(error)
-    elif folders:
-        # 総ファイル数を計算
-        total_files = sum(f['FileCount'] for f in folders)
+        if st.button("🔄 再試行"):
+            st.session_state.folders_loaded = False
+            st.cache_data.clear()
+            st.rerun()
+        st.stop()
 
-        # サイドバーにフォルダ情報
-        with st.sidebar:
-            st.success(f"📁 {len(folders)} フォルダ")
-            st.info(f"📷 {total_files} 画像（全体）")
+    if not folders:
+        st.warning("フォルダがありません。")
+        st.stop()
 
-        # フォルダ選択（「すべて」オプションを追加）
-        folder_options = {"📁 すべて": None}
-        folder_options.update({f"{f['FolderName']} ({f['FileCount']}件)": f for f in folders})
+    # 総ファイル数を計算
+    total_files = sum(f['FileCount'] for f in folders)
 
-        selected_folder_name = st.selectbox(
-            "フォルダを選択",
-            list(folder_options.keys())
-        )
+    # サイドバーにフォルダ情報
+    with st.sidebar:
+        st.success(f"📁 {len(folders)} フォルダ")
+        st.info(f"📷 {total_files} 画像（全体）")
+        if st.button("🔄 フォルダ再取得"):
+            st.session_state.folders_loaded = False
+            st.session_state.images_loaded = False
+            st.cache_data.clear()
+            st.rerun()
 
-        st.divider()
+    # ステップ2: フォルダ選択
+    st.markdown("### フォルダを選択")
 
-        if selected_folder_name == "📁 すべて":
+    folder_options = {"📁 すべて（全フォルダ）": None}
+    folder_options.update({f"{f['FolderName']} ({f['FileCount']}件)": f for f in folders})
+
+    selected_folder_name = st.selectbox(
+        "取得するフォルダ",
+        list(folder_options.keys()),
+        label_visibility="collapsed"
+    )
+
+    # ステップ3: 画像取得ボタン
+    fetch_images_btn = st.button("📷 画像一覧を取得", type="primary")
+
+    st.divider()
+
+    # 画像取得処理
+    if fetch_images_btn or st.session_state.images_loaded:
+        if fetch_images_btn:
+            st.session_state.images_loaded = False
+            st.session_state.images_data = None
+
+        if selected_folder_name == "📁 すべて（全フォルダ）":
             # 全フォルダの画像を取得
-            all_files = []
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+            if not st.session_state.images_loaded or fetch_images_btn:
+                all_files = []
+                progress_bar = st.progress(0)
+                status_text = st.empty()
 
-            for i, folder in enumerate(folders):
-                status_text.text(f"取得中: {folder['FolderName']} ({i + 1}/{len(folders)})")
-                progress_bar.progress((i + 1) / len(folders))
+                for i, folder in enumerate(folders):
+                    status_text.text(f"取得中: {folder['FolderName']} ({i + 1}/{len(folders)})")
+                    progress_bar.progress((i + 1) / len(folders))
 
-                files, err = get_folder_files(int(folder['FolderId']))
-                if files:
-                    for f in files:
-                        f['FolderName'] = folder['FolderName']
-                    all_files.extend(files)
+                    files, err = get_folder_files(int(folder['FolderId']))
+                    if files:
+                        for f in files:
+                            f['FolderName'] = folder['FolderName']
+                        all_files.extend(files)
 
-            progress_bar.empty()
-            status_text.empty()
+                progress_bar.empty()
+                status_text.empty()
+
+                st.session_state.images_data = all_files
+                st.session_state.images_loaded = True
+
+            all_files = st.session_state.images_data
 
             if all_files:
                 st.success(f"📷 {len(all_files)} 件の画像（全フォルダ）")
@@ -338,12 +360,13 @@ if mode == "📂 画像一覧取得":
                 # 検索フィルター
                 search_term = st.text_input("🔍 ファイル名で絞り込み", placeholder="検索キーワード")
 
+                display_files = all_files
                 if search_term:
-                    all_files = [f for f in all_files if search_term.lower() in f['FileName'].lower()]
-                    st.info(f"絞り込み結果: {len(all_files)} 件")
+                    display_files = [f for f in all_files if search_term.lower() in f['FileName'].lower()]
+                    st.info(f"絞り込み結果: {len(display_files)} 件")
 
                 # データフレーム表示
-                df = pd.DataFrame(all_files)
+                df = pd.DataFrame(display_files)
                 df = df[['FolderName', 'FileName', 'FileUrl', 'FileSize', 'TimeStamp']]
                 df.columns = ['フォルダ', 'ファイル名', 'URL', 'サイズ(KB)', '更新日時']
 
@@ -360,11 +383,11 @@ if mode == "📂 画像一覧取得":
             else:
                 st.warning("画像がありません。")
 
-        elif selected_folder_name:
+        else:
+            # 特定フォルダの画像を取得
             selected_folder = folder_options[selected_folder_name]
             folder_id = int(selected_folder['FolderId'])
 
-            # 画像一覧取得
             with st.spinner(f"「{selected_folder['FolderName']}」の画像を取得中..."):
                 files, error = get_folder_files(folder_id)
 
