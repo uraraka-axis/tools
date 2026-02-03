@@ -347,7 +347,7 @@ if mode == "📂 画像一覧取得":
                 status_text = st.empty()
 
                 for i, folder in enumerate(folders):
-                    status_text.text(f"取得中: {folder['FolderName']} ({i + 1}/{len(folders)})")
+                    status_text.text(f"取得中: {folder['FolderName']} ({i + 1}/{len(folders)}) - {folder['FileCount']}件")
                     progress_bar.progress((i + 1) / len(folders))
 
                     files, err = get_folder_files(int(folder['FolderId']))
