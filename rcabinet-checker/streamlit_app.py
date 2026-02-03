@@ -18,9 +18,35 @@ st.set_page_config(
 )
 
 # 認証情報（Streamlit Secretsから取得）
+APP_PASSWORD = st.secrets.get("password", "")
 SERVICE_SECRET = st.secrets.get("RMS_SERVICE_SECRET", "")
 LICENSE_KEY = st.secrets.get("RMS_LICENSE_KEY", "")
 BASE_URL = "https://api.rms.rakuten.co.jp/es/1.0"
+
+
+def check_password():
+    """パスワード認証"""
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    if st.session_state.authenticated:
+        return True
+
+    password_input = st.text_input("パスワードを入力してください", type="password")
+
+    if password_input:
+        if password_input == APP_PASSWORD:
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("パスワードが正しくありません")
+
+    return False
+
+
+# パスワード認証
+if not check_password():
+    st.stop()
 
 
 def get_auth_header():
