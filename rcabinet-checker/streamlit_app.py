@@ -343,6 +343,8 @@ if mode == "📂 画像一覧取得":
             # 全フォルダの画像を取得
             if not st.session_state.images_loaded or fetch_images_btn:
                 all_files = []
+                error_folders = []
+                expected_total = sum(f['FileCount'] for f in folders)
                 progress_bar = st.progress(0)
                 status_text = st.empty()
 
@@ -351,6 +353,13 @@ if mode == "📂 画像一覧取得":
                     progress_bar.progress((i + 1) / len(folders))
 
                     files, err = get_folder_files(int(folder['FolderId']))
+                    if err:
+                        error_folders.append({
+                            'FolderName': folder['FolderName'],
+                            'FolderId': folder['FolderId'],
+                            'FileCount': folder['FileCount'],
+                            'Error': err
+                        })
                     if files:
                         for f in files:
                             f['FolderName'] = folder['FolderName']
@@ -360,12 +369,29 @@ if mode == "📂 画像一覧取得":
                 status_text.empty()
 
                 st.session_state.images_data = all_files
+                st.session_state.error_folders = error_folders
+                st.session_state.expected_total = expected_total
                 st.session_state.images_loaded = True
 
             all_files = st.session_state.images_data
+            error_folders = st.session_state.get('error_folders', [])
+            expected_total = st.session_state.get('expected_total', 0)
 
             if all_files:
-                st.success(f"📷 {len(all_files)} 件の画像（全フォルダ）")
+                # サマリー表示
+                actual_count = len(all_files)
+                diff = expected_total - actual_count
+
+                if diff == 0:
+                    st.success(f"📷 {actual_count} 件の画像（全フォルダ） ✅ 期待値と一致")
+                else:
+                    st.warning(f"📷 {actual_count} 件の画像（期待値: {expected_total}件、差分: {diff}件）")
+
+                # エラーフォルダがあれば表示
+                if error_folders:
+                    with st.expander(f"⚠️ エラーが発生したフォルダ ({len(error_folders)}件)", expanded=False):
+                        for ef in error_folders:
+                            st.write(f"- **{ef['FolderName']}** ({ef['FileCount']}件): {ef['Error']}")
 
                 # 検索フィルター
                 search_term = st.text_input("🔍 ファイル名で絞り込み", placeholder="検索キーワード")
