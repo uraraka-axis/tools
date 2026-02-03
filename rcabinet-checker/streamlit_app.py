@@ -57,6 +57,14 @@ def get_auth_header():
     return {"Authorization": f"ESA {encoded}"}
 
 
+def safe_int(value, default=0):
+    """安全にintに変換"""
+    try:
+        return int(value) if value else default
+    except (ValueError, TypeError):
+        return default
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def get_all_folders():
     """R-Cabinetの全フォルダ一覧を取得"""
@@ -64,17 +72,24 @@ def get_all_folders():
     headers = get_auth_header()
 
     all_folders = []
-    offset = 1  # RMS APIは1始まり
+    offset = 1
     limit = 100
 
     while True:
         params = {"offset": offset, "limit": limit}
-        response = requests.get(url, headers=headers, params=params)
+
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=30)
+        except requests.exceptions.RequestException as e:
+            return None, f"接続エラー: {str(e)}"
 
         if response.status_code != 200:
             return None, f"エラー: {response.status_code} - {response.text[:200]}"
 
-        root = ET.fromstring(response.text)
+        try:
+            root = ET.fromstring(response.text)
+        except ET.ParseError as e:
+            return None, f"XMLパースエラー: {str(e)}"
 
         # エラーチェック
         system_status = root.findtext('.//systemStatus', '')
@@ -89,12 +104,12 @@ def get_all_folders():
                 'FolderId': folder.findtext('FolderId', ''),
                 'FolderName': folder.findtext('FolderName', ''),
                 'FolderPath': folder.findtext('FolderPath', ''),
-                'FileCount': int(folder.findtext('FileCount', '0')),
+                'FileCount': safe_int(folder.findtext('FileCount', '0')),
             })
 
         # 全件取得したかチェック
-        folder_all_count = int(root.findtext('.//folderAllCount', '0'))
-        if offset + limit > folder_all_count:
+        folder_all_count = safe_int(root.findtext('.//folderAllCount', '0'))
+        if folder_all_count == 0 or offset + limit > folder_all_count:
             break
         offset += limit
         time.sleep(0.3)
@@ -114,12 +129,19 @@ def get_folder_files(folder_id: int):
 
     while True:
         params = {"folderId": folder_id, "offset": offset, "limit": limit}
-        response = requests.get(url, headers=headers, params=params)
+
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=30)
+        except requests.exceptions.RequestException as e:
+            return None, f"接続エラー: {str(e)}"
 
         if response.status_code != 200:
             return None, f"エラー: {response.status_code}"
 
-        root = ET.fromstring(response.text)
+        try:
+            root = ET.fromstring(response.text)
+        except ET.ParseError as e:
+            return None, f"XMLパースエラー: {str(e)}"
 
         system_status = root.findtext('.//systemStatus', '')
         if system_status != 'OK':
@@ -138,8 +160,8 @@ def get_folder_files(folder_id: int):
                 'TimeStamp': f.findtext('TimeStamp', ''),
             })
 
-        file_all_count = int(root.findtext('.//fileAllCount', '0'))
-        if offset + limit > file_all_count:
+        file_all_count = safe_int(root.findtext('.//fileAllCount', '0'))
+        if file_all_count == 0 or offset + limit > file_all_count:
             break
         offset += limit
         time.sleep(0.3)
