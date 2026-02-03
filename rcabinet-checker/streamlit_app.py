@@ -193,6 +193,14 @@ def search_image_by_name(file_name: str):
     return []
 
 
+def is_exact_match(file_name: str, comic_no: str) -> bool:
+    """ファイル名がコミックNoと完全一致するかチェック（拡張子除く）"""
+    # 拡張子を除去
+    name_without_ext = file_name.rsplit('.', 1)[0] if '.' in file_name else file_name
+    # 完全一致のみ
+    return name_without_ext == comic_no
+
+
 def check_comic_images(comic_numbers: list, progress_bar=None, status_text=None):
     """コミックNoリストの画像存在チェック"""
     results = []
@@ -206,8 +214,11 @@ def check_comic_images(comic_numbers: list, progress_bar=None, status_text=None)
 
         found_files = search_image_by_name(str(comic_no))
 
-        if found_files:
-            for f in found_files:
+        # 完全一致でフィルタリング
+        matched_files = [f for f in found_files if is_exact_match(f['FileName'], str(comic_no))]
+
+        if matched_files:
+            for f in matched_files:
                 results.append({
                     'コミックNo': comic_no,
                     '存在': '✅ あり',
