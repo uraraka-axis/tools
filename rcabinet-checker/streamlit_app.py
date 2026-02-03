@@ -73,7 +73,7 @@ def get_all_folders():
 
     all_folders = []
     offset = 1
-    limit = 500  # 最大500件ずつ取得（APIの上限に応じて調整）
+    limit = 100  # APIの上限は100件
 
     while True:
         params = {"offset": offset, "limit": limit}
@@ -125,7 +125,7 @@ def get_folder_files(folder_id: int):
 
     all_files = []
     offset = 1
-    limit = 500  # 最大500件ずつ取得
+    limit = 100  # APIの上限は100件
 
     while True:
         params = {"folderId": folder_id, "offset": offset, "limit": limit}
