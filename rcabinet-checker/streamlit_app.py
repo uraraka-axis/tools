@@ -72,11 +72,14 @@ def get_all_folders():
     headers = get_auth_header()
 
     all_folders = []
-    offset = 1
+    offset = 0  # 0始まり
     limit = 100  # APIの上限は100件
 
     while True:
-        params = {"offset": offset, "limit": limit}
+        # offsetが0の場合はパラメータを省略（デフォルト動作）
+        params = {"limit": limit}
+        if offset > 0:
+            params["offset"] = offset
 
         try:
             response = requests.get(url, headers=headers, params=params, timeout=30)
@@ -123,11 +126,14 @@ def get_folder_files(folder_id: int):
     headers = get_auth_header()
 
     all_files = []
-    offset = 1
+    offset = 0  # 0始まり
     limit = 100  # APIの上限は100件
 
     while True:
-        params = {"folderId": folder_id, "offset": offset, "limit": limit}
+        # offsetが0の場合はパラメータを省略
+        params = {"folderId": folder_id, "limit": limit}
+        if offset > 0:
+            params["offset"] = offset
 
         try:
             response = requests.get(url, headers=headers, params=params, timeout=30)
