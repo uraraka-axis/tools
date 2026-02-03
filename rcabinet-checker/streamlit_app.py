@@ -309,16 +309,17 @@ if not SERVICE_SECRET or not LICENSE_KEY:
 with st.sidebar:
     st.title("🖼️ R-Cabinet")
 
-    st.markdown("####")  # 間隔調整
+    st.markdown("<br>", unsafe_allow_html=True)
 
     mode = st.radio(
         "機能を選択",
-        ["📂 画像一覧取得", "🔍 画像存在チェック"],
+        ["📂 画像一覧取得", "🔍 画像存在チェック", "📥 不足画像取得"],
         label_visibility="collapsed"
     )
 
-    st.markdown("####")  # 間隔調整
+    st.markdown("<br>", unsafe_allow_html=True)
     st.divider()
+    st.markdown("<br>", unsafe_allow_html=True)
 
 
 # メインコンテンツ
@@ -691,3 +692,57 @@ elif mode == "🔍 画像存在チェック":
             if st.button("🗑️ 結果をクリア"):
                 st.session_state.check_results = None
                 st.rerun()
+
+
+elif mode == "📥 不足画像取得":
+    st.title("📥 不足画像取得")
+    st.markdown("IS検索結果からJANコードで画像を取得し、ZIPでダウンロードします。")
+
+    st.divider()
+
+    st.markdown("### ステップ1: ファイルアップロード")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("#### IS検索結果")
+        is_list_file = st.file_uploader(
+            "is_list.csv",
+            type=['csv'],
+            key="is_list_upload",
+            help="IS検索でダウンロードしたCSVファイル"
+        )
+
+    with col2:
+        st.markdown("#### CL検索結果")
+        comic_list_file = st.file_uploader(
+            "comic_list.csv",
+            type=['csv'],
+            key="comic_list_upload",
+            help="CL検索でダウンロードしたCSVファイル（出版社・シリーズ情報）"
+        )
+
+    st.markdown("#### フォルダ階層リスト")
+    hierarchy_file = st.file_uploader(
+        "フォルダ階層リスト.xlsx",
+        type=['xlsx'],
+        key="hierarchy_upload",
+        help="RMSフォルダへのマッピング情報"
+    )
+
+    st.divider()
+
+    # ファイルがアップロードされた場合のプレビュー
+    if is_list_file:
+        st.markdown("### is_list.csv プレビュー")
+        try:
+            df_is = pd.read_csv(is_list_file, encoding='cp932', header=None)
+            st.dataframe(df_is.head(10), use_container_width=True, height=200)
+            st.info(f"読み込み件数: {len(df_is)}行")
+        except Exception as e:
+            st.error(f"CSVの読み込みエラー: {e}")
+
+    st.divider()
+
+    st.markdown("### ステップ2: 画像取得")
+    st.warning("この機能は開発中です。近日公開予定。")
