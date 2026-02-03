@@ -73,7 +73,7 @@ def get_all_folders():
 
     all_folders = []
     offset = 1
-    limit = 100
+    limit = 500  # 最大500件ずつ取得（APIの上限に応じて調整）
 
     while True:
         params = {"offset": offset, "limit": limit}
@@ -125,7 +125,7 @@ def get_folder_files(folder_id: int):
 
     all_files = []
     offset = 1
-    limit = 100
+    limit = 500  # 最大500件ずつ取得
 
     while True:
         params = {"folderId": folder_id, "offset": offset, "limit": limit}
@@ -240,23 +240,56 @@ if not SERVICE_SECRET or not LICENSE_KEY:
 with st.sidebar:
     st.title("🖼️ R-Cabinet")
 
+    st.markdown("####")  # 間隔調整
+
     mode = st.radio(
         "機能を選択",
-        ["📂 フォルダ画像一覧", "🔍 画像存在チェック"],
+        ["📂 画像一覧取得", "🔍 画像存在チェック"],
         label_visibility="collapsed"
     )
 
+    st.markdown("####")  # 間隔調整
     st.divider()
 
 
 # メインコンテンツ
-if mode == "📂 フォルダ画像一覧":
-    st.title("📂 フォルダ画像一覧")
+if mode == "📂 画像一覧取得":
+    st.title("📂 画像一覧取得")
     st.markdown("R-Cabinetのフォルダを選択して、画像を一覧表示します。")
 
-    # フォルダ一覧取得
-    with st.spinner("フォルダ一覧を取得中..."):
-        folders, error = get_all_folders()
+    # セッション状態の初期化
+    if "folders_loaded" not in st.session_state:
+        st.session_state.folders_loaded = False
+        st.session_state.folders_data = None
+        st.session_state.folders_error = None
+
+    # フォルダ一覧取得ボタン
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        fetch_btn = st.button("📂 フォルダ一覧を取得", type="primary")
+    with col2:
+        if st.session_state.folders_loaded:
+            if st.button("🔄 再取得"):
+                st.cache_data.clear()
+                st.session_state.folders_loaded = False
+                st.session_state.folders_data = None
+                st.rerun()
+
+    if fetch_btn:
+        with st.spinner("フォルダ一覧を取得中..."):
+            folders, error = get_all_folders()
+        st.session_state.folders_data = folders
+        st.session_state.folders_error = error
+        st.session_state.folders_loaded = True
+        st.rerun()
+
+    # フォルダ未取得の場合は停止
+    if not st.session_state.folders_loaded:
+        st.info("「フォルダ一覧を取得」ボタンを押してください。")
+        st.stop()
+
+    folders = st.session_state.folders_data
+    error = st.session_state.folders_error
 
     if error:
         st.error(error)
