@@ -72,14 +72,11 @@ def get_all_folders():
     headers = get_auth_header()
 
     all_folders = []
-    offset = 0  # 0始まり
+    offset = 1  # 1始まり（ページ番号）
     limit = 100  # APIの上限は100件
 
     while True:
-        # offsetが0の場合はパラメータを省略（デフォルト動作）
-        params = {"limit": limit}
-        if offset > 0:
-            params["offset"] = offset
+        params = {"offset": offset, "limit": limit}
 
         try:
             response = requests.get(url, headers=headers, params=params, timeout=30)
@@ -113,7 +110,7 @@ def get_all_folders():
         # 取得件数がlimit未満なら終了（最終ページ）
         if len(folders) < limit:
             break
-        offset += limit
+        offset += 1  # 次のページへ
         time.sleep(0.3)
 
     return all_folders, None
@@ -126,14 +123,11 @@ def get_folder_files(folder_id: int):
     headers = get_auth_header()
 
     all_files = []
-    offset = 0  # 0始まり
+    offset = 1  # 1始まり（ページ番号）
     limit = 100  # APIの上限は100件
 
     while True:
-        # offsetが0の場合はパラメータを省略
-        params = {"folderId": folder_id, "limit": limit}
-        if offset > 0:
-            params["offset"] = offset
+        params = {"folderId": folder_id, "offset": offset, "limit": limit}
 
         try:
             response = requests.get(url, headers=headers, params=params, timeout=30)
@@ -168,7 +162,7 @@ def get_folder_files(folder_id: int):
         # 取得件数がlimit未満なら終了（最終ページ）
         if len(files) < limit:
             break
-        offset += limit
+        offset += 1  # 次のページへ
         time.sleep(0.3)
 
     return all_files, None
