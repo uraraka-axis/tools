@@ -822,11 +822,12 @@ elif mode == "🔍 画像存在チェック":
 
         st.dataframe(df_display, use_container_width=True, height=400)
 
-        # ダウンロードボタンを横並びに（IS検索用CSV → Excel → スペース → 結果クリア）
-        dl_col1, dl_col2, dl_col3, dl_col4 = st.columns([1, 1, 2, 1])
+        # ダウンロードボタン
+        st.markdown("")  # スペース
+        dl_col1, dl_col2, dl_col3 = st.columns([2, 3, 1])
 
         with dl_col1:
-            # IS検索用CSVダウンロード（存在なしのコミックNoのみ）
+            # Comic Search検索用CSVダウンロード（存在なしのコミックNoのみ）
             not_exists_comics = [r['コミックNo'] for r in results if r['存在'] == '❌ なし']
             if not_exists_comics:
                 # list_コミックナンバー.csv形式で作成
@@ -850,13 +851,13 @@ elif mode == "🔍 画像存在チェック":
                 df_is_csv.to_csv(csv_buffer, index=False, encoding='cp932')
                 csv_buffer.seek(0)
                 st.download_button(
-                    label="📥 IS検索用CSV",
+                    label="📥 Comic Search検索用CSV",
                     data=csv_buffer,
                     file_name="list_コミックナンバー.csv",
                     mime="text/csv"
                 )
             else:
-                st.button("📥 IS検索用CSV", disabled=True, help="存在なしのコミックNoがありません")
+                st.button("📥 Comic Search検索用CSV", disabled=True, help="存在なしのコミックNoがありません")
 
         with dl_col2:
             # Excelダウンロード（スタイル付き）
@@ -866,15 +867,13 @@ elif mode == "🔍 画像存在チェック":
                 style_excel(writer.sheets['Sheet1'], num_columns=5, url_column=5)
             excel_buffer.seek(0)
             st.download_button(
-                label="📥 Excel",
+                label="📥 結果ファイルをExcelでダウンロード",
                 data=excel_buffer,
                 file_name="rcabinet_check_result.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
-        # dl_col3 はスペーサー（空）
-
-        with dl_col4:
+        with dl_col3:
             # 結果クリアボタン
             if st.button("🗑️ 結果をクリア"):
                 st.session_state.check_results = None
