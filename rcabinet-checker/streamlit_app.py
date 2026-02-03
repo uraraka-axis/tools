@@ -117,8 +117,8 @@ def get_all_folders():
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def get_folder_files(folder_id: int):
-    """指定フォルダ内の画像一覧を取得"""
+def get_folder_files(folder_id: int, max_retries: int = 3):
+    """指定フォルダ内の画像一覧を取得（リトライ機能付き）"""
     url = f"{BASE_URL}/cabinet/folder/files/get"
     headers = get_auth_header()
 
@@ -129,13 +129,24 @@ def get_folder_files(folder_id: int):
     while True:
         params = {"folderId": folder_id, "offset": offset, "limit": limit}
 
-        try:
-            response = requests.get(url, headers=headers, params=params, timeout=30)
-        except requests.exceptions.RequestException as e:
-            return None, f"接続エラー: {str(e)}"
+        # リトライ処理
+        for retry in range(max_retries):
+            try:
+                response = requests.get(url, headers=headers, params=params, timeout=30)
+            except requests.exceptions.RequestException as e:
+                if retry < max_retries - 1:
+                    time.sleep(2)  # 2秒待ってリトライ
+                    continue
+                return None, f"接続エラー: {str(e)}"
 
-        if response.status_code != 200:
-            return None, f"エラー: {response.status_code}"
+            if response.status_code == 200:
+                break  # 成功
+            elif response.status_code == 403 and retry < max_retries - 1:
+                time.sleep(3)  # 403の場合は3秒待ってリトライ
+                continue
+            else:
+                if retry == max_retries - 1:
+                    return None, f"エラー: {response.status_code}"
 
         try:
             root = ET.fromstring(response.text)
@@ -353,6 +364,10 @@ if mode == "📂 画像一覧取得":
                     progress_bar.progress((i + 1) / len(folders))
 
                     files, err = get_folder_files(int(folder['FolderId']))
+
+                    # フォルダ間のスリープ（レート制限対策）
+                    time.sleep(0.5)
+
                     if err:
                         error_folders.append({
                             'FolderName': folder['FolderName'],
