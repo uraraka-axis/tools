@@ -261,22 +261,75 @@ if mode == "📂 フォルダ画像一覧":
     if error:
         st.error(error)
     elif folders:
+        # 総ファイル数を計算
+        total_files = sum(f['FileCount'] for f in folders)
+
         # サイドバーにフォルダ情報
         with st.sidebar:
             st.success(f"📁 {len(folders)} フォルダ")
+            st.info(f"📷 {total_files} 画像（全体）")
 
-        # フォルダ選択
-        folder_options = {f"{f['FolderName']} ({f['FileCount']}件)": f for f in folders}
+        # フォルダ選択（「すべて」オプションを追加）
+        folder_options = {"📁 すべて": None}
+        folder_options.update({f"{f['FolderName']} ({f['FileCount']}件)": f for f in folders})
+
         selected_folder_name = st.selectbox(
             "フォルダを選択",
             list(folder_options.keys())
         )
 
-        if selected_folder_name:
+        st.divider()
+
+        if selected_folder_name == "📁 すべて":
+            # 全フォルダの画像を取得
+            all_files = []
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+
+            for i, folder in enumerate(folders):
+                status_text.text(f"取得中: {folder['FolderName']} ({i + 1}/{len(folders)})")
+                progress_bar.progress((i + 1) / len(folders))
+
+                files, err = get_folder_files(int(folder['FolderId']))
+                if files:
+                    for f in files:
+                        f['FolderName'] = folder['FolderName']
+                    all_files.extend(files)
+
+            progress_bar.empty()
+            status_text.empty()
+
+            if all_files:
+                st.success(f"📷 {len(all_files)} 件の画像（全フォルダ）")
+
+                # 検索フィルター
+                search_term = st.text_input("🔍 ファイル名で絞り込み", placeholder="検索キーワード")
+
+                if search_term:
+                    all_files = [f for f in all_files if search_term.lower() in f['FileName'].lower()]
+                    st.info(f"絞り込み結果: {len(all_files)} 件")
+
+                # データフレーム表示
+                df = pd.DataFrame(all_files)
+                df = df[['FolderName', 'FileName', 'FileUrl', 'FileSize', 'TimeStamp']]
+                df.columns = ['フォルダ', 'ファイル名', 'URL', 'サイズ(KB)', '更新日時']
+
+                st.dataframe(df, use_container_width=True, height=500)
+
+                # CSVダウンロード
+                csv_data = df.to_csv(index=False, encoding='utf-8-sig')
+                st.download_button(
+                    label="📥 全データをCSVでダウンロード",
+                    data=csv_data,
+                    file_name="rcabinet_all_files.csv",
+                    mime="text/csv"
+                )
+            else:
+                st.warning("画像がありません。")
+
+        elif selected_folder_name:
             selected_folder = folder_options[selected_folder_name]
             folder_id = int(selected_folder['FolderId'])
-
-            st.divider()
 
             # 画像一覧取得
             with st.spinner(f"「{selected_folder['FolderName']}」の画像を取得中..."):
