@@ -822,24 +822,10 @@ elif mode == "🔍 画像存在チェック":
 
         st.dataframe(df_display, use_container_width=True, height=400)
 
-        # ダウンロードボタンを横並びに
-        dl_col1, dl_col2, dl_col3 = st.columns([1, 1, 1])
+        # ダウンロードボタンを横並びに（IS検索用CSV → Excel → 結果クリア）
+        dl_col1, dl_col2, dl_col3 = st.columns([2, 2, 3])
 
         with dl_col1:
-            # Excelダウンロード（スタイル付き）
-            excel_buffer = BytesIO()
-            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                df_results.to_excel(writer, index=False, sheet_name='Sheet1')
-                style_excel(writer.sheets['Sheet1'], num_columns=5, url_column=5)
-            excel_buffer.seek(0)
-            st.download_button(
-                label="📥 結果をExcelでダウンロード",
-                data=excel_buffer,
-                file_name="rcabinet_check_result.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-
-        with dl_col2:
             # IS検索用CSVダウンロード（存在なしのコミックNoのみ）
             not_exists_comics = [r['コミックNo'] for r in results if r['存在'] == '❌ なし']
             if not_exists_comics:
@@ -871,6 +857,20 @@ elif mode == "🔍 画像存在チェック":
                 )
             else:
                 st.button("📥 IS検索用CSV", disabled=True, help="存在なしのコミックNoがありません")
+
+        with dl_col2:
+            # Excelダウンロード（スタイル付き）
+            excel_buffer = BytesIO()
+            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                df_results.to_excel(writer, index=False, sheet_name='Sheet1')
+                style_excel(writer.sheets['Sheet1'], num_columns=5, url_column=5)
+            excel_buffer.seek(0)
+            st.download_button(
+                label="📥 Excelでダウンロード",
+                data=excel_buffer,
+                file_name="rcabinet_check_result.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 
         with dl_col3:
             # 結果クリアボタン
