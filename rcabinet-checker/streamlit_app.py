@@ -425,6 +425,10 @@ elif mode == "🔍 画像存在チェック":
     st.title("🔍 画像存在チェック")
     st.markdown("コミックNoを入力して、R-Cabinetに画像が存在するか確認します。")
 
+    # セッション状態の初期化
+    if "check_results" not in st.session_state:
+        st.session_state.check_results = None
+
     st.divider()
 
     # 入力方法の選択
@@ -474,13 +478,13 @@ elif mode == "🔍 画像存在チェック":
 
     st.divider()
 
-    # チェック実行
-    if comic_numbers:
-        check_button = st.button("🔍 チェック実行", type="primary")
+    # チェック実行ボタン（常に表示）
+    check_button = st.button("🔍 チェック実行", type="primary")
 
-        if check_button:
-            st.markdown("### チェック結果")
-
+    if check_button:
+        if not comic_numbers:
+            st.warning("コミックNoを入力またはCSVをアップロードしてください。")
+        else:
             progress_bar = st.progress(0)
             status_text = st.empty()
 
@@ -489,41 +493,50 @@ elif mode == "🔍 画像存在チェック":
             progress_bar.empty()
             status_text.empty()
 
-            if results:
-                df_results = pd.DataFrame(results)
+            # 結果をsession_stateに保存
+            st.session_state.check_results = results
 
-                exists_count = len([r for r in results if r['存在'] == '✅ あり'])
-                not_exists_count = len([r for r in results if r['存在'] == '❌ なし'])
+    # 結果表示（session_stateから）
+    if st.session_state.check_results:
+        results = st.session_state.check_results
+        df_results = pd.DataFrame(results)
 
-                col1, col2, col3 = st.columns(3)
-                col1.metric("総数", len(comic_numbers))
-                col2.metric("存在あり", exists_count)
-                col3.metric("存在なし", not_exists_count)
+        st.markdown("### チェック結果")
 
-                st.divider()
+        exists_count = len([r for r in results if r['存在'] == '✅ あり'])
+        not_exists_count = len([r for r in results if r['存在'] == '❌ なし'])
 
-                filter_option = st.radio(
-                    "表示フィルター",
-                    ["すべて", "存在あり", "存在なし"],
-                    horizontal=True
-                )
+        col1, col2, col3 = st.columns(3)
+        col1.metric("総数", len(results))
+        col2.metric("存在あり", exists_count)
+        col3.metric("存在なし", not_exists_count)
 
-                if filter_option == "存在あり":
-                    df_display = df_results[df_results['存在'] == '✅ あり']
-                elif filter_option == "存在なし":
-                    df_display = df_results[df_results['存在'] == '❌ なし']
-                else:
-                    df_display = df_results
+        st.divider()
 
-                st.dataframe(df_display, use_container_width=True, height=400)
+        filter_option = st.radio(
+            "表示フィルター",
+            ["すべて", "存在あり", "存在なし"],
+            horizontal=True
+        )
 
-                csv_data = df_results.to_csv(index=False, encoding='utf-8-sig')
-                st.download_button(
-                    label="📥 結果をCSVでダウンロード",
-                    data=csv_data,
-                    file_name="rcabinet_check_result.csv",
-                    mime="text/csv"
-                )
+        if filter_option == "存在あり":
+            df_display = df_results[df_results['存在'] == '✅ あり']
+        elif filter_option == "存在なし":
+            df_display = df_results[df_results['存在'] == '❌ なし']
+        else:
+            df_display = df_results
 
-    else:
-        st.warning("コミックNoを入力またはCSVをアップロードしてください。")
+        st.dataframe(df_display, use_container_width=True, height=400)
+
+        csv_data = df_results.to_csv(index=False, encoding='utf-8-sig')
+        st.download_button(
+            label="📥 結果をCSVでダウンロード",
+            data=csv_data,
+            file_name="rcabinet_check_result.csv",
+            mime="text/csv"
+        )
+
+        # 結果クリアボタン
+        if st.button("🗑️ 結果をクリア"):
+            st.session_state.check_results = None
+            st.rerun()
