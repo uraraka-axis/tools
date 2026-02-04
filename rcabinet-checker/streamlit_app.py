@@ -13,9 +13,11 @@ import time
 import zipfile
 import random
 from io import BytesIO
+from datetime import datetime
 from bs4 import BeautifulSoup
 from openpyxl.styles import Font, Border, Side, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
+from supabase import create_client, Client
 
 # ページ設定
 st.set_page_config(
@@ -29,6 +31,71 @@ APP_PASSWORD = st.secrets.get("password", "")
 SERVICE_SECRET = st.secrets.get("RMS_SERVICE_SECRET", "")
 LICENSE_KEY = st.secrets.get("RMS_LICENSE_KEY", "")
 BASE_URL = "https://api.rms.rakuten.co.jp/es/1.0"
+
+# Supabase接続情報
+SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
+SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "")
+
+
+@st.cache_resource
+def get_supabase_client() -> Client:
+    """Supabaseクライアントを取得"""
+    if SUPABASE_URL and SUPABASE_KEY:
+        return create_client(SUPABASE_URL, SUPABASE_KEY)
+    return None
+
+
+def save_images_to_db(images: list) -> tuple[bool, str]:
+    """画像一覧をDBに保存"""
+    supabase = get_supabase_client()
+    if not supabase:
+        return False, "Supabase未設定"
+
+    try:
+        # 既存データを削除
+        supabase.table("rcabinet_images").delete().neq("id", 0).execute()
+
+        # 新規データを挿入
+        records = []
+        for img in images:
+            records.append({
+                "folder_name": img.get("FolderName", ""),
+                "file_name": img.get("FileName", ""),
+                "file_url": img.get("FileUrl", ""),
+                "file_size": img.get("FileSize", 0),
+                "file_timestamp": img.get("TimeStamp", "")
+            })
+
+        # バッチインサート（100件ずつ）
+        for i in range(0, len(records), 100):
+            batch = records[i:i+100]
+            supabase.table("rcabinet_images").insert(batch).execute()
+
+        return True, f"{len(records)}件を保存しました"
+    except Exception as e:
+        return False, str(e)
+
+
+def load_images_from_db() -> tuple[list, str]:
+    """DBから画像一覧を読み込み"""
+    supabase = get_supabase_client()
+    if not supabase:
+        return [], "Supabase未設定"
+
+    try:
+        response = supabase.table("rcabinet_images").select("*").execute()
+        images = []
+        for row in response.data:
+            images.append({
+                "FolderName": row.get("folder_name", ""),
+                "FileName": row.get("file_name", ""),
+                "FileUrl": row.get("file_url", ""),
+                "FileSize": row.get("file_size", 0),
+                "TimeStamp": row.get("file_timestamp", "")
+            })
+        return images, f"{len(images)}件を読み込みました"
+    except Exception as e:
+        return [], str(e)
 
 
 def check_password():
@@ -669,6 +736,29 @@ if mode == "📂 画像一覧取得":
                     file_name="rcabinet_all_files.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
+
+                # DB保存ボタン
+                st.divider()
+                db_col1, db_col2, _ = st.columns([1, 1, 2])
+                with db_col1:
+                    if st.button("💾 DBに保存", help="現在の一覧をSupabaseに保存"):
+                        with st.spinner("保存中..."):
+                            success, msg = save_images_to_db(all_files)
+                        if success:
+                            st.success(msg)
+                        else:
+                            st.error(msg)
+                with db_col2:
+                    if st.button("📂 DBから読み込み", help="Supabaseから一覧を読み込み"):
+                        with st.spinner("読み込み中..."):
+                            loaded_images, msg = load_images_from_db()
+                        if loaded_images:
+                            st.success(msg)
+                            st.session_state.images_data = loaded_images
+                            st.session_state.images_loaded = True
+                            st.rerun()
+                        else:
+                            st.warning(msg)
             else:
                 st.warning("画像がありません。")
 
