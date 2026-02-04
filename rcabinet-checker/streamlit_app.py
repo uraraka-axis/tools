@@ -176,6 +176,64 @@ def get_github_file_info(path: str) -> dict:
         return {"exists": False}
 
 
+def trigger_github_actions(workflow_file: str) -> dict:
+    """GitHub Actionsワークフローを手動実行"""
+    if not GITHUB_TOKEN:
+        return {"success": False, "error": "GITHUB_TOKEN未設定"}
+
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/{workflow_file}/dispatches"
+
+    try:
+        response = requests.post(url, headers=headers, json={"ref": "master"})
+        if response.status_code == 204:
+            return {"success": True, "message": "ワークフローを開始しました"}
+        elif response.status_code == 404:
+            return {"success": False, "error": "ワークフローが見つかりません"}
+        else:
+            return {"success": False, "error": f"HTTP {response.status_code}: {response.text[:200]}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def get_workflow_runs(workflow_file: str, limit: int = 3) -> list:
+    """GitHub Actionsワークフローの実行履歴を取得"""
+    if not GITHUB_TOKEN:
+        return []
+
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/{workflow_file}/runs?per_page={limit}"
+
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            runs = response.json().get("workflow_runs", [])
+            result = []
+            for run in runs:
+                created = run.get("created_at", "")
+                if created:
+                    dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    created = dt.strftime("%Y-%m-%d %H:%M")
+                result.append({
+                    "status": run.get("status"),
+                    "conclusion": run.get("conclusion"),
+                    "created_at": created,
+                    "html_url": run.get("html_url")
+                })
+            return result
+        return []
+    except:
+        return []
+
+
 @st.cache_resource
 def get_supabase_client() -> Client:
     """Supabaseクライアントを取得"""
@@ -1301,8 +1359,42 @@ elif mode == "📥 不足画像取得":
         else:
             st.warning("フォルダ階層リスト\n未配置")
 
-    # GitHubから取得ボタン
-    if st.button("📥 GitHubから一括取得", type="primary"):
+    # GitHub Actions 実行セクション
+    st.markdown("#### GitHub Actions")
+
+    # 最新の実行履歴を表示
+    runs = get_workflow_runs("weekly-comic-lister.yml", limit=1)
+    if runs:
+        latest = runs[0]
+        status_icon = "🟢" if latest["conclusion"] == "success" else "🔴" if latest["conclusion"] == "failure" else "🟡"
+        status_text = {
+            "success": "成功",
+            "failure": "失敗",
+            "cancelled": "キャンセル",
+            None: "実行中"
+        }.get(latest["conclusion"], latest["status"])
+        st.caption(f"最終実行: {latest['created_at']} {status_icon} {status_text}")
+
+    # ボタンを横並びに配置
+    btn_col1, btn_col2, _ = st.columns([1.5, 1.5, 2])
+
+    with btn_col1:
+        run_actions = st.button("🚀 GitHub Actions実行", help="comic_list.csv と is_list.csv を生成")
+
+    with btn_col2:
+        fetch_files = st.button("📥 GitHubから一括取得", type="primary")
+
+    # GitHub Actions 実行処理
+    if run_actions:
+        with st.spinner("ワークフローを開始中..."):
+            result = trigger_github_actions("weekly-comic-lister.yml")
+        if result.get("success"):
+            st.success("ワークフローを開始しました（完了まで数分かかります）")
+        else:
+            st.error(f"実行失敗: {result.get('error')}")
+
+    # GitHubから一括取得処理
+    if fetch_files:
         with st.spinner("GitHubからファイルを取得中..."):
             errors = []
 
