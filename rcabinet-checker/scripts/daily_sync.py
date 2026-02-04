@@ -98,10 +98,17 @@ def get_folder_files(folder_id: int):
             break
 
         for file in files:
+            # FileSizeは小数点を含む場合があるのでfloatで処理
+            file_size_str = file.findtext('FileSize', '0')
+            try:
+                file_size = int(float(file_size_str))
+            except ValueError:
+                file_size = 0
+
             file_data = {
                 'FileName': file.findtext('FileName', ''),
                 'FileUrl': file.findtext('FileUrl', ''),
-                'FileSize': int(file.findtext('FileSize', '0')),
+                'FileSize': file_size,
                 'TimeStamp': file.findtext('TimeStamp', '')
             }
             all_files.append(file_data)
