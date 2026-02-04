@@ -326,7 +326,7 @@ def get_supabase_client():
     return None
 
 
-def fetch_all_from_supabase(supabase: Client, table: str, columns: str = "*", filter_col: str = None, filter_val: str = None) -> list:
+def fetch_all_from_supabase(supabase, table: str, columns: str = "*", filter_col: str = None, filter_val: str = None) -> list:
     """Supabaseから全件取得（ページネーション対応）"""
     all_data = []
     page_size = 1000
