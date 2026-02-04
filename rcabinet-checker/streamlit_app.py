@@ -645,13 +645,24 @@ def get_bookoff_image(jan_code, session):
 
 
 def get_amazon_image(jan_code, session):
-    """Amazonから画像URL取得"""
+    """Amazonから画像URL取得（複数セレクタ対応）"""
     search_url = f"https://www.amazon.co.jp/s?k={jan_code}&i=stripbooks"
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
     }
+
+    # 複数のセレクタを試す（サイト構造変更に対応）
+    SELECTORS = [
+        '.s-image',
+        'img[data-image-latency]',
+        '.s-product-image img',
+        '[data-component-type="s-product-image"] img',
+        '.s-result-item img[src*="images-na"]',
+        '.s-result-item img[src*="m.media-amazon"]',
+    ]
 
     try:
         response = session.get(search_url, headers=headers, timeout=15)
@@ -660,13 +671,68 @@ def get_amazon_image(jan_code, session):
         response.raise_for_status()
 
         soup = BeautifulSoup(response.content, 'html.parser')
-        img_tag = soup.select_one('.s-image')
 
-        if img_tag and img_tag.get('src'):
-            image_url = img_tag['src']
-            if '_AC_' in image_url:
-                image_url = image_url.split('._AC_')[0] + '._SY466_.jpg'
-            return image_url
+        # 複数のセレクタを順番に試す
+        for selector in SELECTORS:
+            img_tags = soup.select(selector)
+            for img_tag in img_tags:
+                src = img_tag.get('src') or img_tag.get('data-src')
+                if src and ('images-na' in src or 'm.media-amazon' in src or 'images-amazon' in src):
+                    # NO IMAGE系を除外
+                    if 'no-img' not in src.lower() and 'no_image' not in src.lower():
+                        # 高解像度版に変換
+                        if '_AC_' in src:
+                            src = src.split('._AC_')[0] + '._SY466_.jpg'
+                        elif '_SX' in src or '_SY' in src:
+                            # サイズ指定を大きくする
+                            import re
+                            src = re.sub(r'\._S[XY]\d+_', '._SY466_', src)
+                        return src
+
+        # フォールバック: 正規表現でAmazon画像URLを探す
+        import re
+        amazon_img_pattern = r'(https?://[^"\']+(?:images-na\.ssl-images-amazon|m\.media-amazon|images-amazon)[^"\'\s]+\.(?:jpg|jpeg|png))'
+        matches = re.findall(amazon_img_pattern, response.text)
+        for match in matches:
+            if 'no-img' not in match.lower() and 'no_image' not in match.lower() and 'sprite' not in match.lower():
+                if '_AC_' in match:
+                    match = match.split('._AC_')[0] + '._SY466_.jpg'
+                return match
+
+        return None
+    except Exception:
+        return None
+
+
+def get_rakuten_image(jan_code, session):
+    """楽天ブックスから画像URL取得（Amazonのフォールバック）"""
+    search_url = f"https://books.rakuten.co.jp/search?g=001&isbn={jan_code}"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    }
+
+    try:
+        response = session.get(search_url, headers=headers, timeout=10)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        # 楽天ブックスの画像セレクタ
+        selectors = [
+            '.rbcomp__item-list__item__image img',
+            '.item-image img',
+            'img[src*="thumbnail.image.rakuten"]',
+        ]
+
+        for selector in selectors:
+            img_tag = soup.select_one(selector)
+            if img_tag:
+                src = img_tag.get('src') or img_tag.get('data-src')
+                if src and 'noimage' not in src.lower():
+                    # 大きいサイズに変換
+                    src = src.replace('_ex=64x64', '_ex=200x200').replace('_ex=100x100', '_ex=200x200')
+                    return src
+
         return None
     except Exception:
         return None
@@ -1560,7 +1626,7 @@ elif mode == "📥 不足画像取得":
 
                 session = requests.Session()
                 downloaded_images = []
-                stats = {'total': len(result_data), 'success': 0, 'bookoff': 0, 'amazon': 0, 'failed': 0}
+                stats = {'total': len(result_data), 'success': 0, 'bookoff': 0, 'amazon': 0, 'rakuten': 0, 'failed': 0}
 
                 for i, data in enumerate(result_data):
                     jan_code = data['first_jan']
@@ -1573,15 +1639,21 @@ elif mode == "📥 不足画像取得":
                         stats['failed'] += 1
                         continue
 
-                    # ブックオフで検索
+                    # 1. ブックオフで検索
                     image_url = get_bookoff_image(jan_code, session)
                     source = 'bookoff'
 
+                    # 2. Amazonで検索
                     if not image_url:
-                        # Amazonで検索
                         time.sleep(random.uniform(0.5, 1.0))
                         image_url = get_amazon_image(jan_code, session)
                         source = 'amazon'
+
+                    # 3. 楽天ブックスで検索（フォールバック）
+                    if not image_url:
+                        time.sleep(random.uniform(0.3, 0.6))
+                        image_url = get_rakuten_image(jan_code, session)
+                        source = 'rakuten'
 
                     if image_url:
                         image_data = download_image(image_url, session)
@@ -1594,10 +1666,7 @@ elif mode == "📥 不足画像取得":
                                 'title': data['title']
                             })
                             stats['success'] += 1
-                            if source == 'bookoff':
-                                stats['bookoff'] += 1
-                            else:
-                                stats['amazon'] += 1
+                            stats[source] += 1
                         else:
                             stats['failed'] += 1
                     else:
@@ -1630,11 +1699,12 @@ elif mode == "📥 不足画像取得":
 
         # 結果サマリー
         st.markdown("### 結果")
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5 = st.columns(5)
         col1.metric("総数", stats['total'])
         col2.metric("成功", stats['success'])
         col3.metric("ブックオフ", stats['bookoff'])
         col4.metric("Amazon", stats['amazon'])
+        col5.metric("楽天", stats.get('rakuten', 0))
 
         if stats['failed'] > 0:
             st.warning(f"取得できなかった画像: {stats['failed']}件")
