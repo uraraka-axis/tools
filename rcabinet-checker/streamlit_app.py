@@ -167,10 +167,11 @@ def get_github_file_info(path: str) -> dict:
             commit = response.json()[0]
             date_str = commit.get("commit", {}).get("committer", {}).get("date", "")
             if date_str:
-                # ISO形式をパース
-                from datetime import datetime
-                dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-                return {"last_updated": dt.strftime("%Y-%m-%d %H:%M"), "exists": True}
+                # ISO形式をパースして日本時間に変換（+9時間）
+                from datetime import datetime, timedelta, timezone
+                dt_utc = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                dt_jst = dt_utc + timedelta(hours=9)
+                return {"last_updated": dt_jst.strftime("%Y-%m-%d %H:%M"), "exists": True}
         return {"exists": False}
     except:
         return {"exists": False}
@@ -1359,39 +1360,42 @@ elif mode == "📥 不足画像取得":
         else:
             st.warning("フォルダ階層リスト\n未配置")
 
-    # GitHub Actions 実行セクション
-    st.markdown("#### GitHub Actions")
+    # CSV生成・取得セクション
+    st.markdown("#### CSVファイル操作")
 
-    # 最新の実行履歴を表示
+    # 最新の実行履歴を表示（日本時間に変換）
     runs = get_workflow_runs("weekly-comic-lister.yml", limit=1)
     if runs:
         latest = runs[0]
         status_icon = "🟢" if latest["conclusion"] == "success" else "🔴" if latest["conclusion"] == "failure" else "🟡"
-        status_text = {
-            "success": "成功",
-            "failure": "失敗",
-            "cancelled": "キャンセル",
-            None: "実行中"
-        }.get(latest["conclusion"], latest["status"])
-        st.caption(f"最終実行: {latest['created_at']} {status_icon} {status_text}")
+        # 日本時間に変換（+9時間）
+        from datetime import timedelta
+        try:
+            dt_utc = datetime.strptime(latest['created_at'], "%Y-%m-%d %H:%M")
+            dt_jst = dt_utc + timedelta(hours=9)
+            jst_str = dt_jst.strftime("%Y-%m-%d %H:%M")
+        except:
+            jst_str = latest['created_at']
+        status_text = "完了" if latest["conclusion"] == "success" else "失敗" if latest["conclusion"] == "failure" else "処理中..."
+        st.caption(f"前回生成: {jst_str} {status_icon} {status_text}")
 
-    # ボタンを横並びに配置
-    btn_col1, btn_col2, _ = st.columns([1.5, 1.5, 2])
+    # ボタンを横並びに配置（間隔を詰める）
+    btn_col1, btn_col2, _ = st.columns([1, 1, 3])
 
     with btn_col1:
-        run_actions = st.button("🚀 GitHub Actions実行", help="comic_list.csv と is_list.csv を生成")
+        run_actions = st.button("📊 CSVファイル生成", type="secondary", help="不足コミックのCSVファイルを自動生成します")
 
     with btn_col2:
-        fetch_files = st.button("📥 GitHubから一括取得", type="primary")
+        fetch_files = st.button("📥 ファイル取得", type="primary", help="生成済みのファイルをダウンロードします")
 
     # GitHub Actions 実行処理
     if run_actions:
-        with st.spinner("ワークフローを開始中..."):
+        with st.spinner("CSVファイル生成を開始中..."):
             result = trigger_github_actions("weekly-comic-lister.yml")
         if result.get("success"):
-            st.success("ワークフローを開始しました（完了まで数分かかります）")
+            st.success("CSVファイルの生成を開始しました（完了まで2〜3分お待ちください）")
         else:
-            st.error(f"実行失敗: {result.get('error')}")
+            st.error(f"生成開始に失敗しました: {result.get('error')}")
 
     # GitHubから一括取得処理
     if fetch_files:
