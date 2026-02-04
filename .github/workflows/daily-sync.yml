@@ -1,0 +1,33 @@
+name: Daily R-Cabinet Sync
+
+on:
+  schedule:
+    # 毎日AM8:00 JST = 前日23:00 UTC
+    - cron: '0 23 * * *'
+  workflow_dispatch:  # 手動実行も可能
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install requests supabase
+
+      - name: Run daily sync
+        env:
+          RMS_SERVICE_SECRET: ${{ secrets.RMS_SERVICE_SECRET }}
+          RMS_LICENSE_KEY: ${{ secrets.RMS_LICENSE_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python rcabinet-checker/scripts/daily_sync.py
