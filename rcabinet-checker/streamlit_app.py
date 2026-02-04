@@ -4,24 +4,76 @@ R-Cabinet 管理ツール
 - 画像存在チェック：コミックNoを入力して存在確認
 """
 
+# バージョン（デプロイ確認用）
+APP_VERSION = "2.1.0"
+
 import streamlit as st
 import requests
 import base64
 import xml.etree.ElementTree as ET
 import pandas as pd
 import time
-import zipfile
-import random
 from io import BytesIO
 from datetime import datetime
-from bs4 import BeautifulSoup
-from openpyxl.styles import Font, Border, Side, PatternFill, Alignment
-from openpyxl.utils import get_column_letter
-from supabase import create_client, Client
+
+# 重いライブラリは遅延読み込み（起動高速化）
+_bs4_module = None
+_openpyxl_styles = None
+_openpyxl_utils = None
+_supabase_module = None
+_zipfile_module = None
+_random_module = None
 
 # Gemini AI（遅延読み込み - 起動高速化のため）
-GEMINI_AVAILABLE = None  # 初回使用時にチェック
+GEMINI_AVAILABLE = None
 _genai_module = None
+
+
+def get_bs4():
+    """BeautifulSoupを遅延読み込み"""
+    global _bs4_module
+    if _bs4_module is None:
+        from bs4 import BeautifulSoup
+        _bs4_module = BeautifulSoup
+    return _bs4_module
+
+
+def get_openpyxl_styles():
+    """openpyxlスタイルを遅延読み込み"""
+    global _openpyxl_styles, _openpyxl_utils
+    if _openpyxl_styles is None:
+        from openpyxl.styles import Font, Border, Side, PatternFill, Alignment
+        from openpyxl.utils import get_column_letter
+        _openpyxl_styles = {'Font': Font, 'Border': Border, 'Side': Side, 'PatternFill': PatternFill, 'Alignment': Alignment}
+        _openpyxl_utils = {'get_column_letter': get_column_letter}
+    return _openpyxl_styles, _openpyxl_utils
+
+
+def get_supabase_module():
+    """Supabaseを遅延読み込み"""
+    global _supabase_module
+    if _supabase_module is None:
+        from supabase import create_client
+        _supabase_module = create_client
+    return _supabase_module
+
+
+def get_zipfile():
+    """zipfileを遅延読み込み"""
+    global _zipfile_module
+    if _zipfile_module is None:
+        import zipfile
+        _zipfile_module = zipfile
+    return _zipfile_module
+
+
+def get_random():
+    """randomを遅延読み込み"""
+    global _random_module
+    if _random_module is None:
+        import random
+        _random_module = random
+    return _random_module
 
 # ページ設定
 st.set_page_config(
@@ -266,9 +318,10 @@ def get_workflow_runs(workflow_file: str, limit: int = 3) -> list:
 
 
 @st.cache_resource
-def get_supabase_client() -> Client:
-    """Supabaseクライアントを取得"""
+def get_supabase_client():
+    """Supabaseクライアントを取得（遅延読み込み）"""
     if SUPABASE_URL and SUPABASE_KEY:
+        create_client = get_supabase_module()
         return create_client(SUPABASE_URL, SUPABASE_KEY)
     return None
 
@@ -487,6 +540,14 @@ def safe_int(value, default=0):
 
 def style_excel(ws, num_columns=4, url_column=None):
     """Excelワークシートにスタイルを適用"""
+    styles, utils = get_openpyxl_styles()
+    Font = styles['Font']
+    Border = styles['Border']
+    Side = styles['Side']
+    PatternFill = styles['PatternFill']
+    Alignment = styles['Alignment']
+    get_column_letter = utils['get_column_letter']
+
     # フォント設定
     meiryo_font = Font(name='Meiryo UI')
     header_font = Font(name='Meiryo UI', bold=True, color='FFFFFF')
@@ -563,39 +624,49 @@ def merge_csv_data(is_df, cl_df):
     return is_df
 
 
+def normalize_jan_code(value):
+    """JANコードを正規化（数値の.0除去、nan除去）"""
+    if pd.isna(value):
+        return ''
+    jan_str = str(value).strip()
+    # '.0' を除去（pandasで数値として読み込まれた場合）
+    if jan_str.endswith('.0'):
+        jan_str = jan_str[:-2]
+    # 'nan' は空文字に
+    if jan_str.lower() == 'nan':
+        return ''
+    return jan_str
+
+
 def extract_first_volumes(merged_df):
     """1巻のみを抽出して整形"""
     first_vol_dict = {}
     latest_vol_dict = {}
-    processed_comic_nos = set()
-    result_data = []
+    comic_info_dict = {}  # comic_noごとの情報を保持
 
+    # パス1: 全行を処理して first_vol_dict と latest_vol_dict を構築
     for i in range(1, len(merged_df)):
         try:
-            comic_no = str(merged_df.iloc[i, 6]).strip() if len(merged_df.columns) > 6 else ''  # G列
-            if not comic_no or comic_no == 'nan':
+            comic_no = normalize_jan_code(merged_df.iloc[i, 6]) if len(merged_df.columns) > 6 else ''  # G列
+            if not comic_no:
                 continue
 
-            # JAN情報
-            jan_code = str(merged_df.iloc[i, 5]).strip() if len(merged_df.columns) > 5 else ''  # F列
-            if jan_code and jan_code != 'nan':
+            # JAN情報（正規化）
+            jan_code = normalize_jan_code(merged_df.iloc[i, 5]) if len(merged_df.columns) > 5 else ''  # F列
+            if jan_code:
                 latest_vol_dict[comic_no] = jan_code
 
             # 1巻チェック（J列）
             volume = str(merged_df.iloc[i, 9]).strip() if len(merged_df.columns) > 9 else ''
             if volume == '1' or volume == '1.0':
-                if comic_no not in first_vol_dict:
+                if comic_no not in first_vol_dict and jan_code:
                     first_vol_dict[comic_no] = jan_code
 
-            if comic_no not in processed_comic_nos:
-                processed_comic_nos.add(comic_no)
-
-                first_jan = first_vol_dict.get(comic_no, latest_vol_dict.get(comic_no, ''))
-
-                row_data = {
+            # comic_noの最初の出現行の情報を保持
+            if comic_no not in comic_info_dict:
+                comic_info_dict[comic_no] = {
                     'kaikatsu_narabi': str(merged_df.iloc[i, 3]).strip() if len(merged_df.columns) > 3 else '',
                     'first_isbn': str(merged_df.iloc[i, 4]).strip() if len(merged_df.columns) > 4 else '',
-                    'first_jan': first_jan,
                     'comic_no': comic_no,
                     'genre': str(merged_df.iloc[i, 7]).strip() if len(merged_df.columns) > 7 else '',
                     'title': str(merged_df.iloc[i, 8]).strip() if len(merged_df.columns) > 8 else '',
@@ -603,9 +674,16 @@ def extract_first_volumes(merged_df):
                     'author': str(merged_df.iloc[i, 12]).strip() if len(merged_df.columns) > 12 else '',
                     'series': str(merged_df.iloc[i, 13]).strip() if len(merged_df.columns) > 13 else '',
                 }
-                result_data.append(row_data)
         except Exception:
             continue
+
+    # パス2: result_dataを構築（全行処理後にfirst_janを設定）
+    result_data = []
+    for comic_no, info in comic_info_dict.items():
+        # 1巻のJAN > 最新巻のJAN > 空 の優先順位
+        first_jan = first_vol_dict.get(comic_no, latest_vol_dict.get(comic_no, ''))
+        info['first_jan'] = first_jan
+        result_data.append(info)
 
     # 快活並びでソート
     result_data.sort(key=lambda x: int(float(x['kaikatsu_narabi'])) if x['kaikatsu_narabi'] and x['kaikatsu_narabi'] != 'nan' else 999999)
@@ -656,6 +734,7 @@ def get_bookoff_image(jan_code, session):
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 
     NO_IMAGE_PATTERNS = ['item_ll.gif', 'no_image', 'noimage', 'no-image', 'dummy', 'blank', 'spacer']
+    BeautifulSoup = get_bs4()
 
     try:
         response = session.get(url, headers=headers, timeout=10)
@@ -693,6 +772,7 @@ def get_amazon_image(jan_code, session):
         '.s-result-item img[src*="images-na"]',
         '.s-result-item img[src*="m.media-amazon"]',
     ]
+    BeautifulSoup = get_bs4()
 
     try:
         response = session.get(search_url, headers=headers, timeout=15)
@@ -740,6 +820,7 @@ def get_rakuten_image(jan_code, session):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     }
+    BeautifulSoup = get_bs4()
 
     try:
         response = session.get(search_url, headers=headers, timeout=10)
@@ -788,6 +869,7 @@ def get_image_with_gemini_ai(jan_code, session, source_name="amazon"):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     }
+    BeautifulSoup = get_bs4()
 
     try:
         response = session.get(search_url, headers=headers, timeout=15)
@@ -1053,6 +1135,7 @@ if not SERVICE_SECRET or not LICENSE_KEY:
 # サイドバー：モード切替
 with st.sidebar:
     st.title("🖼️ R-Cabinet")
+    st.caption(f"v{APP_VERSION}")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -1517,22 +1600,57 @@ elif mode == "📥 不足画像取得":
     st.markdown("### ステップ0: GitHubからファイル取得")
     st.markdown("GitHub Actionsで生成されたファイルを取得します。")
 
+    # 自動ダウンロードフラグ（無限ループ防止）
+    if "auto_download_tried" not in st.session_state:
+        st.session_state.auto_download_tried = False
+
+    # まだセッションに読み込まれていない場合は自動ダウンロード（1回だけ試行）
+    not_loaded_yet = not st.session_state.github_is_list or not st.session_state.github_comic_list or not st.session_state.github_folder_hierarchy
+
+    if not_loaded_yet and not st.session_state.auto_download_tried:
+        st.session_state.auto_download_tried = True
+        with st.spinner("GitHubからファイルを自動取得中..."):
+            auto_errors = []
+            if not st.session_state.github_is_list:
+                result = download_from_github(GITHUB_IS_LIST_PATH)
+                if result.get("success"):
+                    st.session_state.github_is_list = result["content"]
+                else:
+                    auto_errors.append(f"is_list.csv: {result.get('error', '不明')}")
+            if not st.session_state.github_comic_list:
+                result = download_from_github(GITHUB_COMIC_LIST_PATH)
+                if result.get("success"):
+                    st.session_state.github_comic_list = result["content"]
+                else:
+                    auto_errors.append(f"comic_list.csv: {result.get('error', '不明')}")
+            if not st.session_state.github_folder_hierarchy:
+                result = download_from_github(GITHUB_FOLDER_HIERARCHY_PATH)
+                if result.get("success"):
+                    st.session_state.github_folder_hierarchy = result["content"]
+                else:
+                    auto_errors.append(f"フォルダ階層リスト: {result.get('error', '不明')}")
+            if auto_errors:
+                st.warning(f"自動取得エラー: {', '.join(auto_errors)}")
+        st.rerun()
+
+    # GitHubファイル情報を取得（表示用）
+    is_info = get_github_file_info(GITHUB_IS_LIST_PATH)
+    cl_info = get_github_file_info(GITHUB_COMIC_LIST_PATH)
+    fh_info = get_github_file_info(GITHUB_FOLDER_HIERARCHY_PATH)
+
     # GitHubファイル情報を表示
     col_info1, col_info2, col_info3 = st.columns(3)
     with col_info1:
-        is_info = get_github_file_info(GITHUB_IS_LIST_PATH)
         if is_info.get("exists"):
             st.success(f"is_list.csv\n更新: {is_info.get('last_updated', '不明')}")
         else:
             st.warning("is_list.csv\n未生成")
     with col_info2:
-        cl_info = get_github_file_info(GITHUB_COMIC_LIST_PATH)
         if cl_info.get("exists"):
             st.success(f"comic_list.csv\n更新: {cl_info.get('last_updated', '不明')}")
         else:
             st.warning("comic_list.csv\n未生成")
     with col_info3:
-        fh_info = get_github_file_info(GITHUB_FOLDER_HIERARCHY_PATH)
         if fh_info.get("exists"):
             st.success(f"フォルダ階層リスト\n更新: {fh_info.get('last_updated', '不明')}")
         else:
@@ -1716,7 +1834,17 @@ elif mode == "📥 不足画像取得":
                     result_data = extract_first_volumes(merged_df)
                     result_data = add_folder_hierarchy_info(result_data, df_hierarchy)
 
-                st.success(f"データ統合完了: {len(result_data)}件")
+                # JANコードの状態を確認
+                jan_count = sum(1 for d in result_data if d.get('first_jan') and normalize_jan_code(d.get('first_jan', '')))
+                no_jan_count = len(result_data) - jan_count
+                st.success(f"データ統合完了: {len(result_data)}件（JANあり: {jan_count}件, JANなし: {no_jan_count}件）")
+
+                # JANコードがない場合は詳細を表示
+                if no_jan_count > 0:
+                    no_jan_items = [d for d in result_data if not normalize_jan_code(d.get('first_jan', ''))]
+                    with st.expander(f"⚠️ JANコードなし: {no_jan_count}件（詳細）"):
+                        for item in no_jan_items[:10]:  # 最大10件表示
+                            st.write(f"- {item.get('comic_no', '?')}: {item.get('title', '?')} (first_jan='{item.get('first_jan', '')}')")
 
                 # 画像ダウンロード
                 st.markdown("### 画像ダウンロード中...")
@@ -1734,15 +1862,17 @@ elif mode == "📥 不足画像取得":
                 downloaded_images = []
                 stats = {'total': len(result_data), 'success': 0, 'bookoff': 0, 'amazon': 0, 'rakuten': 0, 'gemini_ai': 0, 'failed': 0}
 
+                random = get_random()
                 for i, data in enumerate(result_data):
-                    jan_code = data['first_jan']
+                    jan_code = normalize_jan_code(data['first_jan'])
                     comic_no = data['comic_no']
 
                     progress_bar.progress((i + 1) / len(result_data))
-                    status_text.text(f"処理中: {comic_no} ({i + 1}/{len(result_data)})")
+                    status_text.text(f"処理中: {comic_no} ({i + 1}/{len(result_data)}) JAN: {jan_code or '(なし)'}")
 
-                    if not jan_code or jan_code == 'nan':
+                    if not jan_code:
                         stats['failed'] += 1
+                        stats['failed_no_jan'] = stats.get('failed_no_jan', 0) + 1
                         continue
 
                     # 1. ブックオフで検索
@@ -1762,6 +1892,8 @@ elif mode == "📥 不足画像取得":
                         source = 'rakuten'
 
                     # 4. Gemini AIでセルフヒーリング（全て失敗した場合）
+                    # デバッグ: AI修復条件を記録
+                    ai_condition = f"image_url={bool(image_url)}, GEMINI_API_KEY={bool(GEMINI_API_KEY)}"
                     if not image_url and GEMINI_API_KEY:
                         time.sleep(random.uniform(0.5, 1.0))
                         status_text.text(f"処理中: {comic_no} ({i + 1}/{len(result_data)}) - AI解析中...")
@@ -1771,6 +1903,9 @@ elif mode == "📥 不足画像取得":
                         if ai_result:
                             image_url = ai_result
                             source = 'gemini_ai'
+                    elif not image_url and not GEMINI_API_KEY:
+                        # GEMINI_API_KEYがないためスキップ
+                        stats['ai_skipped_no_key'] = stats.get('ai_skipped_no_key', 0) + 1
 
                     if image_url:
                         image_data = download_image(image_url, session)
@@ -1786,8 +1921,13 @@ elif mode == "📥 不足画像取得":
                             stats[source] += 1
                         else:
                             stats['failed'] += 1
+                            stats['failed_download'] = stats.get('failed_download', 0) + 1
+                            # デバッグ: ダウンロード失敗のURLを記録
+                            stats['debug_failed_urls'] = stats.get('debug_failed_urls', [])
+                            stats['debug_failed_urls'].append({'comic_no': comic_no, 'url': image_url[:100]})
                     else:
                         stats['failed'] += 1
+                        stats['failed_not_found'] = stats.get('failed_not_found', 0) + 1
 
                     time.sleep(0.3)
 
@@ -1824,16 +1964,50 @@ elif mode == "📥 不足画像取得":
         col5.metric("楽天", stats.get('rakuten', 0))
         col6.metric("AI修復", stats.get('gemini_ai', 0))
 
-        # Gemini AI試行回数を表示（デバッグ用）
+        # Gemini AI試行回数を表示
         gemini_tried = stats.get('gemini_tried', 0)
-        if gemini_tried > 0 or stats['failed'] > 0:
+        failed_no_jan = stats.get('failed_no_jan', 0)
+        failed_not_found = stats.get('failed_not_found', 0)
+        failed_download = stats.get('failed_download', 0)
+
+        if stats['failed'] > 0:
+            # 失敗の詳細
+            failed_details = []
+            if failed_no_jan > 0:
+                failed_details.append(f"JANコードなし: {failed_no_jan}件")
+            if failed_not_found > 0:
+                failed_details.append(f"画像見つからず: {failed_not_found}件")
+            if failed_download > 0:
+                failed_details.append(f"ダウンロード失敗: {failed_download}件")
+
+            # 詳細がない場合は古い結果の可能性
+            if not failed_details:
+                failed_details.append("詳細不明（古い結果？→クリアして再実行してください）")
+
+            st.warning(f"取得できなかった画像: {stats['failed']}件 ({', '.join(failed_details)})")
+
+            # AI修復の状態
+            ai_skipped_no_key = stats.get('ai_skipped_no_key', 0)
             if GEMINI_API_KEY:
-                st.info(f"🤖 Gemini AI試行: {gemini_tried}回 → 成功: {stats.get('gemini_ai', 0)}回")
+                if gemini_tried > 0:
+                    st.info(f"🤖 Gemini AI試行: {gemini_tried}回 → 成功: {stats.get('gemini_ai', 0)}回")
+                elif failed_no_jan == stats['failed']:
+                    st.info("🤖 AI修復: JANコードがないためスキップ（AI修復にもJANコードが必要です）")
+                elif ai_skipped_no_key > 0:
+                    st.warning(f"🤖 AI修復: APIキーが実行時に空だった（{ai_skipped_no_key}件スキップ）")
+                elif failed_not_found > 0:
+                    st.warning("🤖 AI修復が試行されませんでした（要調査：画像が見つからないのにAIが発動していない）")
             else:
                 st.warning("🤖 Gemini APIキーが未設定のため、AI修復はスキップされました")
 
-        if stats['failed'] > 0:
-            st.warning(f"取得できなかった画像: {stats['failed']}件")
+            # デバッグ情報
+            with st.expander("🔧 デバッグ情報（詳細）"):
+                st.write(f"**stats全体:** {stats}")
+                st.write(f"**GEMINI_API_KEY設定:** {'あり' if GEMINI_API_KEY else 'なし'}")
+                if stats.get('debug_failed_urls'):
+                    st.write("**ダウンロード失敗URL:**")
+                    for item in stats['debug_failed_urls'][:5]:
+                        st.write(f"  - {item['comic_no']}: {item['url']}")
 
         # ZIPダウンロード
         if downloaded_images:
@@ -1841,6 +2015,7 @@ elif mode == "📥 不足画像取得":
             st.markdown("### ダウンロード")
 
             # ZIP作成
+            zipfile = get_zipfile()
             zip_buffer = BytesIO()
             with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
                 for img in downloaded_images:
