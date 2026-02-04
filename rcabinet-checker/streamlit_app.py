@@ -1379,22 +1379,11 @@ elif mode == "📥 不足画像取得":
         status_text = "完了" if latest["conclusion"] == "success" else "失敗" if latest["conclusion"] == "failure" else "処理中..."
         st.caption(f"前回生成: {jst_str} {status_icon} {status_text}")
 
-    # ボタンスタイル用CSS（折り返し防止・間隔調整）
-    st.markdown("""
-    <style>
-    div[data-testid="stHorizontalBlock"] > div:nth-child(1) button,
-    div[data-testid="stHorizontalBlock"] > div:nth-child(2) button {
-        white-space: nowrap;
-        padding: 0.5rem 1rem;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
     # ボタンを横並びに配置
     btn_col1, btn_col2, _ = st.columns([3, 2, 3])
 
     with btn_col1:
-        run_actions = st.button("📊 is_list / comic_list 生成", type="secondary", help="不足コミックのCSVファイルを自動生成します", use_container_width=True)
+        run_actions = st.button("📊 is_list / comic_list 生成", type="primary", help="不足コミックのCSVファイルを自動生成します", use_container_width=True)
 
     with btn_col2:
         fetch_files = st.button("📥 ダウンロード", type="primary", help="生成済みのファイルをダウンロードします", use_container_width=True)
