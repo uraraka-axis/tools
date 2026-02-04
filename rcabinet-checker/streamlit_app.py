@@ -19,6 +19,13 @@ from openpyxl.styles import Font, Border, Side, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 from supabase import create_client, Client
 
+# Gemini AI（オプション - セルフヒーリング用）
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+
 # ページ設定
 st.set_page_config(
     page_title="R-Cabinet 管理ツール",
@@ -43,6 +50,11 @@ GITHUB_MISSING_CSV_PATH = "comic-lister/data/missing_comics.csv"
 GITHUB_IS_LIST_PATH = "comic-lister/data/is_list.csv"
 GITHUB_COMIC_LIST_PATH = "comic-lister/data/comic_list.csv"
 GITHUB_FOLDER_HIERARCHY_PATH = "comic-lister/data/folder_hierarchy.xlsx"
+
+# Gemini API設定（セルフヒーリング用）
+GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
+if GEMINI_AVAILABLE and GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 
 def upload_to_github(content: str, path: str, message: str) -> dict:
@@ -735,6 +747,76 @@ def get_rakuten_image(jan_code, session):
 
         return None
     except Exception:
+        return None
+
+
+def get_image_with_gemini_ai(jan_code, session, source_name="amazon"):
+    """Gemini AIを使って画像URLを抽出（セルフヒーリング機能）"""
+    if not GEMINI_AVAILABLE or not GEMINI_API_KEY:
+        return None
+
+    # ソース別のURL設定
+    if source_name == "amazon":
+        search_url = f"https://www.amazon.co.jp/s?k={jan_code}&i=stripbooks"
+    elif source_name == "rakuten":
+        search_url = f"https://books.rakuten.co.jp/search?g=001&isbn={jan_code}"
+    elif source_name == "bookoff":
+        search_url = f"https://shopping.bookoff.co.jp/search/keyword/{jan_code}"
+    else:
+        return None
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    }
+
+    try:
+        response = session.get(search_url, headers=headers, timeout=15)
+        if response.status_code != 200:
+            return None
+
+        # HTMLの重要部分だけを抽出（トークン節約）
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        # スクリプトとスタイルを削除
+        for tag in soup(['script', 'style', 'noscript', 'header', 'footer', 'nav']):
+            tag.decompose()
+
+        # 商品画像が含まれそうな部分を抽出
+        main_content = soup.find('main') or soup.find('div', {'id': 'search'}) or soup.find('body')
+        if main_content:
+            html_snippet = str(main_content)[:8000]  # 最大8000文字に制限
+        else:
+            html_snippet = str(soup)[:8000]
+
+        # Gemini 2.0 Flashに問い合わせ
+        model = genai.GenerativeModel('gemini-2.0-flash')
+
+        prompt = f"""以下のHTMLから、JANコード「{jan_code}」の本の表紙画像URLを1つだけ抽出してください。
+
+条件:
+- 画像URLのみを返してください（説明不要）
+- NO IMAGE、noimage、placeholder等のダミー画像は除外
+- https://で始まる完全なURLで返してください
+- 見つからない場合は「NOT_FOUND」とだけ返してください
+
+HTML:
+{html_snippet}"""
+
+        response = model.generate_content(prompt)
+        result = response.text.strip()
+
+        # 結果を検証
+        if result and result != "NOT_FOUND" and result.startswith("http"):
+            # NO IMAGE系を最終チェック
+            no_image_patterns = ['no_image', 'noimage', 'no-image', 'dummy', 'blank', 'spacer', 'placeholder']
+            if not any(p in result.lower() for p in no_image_patterns):
+                return result
+
+        return None
+
+    except Exception as e:
+        # エラーログ（デバッグ用）
+        print(f"Gemini AI error: {e}")
         return None
 
 
@@ -1626,7 +1708,7 @@ elif mode == "📥 不足画像取得":
 
                 session = requests.Session()
                 downloaded_images = []
-                stats = {'total': len(result_data), 'success': 0, 'bookoff': 0, 'amazon': 0, 'rakuten': 0, 'failed': 0}
+                stats = {'total': len(result_data), 'success': 0, 'bookoff': 0, 'amazon': 0, 'rakuten': 0, 'gemini_ai': 0, 'failed': 0}
 
                 for i, data in enumerate(result_data):
                     jan_code = data['first_jan']
@@ -1654,6 +1736,13 @@ elif mode == "📥 不足画像取得":
                         time.sleep(random.uniform(0.3, 0.6))
                         image_url = get_rakuten_image(jan_code, session)
                         source = 'rakuten'
+
+                    # 4. Gemini AIでセルフヒーリング（全て失敗した場合）
+                    if not image_url and GEMINI_AVAILABLE and GEMINI_API_KEY:
+                        time.sleep(random.uniform(0.5, 1.0))
+                        # Amazonを再試行（AIでHTML解析）
+                        image_url = get_image_with_gemini_ai(jan_code, session, "amazon")
+                        source = 'gemini_ai'
 
                     if image_url:
                         image_data = download_image(image_url, session)
@@ -1699,12 +1788,13 @@ elif mode == "📥 不足画像取得":
 
         # 結果サマリー
         st.markdown("### 結果")
-        col1, col2, col3, col4, col5 = st.columns(5)
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
         col1.metric("総数", stats['total'])
         col2.metric("成功", stats['success'])
         col3.metric("ブックオフ", stats['bookoff'])
         col4.metric("Amazon", stats['amazon'])
         col5.metric("楽天", stats.get('rakuten', 0))
+        col6.metric("AI修復", stats.get('gemini_ai', 0))
 
         if stats['failed'] > 0:
             st.warning(f"取得できなかった画像: {stats['failed']}件")
