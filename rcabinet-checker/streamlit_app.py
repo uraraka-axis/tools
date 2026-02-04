@@ -822,8 +822,8 @@ elif mode == "🔍 画像存在チェック":
 
         st.dataframe(df_display, use_container_width=True, height=400)
 
-        # ダウンロードボタン（1行目）
-        dl_col1, dl_col2 = st.columns(2)
+        # ダウンロードボタン（1行目：左寄せ）
+        dl_col1, dl_col2, _ = st.columns([1, 1.5, 2])
 
         with dl_col1:
             # Comic Search検索用CSVダウンロード（存在なしのコミックNoのみ）
