@@ -822,9 +822,8 @@ elif mode == "🔍 画像存在チェック":
 
         st.dataframe(df_display, use_container_width=True, height=400)
 
-        # ダウンロードボタン
-        st.markdown("")  # スペース
-        dl_col1, dl_col2, dl_col3 = st.columns([2, 3, 1])
+        # ダウンロードボタン（1行目）
+        dl_col1, dl_col2 = st.columns(2)
 
         with dl_col1:
             # Comic Search検索用CSVダウンロード（存在なしのコミックNoのみ）
@@ -873,10 +872,9 @@ elif mode == "🔍 画像存在チェック":
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
-        with dl_col3:
-            # 結果クリアボタン
-            if st.button("🗑️ 結果をクリア"):
-                st.session_state.check_results = None
+        # 結果クリアボタン（2行目）
+        if st.button("🗑️ 結果をクリア"):
+            st.session_state.check_results = None
                 st.rerun()
 
 
