@@ -1379,11 +1379,11 @@ elif mode == "📥 不足画像取得":
         status_text = "完了" if latest["conclusion"] == "success" else "失敗" if latest["conclusion"] == "failure" else "処理中..."
         st.caption(f"前回生成: {jst_str} {status_icon} {status_text}")
 
-    # ボタンを横並びに配置（間隔を詰める）
-    btn_col1, btn_col2, _ = st.columns([1, 1, 3])
+    # ボタンを横並びに配置
+    btn_col1, btn_col2, _ = st.columns([2.5, 1.5, 1])
 
     with btn_col1:
-        run_actions = st.button("📊 is_list.csv/comic_list.csv 生成", type="secondary", help="不足コミックのCSVファイルを自動生成します")
+        run_actions = st.button("📊 is_list.csv / comic_list.csv 生成", type="secondary", help="不足コミックのCSVファイルを自動生成します")
 
     with btn_col2:
         fetch_files = st.button("📥 ファイルダウンロード", type="primary", help="生成済みのファイルをダウンロードします")
