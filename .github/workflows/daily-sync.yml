@@ -2,8 +2,8 @@ name: Daily R-Cabinet Sync
 
 on:
   schedule:
-    # 毎日AM8:00 JST = 前日23:00 UTC
-    - cron: '0 23 * * *'
+    # 月・水・金 AM8:00 JST = 日・火・木 23:00 UTC
+    - cron: '0 23 * * 0,2,4'
   workflow_dispatch:  # 手動実行も可能
 
 jobs:
