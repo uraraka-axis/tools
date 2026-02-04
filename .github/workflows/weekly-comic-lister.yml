@@ -1,0 +1,62 @@
+name: Weekly Comic Lister
+
+on:
+  schedule:
+    # 毎週月曜 AM9:00 JST = 日曜 00:00 UTC
+    - cron: '0 0 * * 0'
+  workflow_dispatch:  # 手動実行も可能
+
+jobs:
+  comic-lister:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Install ChromeDriver
+        run: |
+          CHROME_VERSION=$(google-chrome --version | awk '{print $3}' | cut -d'.' -f1)
+          echo "Chrome version: $CHROME_VERSION"
+          pip install webdriver-manager
+
+      - name: Install dependencies
+        run: |
+          pip install -r comic-lister/requirements.txt
+          pip install webdriver-manager
+
+      - name: Create output directory
+        run: mkdir -p /tmp/comic-lister-output
+
+      - name: Run Comic Lister CLI
+        env:
+          HARU_USERNAME: ${{ secrets.HARU_USERNAME }}
+          HARU_PASSWORD: ${{ secrets.HARU_PASSWORD }}
+          GOOGLE_SHEETS_URL: ${{ secrets.GOOGLE_SHEETS_URL }}
+          ASSIGNEE_NAME: ${{ secrets.ASSIGNEE_NAME }}
+          ISBN_SETTING: "1st"
+          OUTPUT_DIR: /tmp/comic-lister-output
+        run: |
+          python comic-lister/scripts/comic_lister_cli.py
+
+      - name: List output files
+        run: |
+          echo "=== Output files ==="
+          ls -la /tmp/comic-lister-output/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: comic-lister-output-${{ github.run_number }}
+          path: /tmp/comic-lister-output/
+          retention-days: 30
