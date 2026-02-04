@@ -45,35 +45,84 @@ def get_supabase_client() -> Client:
     return None
 
 
-def save_images_to_db(images: list) -> tuple[bool, str]:
-    """画像一覧をDBに保存"""
+def sync_images_to_db(images: list) -> dict:
+    """画像一覧をDBに同期（upsert）"""
     supabase = get_supabase_client()
     if not supabase:
-        return False, "Supabase未設定"
+        return {"success": False, "error": "Supabase未設定"}
 
     try:
-        # 既存データを削除
-        supabase.table("rcabinet_images").delete().neq("id", 0).execute()
-
-        # 新規データを挿入
-        records = []
+        # file_nameごとにグループ化（重複検出）
+        file_dict = {}
         for img in images:
-            records.append({
-                "folder_name": img.get("FolderName", ""),
-                "file_name": img.get("FileName", ""),
-                "file_url": img.get("FileUrl", ""),
-                "file_size": img.get("FileSize", 0),
-                "file_timestamp": img.get("TimeStamp", "")
-            })
+            file_name = img.get("FileName", "")
+            folder_name = img.get("FolderName", "")
+            if file_name in file_dict:
+                # 重複: folder_namesに追加
+                existing_folders = file_dict[file_name]["folder_names"].split(", ")
+                if folder_name not in existing_folders:
+                    file_dict[file_name]["folder_names"] += f", {folder_name}"
+            else:
+                file_dict[file_name] = {
+                    "file_name": file_name,
+                    "folder_names": folder_name,
+                    "file_url": img.get("FileUrl", ""),
+                    "file_size": img.get("FileSize", 0),
+                    "file_timestamp": img.get("TimeStamp", "")
+                }
 
-        # バッチインサート（100件ずつ）
-        for i in range(0, len(records), 100):
-            batch = records[i:i+100]
-            supabase.table("rcabinet_images").insert(batch).execute()
+        # 既存データを取得
+        existing = supabase.table("rcabinet_images").select("file_name, file_timestamp").execute()
+        existing_dict = {row["file_name"]: row["file_timestamp"] for row in existing.data}
 
-        return True, f"{len(records)}件を保存しました"
+        # 差分計算
+        new_count = 0
+        updated_count = 0
+        duplicate_count = 0
+        unchanged_count = 0
+
+        records_to_upsert = []
+        for file_name, record in file_dict.items():
+            # 重複チェック（複数フォルダにある）
+            if ", " in record["folder_names"]:
+                duplicate_count += 1
+
+            if file_name not in existing_dict:
+                new_count += 1
+                records_to_upsert.append(record)
+            elif existing_dict[file_name] != record["file_timestamp"]:
+                updated_count += 1
+                records_to_upsert.append(record)
+            else:
+                unchanged_count += 1
+
+        # 削除済み検出（DBにあるがAPIにない）
+        deleted_files = set(existing_dict.keys()) - set(file_dict.keys())
+        deleted_count = len(deleted_files)
+
+        # upsert実行（100件ずつ）
+        for i in range(0, len(records_to_upsert), 100):
+            batch = records_to_upsert[i:i+100]
+            supabase.table("rcabinet_images").upsert(
+                batch, on_conflict="file_name"
+            ).execute()
+
+        # 削除済みファイルをDBから削除
+        if deleted_files:
+            for file_name in deleted_files:
+                supabase.table("rcabinet_images").delete().eq("file_name", file_name).execute()
+
+        return {
+            "success": True,
+            "new": new_count,
+            "updated": updated_count,
+            "duplicate": duplicate_count,
+            "unchanged": unchanged_count,
+            "deleted": deleted_count,
+            "total": len(file_dict)
+        }
     except Exception as e:
-        return False, str(e)
+        return {"success": False, "error": str(e)}
 
 
 def load_images_from_db() -> tuple[list, str]:
@@ -87,7 +136,7 @@ def load_images_from_db() -> tuple[list, str]:
         images = []
         for row in response.data:
             images.append({
-                "FolderName": row.get("folder_name", ""),
+                "FolderName": row.get("folder_names", ""),
                 "FileName": row.get("file_name", ""),
                 "FileUrl": row.get("file_url", ""),
                 "FileSize": row.get("file_size", 0),
@@ -96,6 +145,21 @@ def load_images_from_db() -> tuple[list, str]:
         return images, f"{len(images)}件を読み込みました"
     except Exception as e:
         return [], str(e)
+
+
+def get_db_stats() -> dict:
+    """DBの統計情報を取得"""
+    supabase = get_supabase_client()
+    if not supabase:
+        return {}
+
+    try:
+        response = supabase.table("rcabinet_images").select("folder_names").execute()
+        total = len(response.data)
+        duplicates = sum(1 for row in response.data if ", " in row.get("folder_names", ""))
+        return {"total": total, "duplicates": duplicates}
+    except Exception:
+        return {}
 
 
 def check_password():
@@ -737,17 +801,33 @@ if mode == "📂 画像一覧取得":
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
 
-                # DB保存ボタン
+                # DB同期ボタン
                 st.divider()
+                st.markdown("### 📊 データベース連携")
+
+                # DB統計情報を表示
+                db_stats = get_db_stats()
+                if db_stats:
+                    stat_col1, stat_col2, stat_col3 = st.columns(3)
+                    with stat_col1:
+                        st.metric("DB登録数", db_stats.get("total", 0))
+                    with stat_col2:
+                        st.metric("重複ファイル", db_stats.get("duplicates", 0))
+                    with stat_col3:
+                        st.metric("API取得数", len(all_files))
+
                 db_col1, db_col2, _ = st.columns([1, 1, 2])
                 with db_col1:
-                    if st.button("💾 DBに保存", help="現在の一覧をSupabaseに保存"):
-                        with st.spinner("保存中..."):
-                            success, msg = save_images_to_db(all_files)
-                        if success:
-                            st.success(msg)
+                    if st.button("🔄 DBに同期", help="APIデータとDBを同期（差分更新）"):
+                        with st.spinner("同期中..."):
+                            result = sync_images_to_db(all_files)
+                        if result.get("success"):
+                            st.success(f"同期完了！ 合計: {result['total']}件")
+                            st.info(f"📊 新規: {result['new']} / 更新: {result['updated']} / 重複: {result['duplicate']} / 削除: {result['deleted']}")
+                            if result['duplicate'] > 0:
+                                st.warning(f"⚠️ {result['duplicate']}件のファイルが複数フォルダに存在しています")
                         else:
-                            st.error(msg)
+                            st.error(result.get("error", "同期失敗"))
                 with db_col2:
                     if st.button("📂 DBから読み込み", help="Supabaseから一覧を読み込み"):
                         with st.spinner("読み込み中..."):
