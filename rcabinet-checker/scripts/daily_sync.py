@@ -35,15 +35,20 @@ def get_all_folders():
         url = f"{BASE_URL}/cabinet/folders/get"
         params = {"limit": 100, "offset": page}
 
+        print(f"  API Request: {url} (page={page})")
         response = requests.get(url, headers=get_auth_header(), params=params)
+        print(f"  Response status: {response.status_code}")
 
         if response.status_code != 200:
             print(f"Error: {response.status_code}")
+            print(f"Response: {response.text[:500]}")
             return all_folders
 
         root = ET.fromstring(response.content)
         status = root.find(".//resultCode")
+        print(f"  Result code: {status.text if status is not None else 'None'}")
         if status is None or status.text != "N000":
+            print(f"  API Error or no more data")
             break
 
         folders = root.findall(".//folder")
@@ -183,7 +188,12 @@ def main():
     print("R-Cabinet Daily Sync Started")
     print("=" * 50)
 
-    # 環境変数チェック
+    # 環境変数チェック（デバッグ用）
+    print(f"SERVICE_SECRET set: {bool(SERVICE_SECRET)} (len={len(SERVICE_SECRET) if SERVICE_SECRET else 0})")
+    print(f"LICENSE_KEY set: {bool(LICENSE_KEY)} (len={len(LICENSE_KEY) if LICENSE_KEY else 0})")
+    print(f"SUPABASE_URL set: {bool(SUPABASE_URL)}")
+    print(f"SUPABASE_KEY set: {bool(SUPABASE_KEY)} (len={len(SUPABASE_KEY) if SUPABASE_KEY else 0})")
+
     if not all([SERVICE_SECRET, LICENSE_KEY, SUPABASE_URL, SUPABASE_KEY]):
         print("Error: Missing environment variables")
         sys.exit(1)
