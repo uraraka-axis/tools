@@ -1764,9 +1764,12 @@ elif mode == "📥 不足画像取得":
                     # 4. Gemini AIでセルフヒーリング（全て失敗した場合）
                     if not image_url and GEMINI_API_KEY:
                         time.sleep(random.uniform(0.5, 1.0))
+                        status_text.text(f"処理中: {comic_no} ({i + 1}/{len(result_data)}) - AI解析中...")
+                        stats['gemini_tried'] = stats.get('gemini_tried', 0) + 1
                         # Amazonを再試行（AIでHTML解析）
-                        image_url = get_image_with_gemini_ai(jan_code, session, "amazon")
-                        if image_url:
+                        ai_result = get_image_with_gemini_ai(jan_code, session, "amazon")
+                        if ai_result:
+                            image_url = ai_result
                             source = 'gemini_ai'
 
                     if image_url:
@@ -1820,6 +1823,14 @@ elif mode == "📥 不足画像取得":
         col4.metric("Amazon", stats['amazon'])
         col5.metric("楽天", stats.get('rakuten', 0))
         col6.metric("AI修復", stats.get('gemini_ai', 0))
+
+        # Gemini AI試行回数を表示（デバッグ用）
+        gemini_tried = stats.get('gemini_tried', 0)
+        if gemini_tried > 0 or stats['failed'] > 0:
+            if GEMINI_API_KEY:
+                st.info(f"🤖 Gemini AI試行: {gemini_tried}回 → 成功: {stats.get('gemini_ai', 0)}回")
+            else:
+                st.warning("🤖 Gemini APIキーが未設定のため、AI修復はスキップされました")
 
         if stats['failed'] > 0:
             st.warning(f"取得できなかった画像: {stats['failed']}件")
