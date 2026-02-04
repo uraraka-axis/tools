@@ -44,12 +44,12 @@ def get_all_folders():
             print(f"Response: {response.text[:500]}")
             return all_folders
 
-        print(f"  Response (first 500 chars): {response.text[:500]}")
         root = ET.fromstring(response.content)
         status = root.find(".//resultCode")
         print(f"  Result code: {status.text if status is not None else 'None'}")
-        if status is None or status.text != "N000":
-            print(f"  API Error or no more data. Full result code element: {ET.tostring(root, encoding='unicode')[:300]}")
+        # R-Cabinet APIでは resultCode=0 が成功
+        if status is None or status.text not in ["0", "N000"]:
+            print(f"  API Error: {status.text if status else 'None'}")
             break
 
         folders = root.findall(".//folder")
@@ -89,7 +89,8 @@ def get_folder_files(folder_id: int):
 
         root = ET.fromstring(response.content)
         status = root.find(".//resultCode")
-        if status is None or status.text != "N000":
+        # R-Cabinet APIでは resultCode=0 が成功
+        if status is None or status.text not in ["0", "N000"]:
             break
 
         files = root.findall(".//file")
