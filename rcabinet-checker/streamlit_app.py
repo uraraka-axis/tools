@@ -154,12 +154,42 @@ def get_db_stats() -> dict:
         return {}
 
     try:
-        response = supabase.table("rcabinet_images").select("folder_names").execute()
+        response = supabase.table("rcabinet_images").select("folder_names, created_at").execute()
         total = len(response.data)
         duplicates = sum(1 for row in response.data if ", " in row.get("folder_names", ""))
-        return {"total": total, "duplicates": duplicates}
+
+        # 最終更新日時を取得
+        last_updated = None
+        if response.data:
+            dates = [row.get("created_at") for row in response.data if row.get("created_at")]
+            if dates:
+                last_updated = max(dates)[:16].replace("T", " ")  # "2025-02-04 10:30"形式
+
+        return {"total": total, "duplicates": duplicates, "last_updated": last_updated}
     except Exception:
         return {}
+
+
+def load_images_from_db_by_folder(folder_name: str) -> list:
+    """DBから特定フォルダの画像を読み込み"""
+    supabase = get_supabase_client()
+    if not supabase:
+        return []
+
+    try:
+        response = supabase.table("rcabinet_images").select("*").ilike("folder_names", f"%{folder_name}%").execute()
+        images = []
+        for row in response.data:
+            images.append({
+                "FolderName": row.get("folder_names", ""),
+                "FileName": row.get("file_name", ""),
+                "FileUrl": row.get("file_url", ""),
+                "FileSize": row.get("file_size", 0),
+                "TimeStamp": row.get("file_timestamp", "")
+            })
+        return images
+    except Exception:
+        return []
 
 
 def check_password():
@@ -704,146 +734,109 @@ if mode == "📂 画像一覧取得":
         label_visibility="collapsed"
     )
 
-    # ステップ3: 画像取得ボタン
-    fetch_images_btn = st.button("📷 画像一覧を取得", type="primary")
+    # DB統計情報を表示
+    db_stats = get_db_stats()
+    if db_stats.get("total", 0) > 0:
+        stat_cols = st.columns(4)
+        with stat_cols[0]:
+            st.metric("DB登録数", db_stats.get("total", 0))
+        with stat_cols[1]:
+            st.metric("重複ファイル", db_stats.get("duplicates", 0))
+        with stat_cols[2]:
+            st.metric("API総数", total_files)
+        with stat_cols[3]:
+            last_updated = db_stats.get("last_updated", "-")
+            st.metric("最終更新", last_updated if last_updated else "-")
+
+    # ステップ3: 操作ボタン（2つ）
+    btn_col1, btn_col2, _ = st.columns([1.2, 1.2, 2])
+    with btn_col1:
+        show_db_btn = st.button(
+            "📂 保存済み一覧を表示",
+            disabled=(db_stats.get("total", 0) == 0),
+            help="DBに保存された一覧を表示（高速）"
+        )
+    with btn_col2:
+        fetch_api_btn = st.button(
+            "🔄 最新一覧を取得",
+            type="primary",
+            help="APIから最新データを取得してDBに同期"
+        )
 
     st.divider()
 
-    # 画像取得処理
-    if fetch_images_btn or st.session_state.images_loaded:
-        if fetch_images_btn:
-            st.session_state.images_loaded = False
-            st.session_state.images_data = None
+    # ボタン押下時の処理
+    if show_db_btn:
+        # DBから読み込み
+        st.session_state.data_source = "db"
+        if selected_folder_name == "📁 すべて（全フォルダ）":
+            loaded_images, msg = load_images_from_db()
+        else:
+            folder_name = folder_options[selected_folder_name]['FolderName']
+            loaded_images = load_images_from_db_by_folder(folder_name)
+            msg = f"{len(loaded_images)}件を読み込みました"
+
+        if loaded_images:
+            st.session_state.images_data = loaded_images
+            st.session_state.images_loaded = True
+            st.session_state.error_folders = []
+            st.success(f"📂 DBから{msg}")
+        else:
+            st.warning("DBにデータがありません")
+
+    if fetch_api_btn:
+        # APIから取得してDB同期
+        st.session_state.data_source = "api"
+        st.session_state.images_loaded = False
+        st.session_state.images_data = None
 
         if selected_folder_name == "📁 すべて（全フォルダ）":
             # 全フォルダの画像を取得
-            if not st.session_state.images_loaded or fetch_images_btn:
-                all_files = []
-                error_folders = []
-                expected_total = sum(f['FileCount'] for f in folders)
-                progress_bar = st.progress(0)
-                status_text = st.empty()
+            all_files = []
+            error_folders = []
+            expected_total = sum(f['FileCount'] for f in folders)
+            progress_bar = st.progress(0)
+            status_text = st.empty()
 
-                for i, folder in enumerate(folders):
-                    status_text.text(f"取得中: {folder['FolderName']} ({i + 1}/{len(folders)}) - {folder['FileCount']}件")
-                    progress_bar.progress((i + 1) / len(folders))
+            for i, folder in enumerate(folders):
+                status_text.text(f"取得中: {folder['FolderName']} ({i + 1}/{len(folders)}) - {folder['FileCount']}件")
+                progress_bar.progress((i + 1) / len(folders))
 
-                    files, err = get_folder_files(int(folder['FolderId']))
+                files, err = get_folder_files(int(folder['FolderId']))
+                time.sleep(0.5)
 
-                    # フォルダ間のスリープ（レート制限対策）
-                    time.sleep(0.5)
+                if err:
+                    error_folders.append({
+                        'FolderName': folder['FolderName'],
+                        'FolderId': folder['FolderId'],
+                        'FileCount': folder['FileCount'],
+                        'Error': err
+                    })
+                if files:
+                    for f in files:
+                        f['FolderName'] = folder['FolderName']
+                    all_files.extend(files)
 
-                    if err:
-                        error_folders.append({
-                            'FolderName': folder['FolderName'],
-                            'FolderId': folder['FolderId'],
-                            'FileCount': folder['FileCount'],
-                            'Error': err
-                        })
-                    if files:
-                        for f in files:
-                            f['FolderName'] = folder['FolderName']
-                        all_files.extend(files)
+            progress_bar.empty()
+            status_text.empty()
 
-                progress_bar.empty()
-                status_text.empty()
+            # DB同期
+            with st.spinner("DBに同期中..."):
+                sync_result = sync_images_to_db(all_files)
 
-                st.session_state.images_data = all_files
-                st.session_state.error_folders = error_folders
-                st.session_state.expected_total = expected_total
-                st.session_state.images_loaded = True
-
-            all_files = st.session_state.images_data
-            error_folders = st.session_state.get('error_folders', [])
-            expected_total = st.session_state.get('expected_total', 0)
-
-            if all_files:
-                # サマリー表示
-                actual_count = len(all_files)
-                diff = expected_total - actual_count
-
-                if diff == 0:
-                    st.success(f"📷 {actual_count} 件の画像（全フォルダ） ✅ 予定していた全ファイルの情報を取得しました。")
-                else:
-                    st.warning(f"📷 {actual_count} 件の画像（期待値: {expected_total}件、差分: {diff}件）")
-
-                # エラーフォルダがあれば表示
-                if error_folders:
-                    with st.expander(f"⚠️ エラーが発生したフォルダ ({len(error_folders)}件)", expanded=False):
-                        for ef in error_folders:
-                            st.write(f"- **{ef['FolderName']}** ({ef['FileCount']}件): {ef['Error']}")
-
-                # 検索フィルター
-                search_term = st.text_input("🔍 ファイル名で絞り込み", placeholder="検索キーワード")
-
-                display_files = all_files
-                if search_term:
-                    display_files = [f for f in all_files if search_term.lower() in f['FileName'].lower()]
-                    st.info(f"絞り込み結果: {len(display_files)} 件")
-
-                # データフレーム表示
-                df = pd.DataFrame(display_files)
-                df = df[['FolderName', 'FileName', 'FileUrl', 'FileSize', 'TimeStamp']]
-                df.columns = ['フォルダ', 'ファイル名', 'URL', 'サイズ(KB)', '更新日時']
-
-                st.dataframe(df, use_container_width=True, height=500)
-
-                # Excelダウンロード（スタイル付き）
-                excel_buffer = BytesIO()
-                with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                    df.to_excel(writer, index=False, sheet_name='Sheet1')
-                    style_excel(writer.sheets['Sheet1'], num_columns=5, url_column=3)
-                excel_buffer.seek(0)
-                st.download_button(
-                    label="📥 全データをExcelでダウンロード",
-                    data=excel_buffer,
-                    file_name="rcabinet_all_files.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-
-                # DB同期ボタン
-                st.divider()
-                st.markdown("### 📊 データベース連携")
-
-                # DB統計情報を表示
-                db_stats = get_db_stats()
-                if db_stats:
-                    stat_col1, stat_col2, stat_col3 = st.columns(3)
-                    with stat_col1:
-                        st.metric("DB登録数", db_stats.get("total", 0))
-                    with stat_col2:
-                        st.metric("重複ファイル", db_stats.get("duplicates", 0))
-                    with stat_col3:
-                        st.metric("API取得数", len(all_files))
-
-                db_col1, db_col2, _ = st.columns([1, 1, 2])
-                with db_col1:
-                    if st.button("🔄 DBに同期", help="APIデータとDBを同期（差分更新）"):
-                        with st.spinner("同期中..."):
-                            result = sync_images_to_db(all_files)
-                        if result.get("success"):
-                            st.success(f"同期完了！ 合計: {result['total']}件")
-                            st.info(f"📊 新規: {result['new']} / 更新: {result['updated']} / 重複: {result['duplicate']} / 削除: {result['deleted']}")
-                            if result['duplicate'] > 0:
-                                st.warning(f"⚠️ {result['duplicate']}件のファイルが複数フォルダに存在しています")
-                        else:
-                            st.error(result.get("error", "同期失敗"))
-                with db_col2:
-                    if st.button("📂 DBから読み込み", help="Supabaseから一覧を読み込み"):
-                        with st.spinner("読み込み中..."):
-                            loaded_images, msg = load_images_from_db()
-                        if loaded_images:
-                            st.success(msg)
-                            st.session_state.images_data = loaded_images
-                            st.session_state.images_loaded = True
-                            st.rerun()
-                        else:
-                            st.warning(msg)
+            if sync_result.get("success"):
+                st.success(f"🔄 API取得完了・DB同期済み（新規: {sync_result['new']} / 更新: {sync_result['updated']} / 重複: {sync_result['duplicate']}）")
+                if sync_result['duplicate'] > 0:
+                    st.warning(f"⚠️ {sync_result['duplicate']}件のファイルが複数フォルダに存在")
             else:
-                st.warning("画像がありません。")
+                st.error(f"DB同期エラー: {sync_result.get('error')}")
 
+            st.session_state.images_data = all_files
+            st.session_state.error_folders = error_folders
+            st.session_state.expected_total = expected_total
+            st.session_state.images_loaded = True
         else:
-            # 特定フォルダの画像を取得
+            # 個別フォルダの場合
             selected_folder = folder_options[selected_folder_name]
             folder_id = int(selected_folder['FolderId'])
 
@@ -853,36 +846,64 @@ if mode == "📂 画像一覧取得":
             if error:
                 st.error(error)
             elif files:
-                st.success(f"📷 {len(files)} 件の画像")
+                for f in files:
+                    f['FolderName'] = selected_folder['FolderName']
 
-                # 検索フィルター
-                search_term = st.text_input("🔍 ファイル名で絞り込み", placeholder="検索キーワード")
+                # DB同期
+                with st.spinner("DBに同期中..."):
+                    sync_result = sync_images_to_db(files)
 
-                if search_term:
-                    files = [f for f in files if search_term.lower() in f['FileName'].lower()]
-                    st.info(f"絞り込み結果: {len(files)} 件")
+                if sync_result.get("success"):
+                    st.success(f"🔄 取得完了（{len(files)}件）・DB同期済み")
 
-                # データフレーム表示
-                df = pd.DataFrame(files)
-                df = df[['FileName', 'FileUrl', 'FileSize', 'TimeStamp']]
-                df.columns = ['ファイル名', 'URL', 'サイズ(KB)', '更新日時']
+                st.session_state.images_data = files
+                st.session_state.error_folders = []
+                st.session_state.images_loaded = True
 
-                st.dataframe(df, use_container_width=True, height=500)
+    # 画像一覧表示
+    if st.session_state.images_loaded and st.session_state.images_data:
+        all_files = st.session_state.images_data
+        error_folders = st.session_state.get('error_folders', [])
 
-                # Excelダウンロード（スタイル付き）
-                excel_buffer = BytesIO()
-                with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                    df.to_excel(writer, index=False, sheet_name='Sheet1')
-                    style_excel(writer.sheets['Sheet1'], num_columns=4, url_column=2)
-                excel_buffer.seek(0)
-                st.download_button(
-                    label="📥 Excelでダウンロード",
-                    data=excel_buffer,
-                    file_name=f"rcabinet_{selected_folder['FolderName']}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-            else:
-                st.warning("このフォルダに画像はありません。")
+        if all_files:
+            # サマリー表示
+            st.success(f"📷 {len(all_files)} 件の画像")
+
+            # エラーフォルダがあれば表示
+            if error_folders:
+                with st.expander(f"⚠️ エラーが発生したフォルダ ({len(error_folders)}件)", expanded=False):
+                    for ef in error_folders:
+                        st.write(f"- **{ef['FolderName']}** ({ef['FileCount']}件): {ef['Error']}")
+
+            # 検索フィルター
+            search_term = st.text_input("🔍 ファイル名で絞り込み", placeholder="検索キーワード")
+
+            display_files = all_files
+            if search_term:
+                display_files = [f for f in all_files if search_term.lower() in f['FileName'].lower()]
+                st.info(f"絞り込み結果: {len(display_files)} 件")
+
+            # データフレーム表示
+            df = pd.DataFrame(display_files)
+            df = df[['FolderName', 'FileName', 'FileUrl', 'FileSize', 'TimeStamp']]
+            df.columns = ['フォルダ', 'ファイル名', 'URL', 'サイズ(KB)', '更新日時']
+
+            st.dataframe(df, use_container_width=True, height=500)
+
+            # Excelダウンロード
+            excel_buffer = BytesIO()
+            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                df.to_excel(writer, index=False, sheet_name='Sheet1')
+                style_excel(writer.sheets['Sheet1'], num_columns=5, url_column=3)
+            excel_buffer.seek(0)
+            st.download_button(
+                label="📥 Excelでダウンロード",
+                data=excel_buffer,
+                file_name="rcabinet_images.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        else:
+            st.warning("画像がありません。")
 
 
 elif mode == "🔍 画像存在チェック":
