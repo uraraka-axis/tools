@@ -625,7 +625,7 @@ def get_bookoff_image(jan_code, session):
     url = f"https://shopping.bookoff.co.jp/search/keyword/{jan_code}"
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 
-    NO_IMAGE_URLS = ['item_ll.gif', 'no_image', 'noimage']
+    NO_IMAGE_PATTERNS = ['item_ll.gif', 'no_image', 'noimage', 'no-image', 'dummy', 'blank', 'spacer']
 
     try:
         response = session.get(url, headers=headers, timeout=10)
@@ -636,7 +636,7 @@ def get_bookoff_image(jan_code, session):
 
         if img_tag and img_tag.get('src'):
             image_url = img_tag['src']
-            if any(no_img in image_url.lower() for no_img in NO_IMAGE_URLS):
+            if any(no_img in image_url.lower() for no_img in NO_IMAGE_PATTERNS):
                 return None
             return image_url
         return None
@@ -673,11 +673,22 @@ def get_amazon_image(jan_code, session):
 
 
 def download_image(image_url, session):
-    """画像をダウンロードしてバイトデータを返す"""
+    """画像をダウンロードしてバイトデータを返す（NO IMAGE検出付き）"""
     try:
         response = session.get(image_url, timeout=10)
         response.raise_for_status()
-        return response.content
+        content = response.content
+
+        # 画像サイズが小さすぎる場合はNO IMAGEの可能性が高い（5KB未満）
+        if len(content) < 5000:
+            return None
+
+        # 特定のパターンをURLで再チェック
+        no_image_patterns = ['no_image', 'noimage', 'no-image', 'dummy', 'blank', 'spacer', 'placeholder']
+        if any(pattern in image_url.lower() for pattern in no_image_patterns):
+            return None
+
+        return content
     except Exception:
         return None
 
@@ -1335,6 +1346,8 @@ elif mode == "📥 不足画像取得":
         st.session_state.github_comic_list = None
     if "github_folder_hierarchy" not in st.session_state:
         st.session_state.github_folder_hierarchy = None
+    if "image_download_result" not in st.session_state:
+        st.session_state.image_download_result = None
 
     st.markdown("### ステップ0: GitHubからファイル取得")
     st.markdown("GitHub Actionsで生成されたファイルを取得します。")
@@ -1595,67 +1608,91 @@ elif mode == "📥 不足画像取得":
                 progress_bar.empty()
                 status_text.empty()
 
-                # 結果サマリー
-                st.markdown("### 結果")
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("総数", stats['total'])
-                col2.metric("成功", stats['success'])
-                col3.metric("ブックオフ", stats['bookoff'])
-                col4.metric("Amazon", stats['amazon'])
-
-                if stats['failed'] > 0:
-                    st.warning(f"取得できなかった画像: {stats['failed']}件")
-
-                # ZIPダウンロード
-                if downloaded_images:
-                    st.divider()
-                    st.markdown("### ダウンロード")
-
-                    # ZIP作成
-                    zip_buffer = BytesIO()
-                    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-                        for img in downloaded_images:
-                            zf.writestr(img['filename'], img['data'])
-                    zip_buffer.seek(0)
-
-                    st.download_button(
-                        label=f"📥 画像ZIPダウンロード ({len(downloaded_images)}件)",
-                        data=zip_buffer,
-                        file_name="comic_images.zip",
-                        mime="application/zip"
-                    )
-
-                    # 振り分けマップExcel作成
-                    excel_data = []
-                    for i, data in enumerate(result_data, 1):
-                        excel_data.append({
-                            '連番': i,
-                            'コミックNo': data['comic_no'],
-                            '1巻JAN': data['first_jan'],
-                            'タイトル': data['title'],
-                            'ジャンル': data['genre'],
-                            '出版社': data['publisher'],
-                            '著者': data['author'],
-                            'シリーズ': data['series'],
-                            'メインフォルダ': data.get('main_folder', ''),
-                            'サブフォルダ': data.get('sub_folder', '')
-                        })
-
-                    df_excel = pd.DataFrame(excel_data)
-                    excel_buffer = BytesIO()
-                    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                        df_excel.to_excel(writer, index=False, sheet_name='振り分けマップ')
-                        style_excel(writer.sheets['振り分けマップ'], num_columns=10)
-                    excel_buffer.seek(0)
-
-                    st.download_button(
-                        label="📥 振り分けマップExcel",
-                        data=excel_buffer,
-                        file_name="振り分けマップ.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
+                # 結果をsession_stateに保存
+                st.session_state.image_download_result = {
+                    'stats': stats,
+                    'downloaded_images': downloaded_images,
+                    'result_data': result_data
+                }
+                st.rerun()
 
             except Exception as e:
                 st.error(f"エラーが発生しました: {e}")
                 import traceback
                 st.code(traceback.format_exc())
+
+    # 結果表示（session_stateから）
+    if st.session_state.image_download_result:
+        result = st.session_state.image_download_result
+        stats = result['stats']
+        downloaded_images = result['downloaded_images']
+        result_data = result['result_data']
+
+        # 結果サマリー
+        st.markdown("### 結果")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("総数", stats['total'])
+        col2.metric("成功", stats['success'])
+        col3.metric("ブックオフ", stats['bookoff'])
+        col4.metric("Amazon", stats['amazon'])
+
+        if stats['failed'] > 0:
+            st.warning(f"取得できなかった画像: {stats['failed']}件")
+
+        # ZIPダウンロード
+        if downloaded_images:
+            st.divider()
+            st.markdown("### ダウンロード")
+
+            # ZIP作成
+            zip_buffer = BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for img in downloaded_images:
+                    zf.writestr(img['filename'], img['data'])
+            zip_buffer.seek(0)
+
+            # 振り分けマップExcel作成
+            excel_data = []
+            for i, data in enumerate(result_data, 1):
+                excel_data.append({
+                    '連番': i,
+                    'コミックNo': data['comic_no'],
+                    '1巻JAN': data['first_jan'],
+                    'タイトル': data['title'],
+                    'ジャンル': data['genre'],
+                    '出版社': data['publisher'],
+                    '著者': data['author'],
+                    'シリーズ': data['series'],
+                    'メインフォルダ': data.get('main_folder', ''),
+                    'サブフォルダ': data.get('sub_folder', '')
+                })
+
+            df_excel = pd.DataFrame(excel_data)
+            excel_buffer = BytesIO()
+            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                df_excel.to_excel(writer, index=False, sheet_name='振り分けマップ')
+                style_excel(writer.sheets['振り分けマップ'], num_columns=10)
+            excel_buffer.seek(0)
+
+            # ダウンロードボタンを横並びに
+            dl_col1, dl_col2, dl_col3 = st.columns([2, 2, 1])
+            with dl_col1:
+                st.download_button(
+                    label=f"📥 画像ZIP ({len(downloaded_images)}件)",
+                    data=zip_buffer,
+                    file_name="comic_images.zip",
+                    mime="application/zip",
+                    key="zip_download"
+                )
+            with dl_col2:
+                st.download_button(
+                    label="📥 振り分けマップExcel",
+                    data=excel_buffer,
+                    file_name="振り分けマップ.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="excel_download"
+                )
+            with dl_col3:
+                if st.button("🗑️ クリア"):
+                    st.session_state.image_download_result = None
+                    st.rerun()
