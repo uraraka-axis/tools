@@ -875,7 +875,7 @@ elif mode == "🔍 画像存在チェック":
         # 結果クリアボタン（2行目）
         if st.button("🗑️ 結果をクリア"):
             st.session_state.check_results = None
-                st.rerun()
+            st.rerun()
 
 
 elif mode == "📥 不足画像取得":
