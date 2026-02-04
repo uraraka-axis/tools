@@ -1703,6 +1703,13 @@ elif mode == "📥 不足画像取得":
 
                 # 画像ダウンロード
                 st.markdown("### 画像ダウンロード中...")
+
+                # Gemini AI状態を表示
+                if GEMINI_AVAILABLE and GEMINI_API_KEY:
+                    st.info("🤖 Gemini AI セルフヒーリング: 有効")
+                else:
+                    st.warning(f"🤖 Gemini AI セルフヒーリング: 無効 (AVAILABLE={GEMINI_AVAILABLE}, KEY設定={bool(GEMINI_API_KEY)})")
+
                 progress_bar = st.progress(0)
                 status_text = st.empty()
 
