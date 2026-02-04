@@ -5,7 +5,7 @@ R-Cabinet 管理ツール
 """
 
 # バージョン（デプロイ確認用）
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.1.2"
 
 import streamlit as st
 import requests
@@ -1249,22 +1249,41 @@ if mode == "📂 画像一覧取得":
 
     # ボタン押下時の処理
     if show_db_btn:
-        # DBから読み込み
-        st.session_state.data_source = "db"
-        if selected_folder_name == "📁 すべて（全フォルダ）":
-            loaded_images, msg = load_images_from_db()
-        else:
-            folder_name = folder_options[selected_folder_name]['FolderName']
-            loaded_images = load_images_from_db_by_folder(folder_name)
-            msg = f"{len(loaded_images)}件を読み込みました"
+        st.session_state.images_loaded = False
+        st.session_state.images_data = None
 
-        if loaded_images:
-            st.session_state.images_data = loaded_images
-            st.session_state.images_loaded = True
-            st.session_state.error_folders = []
-            st.success(f"📂 DBから{msg}")
+        if selected_folder_name == "📁 すべて（全フォルダ）":
+            # 全フォルダ: DBから読み込み（高速）
+            st.session_state.data_source = "db"
+            loaded_images, msg = load_images_from_db()
+            if loaded_images:
+                st.session_state.images_data = loaded_images
+                st.session_state.images_loaded = True
+                st.session_state.error_folders = []
+                st.success(f"📂 DBから{msg}")
+            else:
+                st.warning("DBにデータがありません")
         else:
-            st.warning("DBにデータがありません")
+            # 個別フォルダ: APIから直接取得（高速）
+            st.session_state.data_source = "api"
+            selected_folder = folder_options[selected_folder_name]
+            folder_id = int(selected_folder['FolderId'])
+            folder_name = selected_folder['FolderName']
+
+            with st.spinner(f"「{folder_name}」を取得中..."):
+                files, error = get_folder_files(folder_id)
+
+            if error:
+                st.error(error)
+            elif files:
+                for f in files:
+                    f['FolderName'] = folder_name
+                st.session_state.images_data = files
+                st.session_state.images_loaded = True
+                st.session_state.error_folders = []
+                st.success(f"📂 APIから{len(files)}件を取得しました")
+            else:
+                st.warning("画像がありません")
 
     if fetch_api_btn:
         # APIから取得してDB同期
