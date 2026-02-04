@@ -1467,67 +1467,22 @@ elif mode == "📥 不足画像取得":
 
     st.divider()
 
-    st.markdown("### ステップ1: ファイルアップロード（オプション）")
-    st.markdown("手動でファイルをアップロードする場合、またはフォルダ階層リストを更新する場合に使用します。")
+    # 使用するファイルを決定（GitHubから取得したもの）
+    use_is_list = BytesIO(st.session_state.github_is_list) if st.session_state.github_is_list else None
+    use_comic_list = BytesIO(st.session_state.github_comic_list) if st.session_state.github_comic_list else None
+    use_hierarchy = BytesIO(st.session_state.github_folder_hierarchy) if st.session_state.github_folder_hierarchy else None
 
-    with st.expander("📁 ファイルを手動アップロード", expanded=False):
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.markdown("#### IS検索結果")
-            is_list_file = st.file_uploader(
-                "is_list.csv",
-                type=['csv'],
-                key="is_list_upload",
-                help="IS検索でダウンロードしたCSVファイル"
-            )
-
-        with col2:
-            st.markdown("#### CL検索結果")
-            comic_list_file = st.file_uploader(
-                "comic_list.csv",
-                type=['csv'],
-                key="comic_list_upload",
-                help="CL検索でダウンロードしたCSVファイル（出版社・シリーズ情報）"
-            )
-
-        st.markdown("#### フォルダ階層リスト（更新する場合のみ）")
-        hierarchy_file = st.file_uploader(
-            "フォルダ階層リスト.xlsx",
-            type=['xlsx'],
-            key="hierarchy_upload",
-            help="RMSフォルダへのマッピング情報（GitHubにアップロードして更新）"
-        )
-
-        # フォルダ階層リストをGitHubにアップロードするボタン
-        if hierarchy_file:
-            if st.button("📤 フォルダ階層リストをGitHubにアップロード"):
-                hierarchy_file.seek(0)
-                content = hierarchy_file.read()
-                result = upload_binary_to_github(
-                    content,
-                    GITHUB_FOLDER_HIERARCHY_PATH,
-                    f"Update folder_hierarchy.xlsx - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-                )
-                if result.get("success"):
-                    st.success("フォルダ階層リストをGitHubにアップロードしました")
-                    st.session_state.github_folder_hierarchy = content
-                else:
-                    st.error(f"アップロード失敗: {result.get('error')}")
-
-    st.divider()
-
-    # 使用するファイルを決定（アップロードファイル優先、なければGitHubから取得したもの）
-    use_is_list = is_list_file if is_list_file else (BytesIO(st.session_state.github_is_list) if st.session_state.github_is_list else None)
-    use_comic_list = comic_list_file if comic_list_file else (BytesIO(st.session_state.github_comic_list) if st.session_state.github_comic_list else None)
-    use_hierarchy = hierarchy_file if hierarchy_file else (BytesIO(st.session_state.github_folder_hierarchy) if st.session_state.github_folder_hierarchy else None)
-
-    # ファイルがアップロードされた場合のプレビュー
+    # ファイルのプレビュー
     if use_is_list:
         st.markdown("### is_list.csv プレビュー")
         try:
             use_is_list.seek(0)
-            df_is_preview = pd.read_csv(use_is_list, encoding='cp932', header=None)
+            # UTF-8を先に試し、失敗したらcp932
+            try:
+                df_is_preview = pd.read_csv(use_is_list, encoding='utf-8', header=None)
+            except:
+                use_is_list.seek(0)
+                df_is_preview = pd.read_csv(use_is_list, encoding='cp932', header=None)
             st.dataframe(df_is_preview.head(10), use_container_width=True, height=200)
             st.info(f"読み込み件数: {len(df_is_preview)}行")
         except Exception as e:
@@ -1535,7 +1490,7 @@ elif mode == "📥 不足画像取得":
 
     st.divider()
 
-    st.markdown("### ステップ2: 画像取得")
+    st.markdown("### 画像取得")
 
     # 全ファイルが利用可能かチェック
     all_files_ready = use_is_list and use_comic_list and use_hierarchy
@@ -1553,14 +1508,26 @@ elif mode == "📥 不足画像取得":
         # 画像取得ボタン
         if st.button("🖼️ 画像取得開始", type="primary"):
             try:
-                # ファイル読み込み
+                # ファイル読み込み（UTF-8を先に試し、失敗したらcp932）
                 use_is_list.seek(0)
                 use_comic_list.seek(0)
                 use_hierarchy.seek(0)
 
                 with st.spinner("ファイルを読み込み中..."):
-                    df_is = pd.read_csv(use_is_list, encoding='cp932', header=None)
-                    df_cl = pd.read_csv(use_comic_list, encoding='cp932', header=None)
+                    # is_list.csv
+                    try:
+                        df_is = pd.read_csv(use_is_list, encoding='utf-8', header=None)
+                    except:
+                        use_is_list.seek(0)
+                        df_is = pd.read_csv(use_is_list, encoding='cp932', header=None)
+
+                    # comic_list.csv
+                    try:
+                        df_cl = pd.read_csv(use_comic_list, encoding='utf-8', header=None)
+                    except:
+                        use_comic_list.seek(0)
+                        df_cl = pd.read_csv(use_comic_list, encoding='cp932', header=None)
+
                     df_hierarchy = pd.read_excel(use_hierarchy, sheet_name="フォルダ階層リスト", header=None)
 
                 st.success(f"ファイル読み込み完了: IS={len(df_is)}行, CL={len(df_cl)}行, 階層={len(df_hierarchy)}行")
