@@ -1360,6 +1360,29 @@ elif mode == "📥 不足画像取得":
         else:
             st.warning("フォルダ階層リスト\n未配置")
 
+    # フォルダ階層リストのアップロード機能
+    hierarchy_upload = st.file_uploader(
+        "フォルダ階層リストをアップロード（更新）",
+        type=['xlsx'],
+        key="hierarchy_quick_upload",
+        help="フォルダ階層リスト.xlsxをドラッグ&ドロップしてGitHubにアップロード"
+    )
+    if hierarchy_upload:
+        if st.button("📤 フォルダ階層リストを更新", type="secondary"):
+            hierarchy_upload.seek(0)
+            content = hierarchy_upload.read()
+            result = upload_binary_to_github(
+                content,
+                GITHUB_FOLDER_HIERARCHY_PATH,
+                f"Update folder_hierarchy.xlsx - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            )
+            if result.get("success"):
+                st.success("フォルダ階層リストを更新しました")
+                st.session_state.github_folder_hierarchy = content
+                st.rerun()
+            else:
+                st.error(f"アップロード失敗: {result.get('error')}")
+
     # CSV生成・取得セクション
     st.markdown("#### CSVファイル操作")
 
@@ -1379,14 +1402,14 @@ elif mode == "📥 不足画像取得":
         status_text = "完了" if latest["conclusion"] == "success" else "失敗" if latest["conclusion"] == "failure" else "処理中..."
         st.caption(f"前回生成: {jst_str} {status_icon} {status_text}")
 
-    # ボタンを横並びに配置
+    # ボタンを横並びに配置（左を目立つ色に）
     btn_col1, btn_col2, _ = st.columns([3, 2, 3])
 
     with btn_col1:
         run_actions = st.button("📊 is_list / comic_list 生成", type="primary", help="不足コミックのCSVファイルを自動生成します", use_container_width=True)
 
     with btn_col2:
-        fetch_files = st.button("📥 ダウンロード", type="primary", help="生成済みのファイルをダウンロードします", use_container_width=True)
+        fetch_files = st.button("📥 ダウンロード", type="secondary", help="生成済みのファイルをダウンロードします", use_container_width=True)
 
     # GitHub Actions 実行処理
     if run_actions:
