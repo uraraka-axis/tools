@@ -44,11 +44,12 @@ def get_all_folders():
             print(f"Response: {response.text[:500]}")
             return all_folders
 
+        print(f"  Response (first 500 chars): {response.text[:500]}")
         root = ET.fromstring(response.content)
         status = root.find(".//resultCode")
         print(f"  Result code: {status.text if status is not None else 'None'}")
         if status is None or status.text != "N000":
-            print(f"  API Error or no more data")
+            print(f"  API Error or no more data. Full result code element: {ET.tostring(root, encoding='unicode')[:300]}")
             break
 
         folders = root.findall(".//folder")
