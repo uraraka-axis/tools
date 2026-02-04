@@ -19,12 +19,9 @@ from openpyxl.styles import Font, Border, Side, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 from supabase import create_client, Client
 
-# Gemini AI（オプション - セルフヒーリング用）
-try:
-    import google.generativeai as genai
-    GEMINI_AVAILABLE = True
-except ImportError:
-    GEMINI_AVAILABLE = False
+# Gemini AI（遅延読み込み - 起動高速化のため）
+GEMINI_AVAILABLE = None  # 初回使用時にチェック
+_genai_module = None
 
 # ページ設定
 st.set_page_config(
@@ -53,8 +50,29 @@ GITHUB_FOLDER_HIERARCHY_PATH = "comic-lister/data/folder_hierarchy.xlsx"
 
 # Gemini API設定（セルフヒーリング用）
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
-if GEMINI_AVAILABLE and GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+
+
+def get_gemini_model():
+    """Gemini AIモデルを遅延読み込みで取得"""
+    global GEMINI_AVAILABLE, _genai_module
+
+    if GEMINI_AVAILABLE is None:
+        try:
+            import google.generativeai as genai
+            _genai_module = genai
+            GEMINI_AVAILABLE = True
+        except ImportError:
+            GEMINI_AVAILABLE = False
+            return None
+
+    if not GEMINI_AVAILABLE or not GEMINI_API_KEY:
+        return None
+
+    if _genai_module:
+        _genai_module.configure(api_key=GEMINI_API_KEY)
+        return _genai_module.GenerativeModel('gemini-2.0-flash')
+
+    return None
 
 
 def upload_to_github(content: str, path: str, message: str) -> dict:
@@ -752,7 +770,9 @@ def get_rakuten_image(jan_code, session):
 
 def get_image_with_gemini_ai(jan_code, session, source_name="amazon"):
     """Gemini AIを使って画像URLを抽出（セルフヒーリング機能）"""
-    if not GEMINI_AVAILABLE or not GEMINI_API_KEY:
+    # Geminiモデルを遅延読み込み
+    model = get_gemini_model()
+    if not model:
         return None
 
     # ソース別のURL設定
@@ -787,9 +807,6 @@ def get_image_with_gemini_ai(jan_code, session, source_name="amazon"):
             html_snippet = str(main_content)[:8000]  # 最大8000文字に制限
         else:
             html_snippet = str(soup)[:8000]
-
-        # Gemini 2.0 Flashに問い合わせ
-        model = genai.GenerativeModel('gemini-2.0-flash')
 
         prompt = f"""以下のHTMLから、JANコード「{jan_code}」の本の表紙画像URLを1つだけ抽出してください。
 
@@ -1705,10 +1722,10 @@ elif mode == "📥 不足画像取得":
                 st.markdown("### 画像ダウンロード中...")
 
                 # Gemini AI状態を表示
-                if GEMINI_AVAILABLE and GEMINI_API_KEY:
-                    st.info("🤖 Gemini AI セルフヒーリング: 有効")
+                if GEMINI_API_KEY:
+                    st.info("🤖 Gemini AI セルフヒーリング: 有効（APIキー設定済み）")
                 else:
-                    st.warning(f"🤖 Gemini AI セルフヒーリング: 無効 (AVAILABLE={GEMINI_AVAILABLE}, KEY設定={bool(GEMINI_API_KEY)})")
+                    st.warning("🤖 Gemini AI セルフヒーリング: 無効（GEMINI_API_KEY未設定）")
 
                 progress_bar = st.progress(0)
                 status_text = st.empty()
@@ -1745,11 +1762,12 @@ elif mode == "📥 不足画像取得":
                         source = 'rakuten'
 
                     # 4. Gemini AIでセルフヒーリング（全て失敗した場合）
-                    if not image_url and GEMINI_AVAILABLE and GEMINI_API_KEY:
+                    if not image_url and GEMINI_API_KEY:
                         time.sleep(random.uniform(0.5, 1.0))
                         # Amazonを再試行（AIでHTML解析）
                         image_url = get_image_with_gemini_ai(jan_code, session, "amazon")
-                        source = 'gemini_ai'
+                        if image_url:
+                            source = 'gemini_ai'
 
                     if image_url:
                         image_data = download_image(image_url, session)
