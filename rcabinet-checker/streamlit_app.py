@@ -5,7 +5,7 @@ R-Cabinet 管理ツール
 """
 
 # バージョン（デプロイ確認用）
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 
 import streamlit as st
 import requests
@@ -733,7 +733,7 @@ def get_bookoff_image(jan_code, session):
     url = f"https://shopping.bookoff.co.jp/search/keyword/{jan_code}"
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 
-    NO_IMAGE_PATTERNS = ['item_ll.gif', 'no_image', 'noimage', 'no-image', 'dummy', 'blank', 'spacer']
+    NO_IMAGE_PATTERNS = ['item_ll', 'no_image', 'noimage', 'no-image', 'dummy', 'blank', 'spacer', 'placeholder']
     BeautifulSoup = get_bs4()
 
     try:
