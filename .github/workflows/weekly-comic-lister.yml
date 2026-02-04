@@ -42,7 +42,7 @@ jobs:
         env:
           HARU_USERNAME: ${{ secrets.HARU_USERNAME }}
           HARU_PASSWORD: ${{ secrets.HARU_PASSWORD }}
-          GOOGLE_SHEETS_URL: ${{ secrets.GOOGLE_SHEETS_URL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ASSIGNEE_NAME: ${{ secrets.ASSIGNEE_NAME }}
           ISBN_SETTING: "1st"
           OUTPUT_DIR: /tmp/comic-lister-output

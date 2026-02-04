@@ -36,6 +36,51 @@ BASE_URL = "https://api.rms.rakuten.co.jp/es/1.0"
 SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
 SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "")
 
+# GitHub接続情報
+GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN", "")
+GITHUB_REPO = "uraraka-axis/tools"
+GITHUB_MISSING_CSV_PATH = "comic-lister/data/missing_comics.csv"
+
+
+def upload_to_github(content: str, path: str, message: str) -> dict:
+    """GitHubにファイルをアップロード（上書き更新）"""
+    if not GITHUB_TOKEN:
+        return {"success": False, "error": "GITHUB_TOKEN未設定"}
+
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+
+    # 既存ファイルのSHAを取得（更新時に必要）
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+    sha = None
+
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            sha = response.json().get("sha")
+    except:
+        pass
+
+    # ファイルをアップロード
+    data = {
+        "message": message,
+        "content": base64.b64encode(content.encode('utf-8')).decode('utf-8'),
+        "branch": "master"
+    }
+    if sha:
+        data["sha"] = sha
+
+    try:
+        response = requests.put(url, headers=headers, json=data)
+        if response.status_code in [200, 201]:
+            return {"success": True, "url": response.json().get("content", {}).get("html_url", "")}
+        else:
+            return {"success": False, "error": f"HTTP {response.status_code}: {response.text[:200]}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 
 @st.cache_resource
 def get_supabase_client() -> Client:
@@ -1088,10 +1133,40 @@ elif mode == "🔍 画像存在チェック":
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
-        # 結果クリアボタン（2行目）
-        if st.button("🗑️ 結果をクリア"):
-            st.session_state.check_results = None
-            st.rerun()
+        # 2行目：GitHubアップロード、結果クリア
+        btn_col3, btn_col4, _ = st.columns([1.5, 1, 2])
+
+        with btn_col3:
+            # GitHubにアップロードボタン
+            if not_exists_comics:
+                if st.button("📤 GitHubにアップロード", help="コミックリスター用にGitHubへアップロード"):
+                    # コミックリスター用CSV形式（J列にコミックNo.、K列に1）
+                    csv_lines = []
+                    for comic_no in not_exists_comics:
+                        row = [''] * 9 + [str(comic_no), '1']
+                        csv_lines.append(','.join(row))
+                    csv_content = '\n'.join(csv_lines)
+
+                    with st.spinner("GitHubにアップロード中..."):
+                        today = datetime.now().strftime("%Y-%m-%d %H:%M")
+                        result = upload_to_github(
+                            csv_content,
+                            GITHUB_MISSING_CSV_PATH,
+                            f"Update missing_comics.csv ({len(not_exists_comics)}件) - {today}"
+                        )
+
+                    if result.get("success"):
+                        st.success(f"GitHubにアップロード完了（{len(not_exists_comics)}件）")
+                    else:
+                        st.error(f"アップロード失敗: {result.get('error')}")
+            else:
+                st.button("📤 GitHubにアップロード", disabled=True, help="存在なしのコミックNoがありません")
+
+        with btn_col4:
+            # 結果クリアボタン
+            if st.button("🗑️ 結果をクリア"):
+                st.session_state.check_results = None
+                st.rerun()
 
 
 elif mode == "📥 不足画像取得":

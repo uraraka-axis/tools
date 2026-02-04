@@ -7,9 +7,9 @@ import time
 import os
 import sys
 import datetime
-import re
 from pathlib import Path
 
+import requests
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -22,10 +22,13 @@ import pandas as pd
 # 環境変数から設定を取得
 HARU_USERNAME = os.environ.get("HARU_USERNAME", "haruuser")
 HARU_PASSWORD = os.environ.get("HARU_PASSWORD", "Haru@9999")
-GOOGLE_SHEETS_URL = os.environ.get("GOOGLE_SHEETS_URL",
-    "https://docs.google.com/spreadsheets/d/1ivKBwOnyHi88F_-OjDPTu0-P2OW81qpS/edit?gid=1315015327#gid=1315015327")
 ASSIGNEE_NAME = os.environ.get("ASSIGNEE_NAME", "笹山")
 ISBN_SETTING = os.environ.get("ISBN_SETTING", "1st")  # lst, dat, max, 1st
+
+# GitHub設定（R-Cabinetチェッカーからアップロードされたmissing_comics.csv）
+GITHUB_REPO = "uraraka-axis/tools"
+GITHUB_CSV_PATH = "comic-lister/data/missing_comics.csv"
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
 # 出力ディレクトリ
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/tmp/comic-lister-output"))
@@ -37,27 +40,31 @@ def log(message):
     print(f"[{timestamp}] {message}")
 
 
-def get_comic_numbers_from_sheets():
-    """Google SheetsからコミックNo.を取得"""
+def get_comic_numbers_from_github():
+    """GitHubからmissing_comics.csvを取得してコミックNo.を抽出"""
     try:
-        log("Google Sheetsからデータ取得中...")
+        log("GitHubからデータ取得中...")
 
-        # 公開CSVアクセス用URLを生成
-        if "edit" in GOOGLE_SHEETS_URL:
-            sheet_id = re.search(r'/spreadsheets/d/([a-zA-Z0-9-_]+)', GOOGLE_SHEETS_URL).group(1)
-            gid = re.search(r'gid=([0-9]+)', GOOGLE_SHEETS_URL)
-            gid = gid.group(1) if gid else "0"
-            csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
-        else:
-            csv_url = GOOGLE_SHEETS_URL
+        # GitHub Raw URLから取得（公開リポジトリの場合）
+        raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/master/{GITHUB_CSV_PATH}"
 
-        df = pd.read_csv(csv_url, header=None)
+        headers = {}
+        if GITHUB_TOKEN:
+            headers["Authorization"] = f"token {GITHUB_TOKEN}"
 
-        # C列（2列目）の3行目以降からコミックNo.を取得
+        response = requests.get(raw_url, headers=headers)
+
+        if response.status_code != 200:
+            log(f"GitHub取得エラー: HTTP {response.status_code}")
+            return []
+
+        # CSVをパース（J列=9列目にコミックNo.が入っている）
+        df = pd.read_csv(pd.io.common.StringIO(response.text), header=None)
+
         comic_numbers = []
-        if len(df.columns) >= 3:
-            for i in range(2, len(df)):
-                value = df.iloc[i, 2]
+        for i in range(len(df)):
+            if len(df.columns) > 9:
+                value = df.iloc[i, 9]  # J列（0始まりで9）
                 if pd.notna(value) and str(value).strip():
                     comic_numbers.append(str(value).strip())
 
@@ -65,7 +72,7 @@ def get_comic_numbers_from_sheets():
         return comic_numbers
 
     except Exception as e:
-        log(f"Google Sheetsからのデータ取得エラー: {e}")
+        log(f"GitHubからのデータ取得エラー: {e}")
         return []
 
 
@@ -468,7 +475,8 @@ def main():
     # 環境変数チェック
     log(f"HARU_USERNAME set: {bool(HARU_USERNAME)}")
     log(f"HARU_PASSWORD set: {bool(HARU_PASSWORD)}")
-    log(f"GOOGLE_SHEETS_URL set: {bool(GOOGLE_SHEETS_URL)}")
+    log(f"GITHUB_TOKEN set: {bool(GITHUB_TOKEN)}")
+    log(f"GITHUB_CSV_PATH: {GITHUB_CSV_PATH}")
     log(f"ASSIGNEE_NAME: {ASSIGNEE_NAME}")
     log(f"ISBN_SETTING: {ISBN_SETTING}")
     log(f"OUTPUT_DIR: {OUTPUT_DIR}")
@@ -476,8 +484,8 @@ def main():
     # 出力ディレクトリ作成
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 1. Google SheetsからコミックNo.を取得
-    comic_numbers = get_comic_numbers_from_sheets()
+    # 1. GitHubからコミックNo.を取得（R-Cabinetチェッカーからアップロードされたもの）
+    comic_numbers = get_comic_numbers_from_github()
 
     if not comic_numbers:
         log("コミックNo.が取得できませんでした。終了します。")
