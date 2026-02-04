@@ -122,6 +122,28 @@ def get_folder_files(folder_id: int):
     return all_files
 
 
+def fetch_all_from_supabase(supabase: Client, table: str, columns: str = "*") -> list:
+    """Supabaseから全件取得（ページネーション対応）"""
+    all_data = []
+    page_size = 1000
+    offset = 0
+
+    while True:
+        response = supabase.table(table).select(columns).range(offset, offset + page_size - 1).execute()
+
+        if not response.data:
+            break
+
+        all_data.extend(response.data)
+
+        if len(response.data) < page_size:
+            break
+
+        offset += page_size
+
+    return all_data
+
+
 def sync_images_to_db(supabase: Client, images: list) -> dict:
     """画像一覧をDBに同期（upsert）"""
     try:
@@ -143,9 +165,9 @@ def sync_images_to_db(supabase: Client, images: list) -> dict:
                     "file_timestamp": img.get("TimeStamp", "")
                 }
 
-        # 既存データを取得
-        existing = supabase.table("rcabinet_images").select("file_name, file_timestamp").execute()
-        existing_dict = {row["file_name"]: row["file_timestamp"] for row in existing.data}
+        # 既存データを取得（ページネーション対応）
+        existing_data = fetch_all_from_supabase(supabase, "rcabinet_images", "file_name, file_timestamp")
+        existing_dict = {row["file_name"]: row["file_timestamp"] for row in existing_data}
 
         # 差分計算
         new_count = 0

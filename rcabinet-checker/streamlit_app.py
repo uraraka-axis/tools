@@ -45,6 +45,31 @@ def get_supabase_client() -> Client:
     return None
 
 
+def fetch_all_from_supabase(supabase: Client, table: str, columns: str = "*", filter_col: str = None, filter_val: str = None) -> list:
+    """Supabaseから全件取得（ページネーション対応）"""
+    all_data = []
+    page_size = 1000
+    offset = 0
+
+    while True:
+        query = supabase.table(table).select(columns).range(offset, offset + page_size - 1)
+        if filter_col and filter_val:
+            query = query.ilike(filter_col, f"%{filter_val}%")
+        response = query.execute()
+
+        if not response.data:
+            break
+
+        all_data.extend(response.data)
+
+        if len(response.data) < page_size:
+            break
+
+        offset += page_size
+
+    return all_data
+
+
 def sync_images_to_db(images: list) -> dict:
     """画像一覧をDBに同期（upsert）"""
     supabase = get_supabase_client()
@@ -71,9 +96,9 @@ def sync_images_to_db(images: list) -> dict:
                     "file_timestamp": img.get("TimeStamp", "")
                 }
 
-        # 既存データを取得
-        existing = supabase.table("rcabinet_images").select("file_name, file_timestamp").execute()
-        existing_dict = {row["file_name"]: row["file_timestamp"] for row in existing.data}
+        # 既存データを取得（ページネーション対応）
+        existing_data = fetch_all_from_supabase(supabase, "rcabinet_images", "file_name, file_timestamp")
+        existing_dict = {row["file_name"]: row["file_timestamp"] for row in existing_data}
 
         # 差分計算
         new_count = 0
@@ -126,15 +151,15 @@ def sync_images_to_db(images: list) -> dict:
 
 
 def load_images_from_db() -> tuple[list, str]:
-    """DBから画像一覧を読み込み"""
+    """DBから画像一覧を読み込み（ページネーション対応）"""
     supabase = get_supabase_client()
     if not supabase:
         return [], "Supabase未設定"
 
     try:
-        response = supabase.table("rcabinet_images").select("*").execute()
+        all_data = fetch_all_from_supabase(supabase, "rcabinet_images", "*")
         images = []
-        for row in response.data:
+        for row in all_data:
             images.append({
                 "FolderName": row.get("folder_names", ""),
                 "FileName": row.get("file_name", ""),
@@ -148,20 +173,20 @@ def load_images_from_db() -> tuple[list, str]:
 
 
 def get_db_stats() -> dict:
-    """DBの統計情報を取得"""
+    """DBの統計情報を取得（ページネーション対応）"""
     supabase = get_supabase_client()
     if not supabase:
         return {}
 
     try:
-        response = supabase.table("rcabinet_images").select("folder_names, created_at").execute()
-        total = len(response.data)
-        duplicates = sum(1 for row in response.data if ", " in row.get("folder_names", ""))
+        all_data = fetch_all_from_supabase(supabase, "rcabinet_images", "folder_names, created_at")
+        total = len(all_data)
+        duplicates = sum(1 for row in all_data if ", " in row.get("folder_names", ""))
 
         # 最終更新日時を取得
         last_updated = None
-        if response.data:
-            dates = [row.get("created_at") for row in response.data if row.get("created_at")]
+        if all_data:
+            dates = [row.get("created_at") for row in all_data if row.get("created_at")]
             if dates:
                 last_updated = max(dates)[:16].replace("T", " ")  # "2025-02-04 10:30"形式
 
@@ -171,15 +196,15 @@ def get_db_stats() -> dict:
 
 
 def load_images_from_db_by_folder(folder_name: str) -> list:
-    """DBから特定フォルダの画像を読み込み"""
+    """DBから特定フォルダの画像を読み込み（ページネーション対応）"""
     supabase = get_supabase_client()
     if not supabase:
         return []
 
     try:
-        response = supabase.table("rcabinet_images").select("*").ilike("folder_names", f"%{folder_name}%").execute()
+        all_data = fetch_all_from_supabase(supabase, "rcabinet_images", "*", "folder_names", folder_name)
         images = []
-        for row in response.data:
+        for row in all_data:
             images.append({
                 "FolderName": row.get("folder_names", ""),
                 "FileName": row.get("file_name", ""),
