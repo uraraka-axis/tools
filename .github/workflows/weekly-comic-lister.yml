@@ -2,8 +2,8 @@ name: Weekly Comic Lister
 
 on:
   schedule:
-    # 毎週月曜 AM9:00 JST = 日曜 00:00 UTC
-    - cron: '0 0 * * 0'
+    # 毎週金曜 AM8:00 JST = 木曜 23:00 UTC
+    - cron: '0 23 * * 4'
   workflow_dispatch:  # 手動実行も可能
 
 jobs:
