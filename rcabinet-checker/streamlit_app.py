@@ -40,6 +40,9 @@ SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "")
 GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN", "")
 GITHUB_REPO = "uraraka-axis/tools"
 GITHUB_MISSING_CSV_PATH = "comic-lister/data/missing_comics.csv"
+GITHUB_IS_LIST_PATH = "comic-lister/data/is_list.csv"
+GITHUB_COMIC_LIST_PATH = "comic-lister/data/comic_list.csv"
+GITHUB_FOLDER_HIERARCHY_PATH = "comic-lister/data/folder_hierarchy.xlsx"
 
 
 def upload_to_github(content: str, path: str, message: str) -> dict:
@@ -80,6 +83,97 @@ def upload_to_github(content: str, path: str, message: str) -> dict:
             return {"success": False, "error": f"HTTP {response.status_code}: {response.text[:200]}"}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+def upload_binary_to_github(content: bytes, path: str, message: str) -> dict:
+    """バイナリファイルをGitHubにアップロード（上書き更新）"""
+    if not GITHUB_TOKEN:
+        return {"success": False, "error": "GITHUB_TOKEN未設定"}
+
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+
+    # 既存ファイルのSHAを取得（更新時に必要）
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+    sha = None
+
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            sha = response.json().get("sha")
+    except:
+        pass
+
+    # ファイルをアップロード
+    data = {
+        "message": message,
+        "content": base64.b64encode(content).decode('utf-8'),
+        "branch": "master"
+    }
+    if sha:
+        data["sha"] = sha
+
+    try:
+        response = requests.put(url, headers=headers, json=data)
+        if response.status_code in [200, 201]:
+            return {"success": True, "url": response.json().get("content", {}).get("html_url", "")}
+        else:
+            return {"success": False, "error": f"HTTP {response.status_code}: {response.text[:200]}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def download_from_github(path: str) -> dict:
+    """GitHubからファイルをダウンロード"""
+    if not GITHUB_TOKEN:
+        return {"success": False, "error": "GITHUB_TOKEN未設定"}
+
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3.raw"
+    }
+
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            return {"success": True, "content": response.content, "path": path}
+        elif response.status_code == 404:
+            return {"success": False, "error": f"ファイルが見つかりません: {path}"}
+        else:
+            return {"success": False, "error": f"HTTP {response.status_code}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def get_github_file_info(path: str) -> dict:
+    """GitHubファイルの情報（更新日時など）を取得"""
+    if not GITHUB_TOKEN:
+        return {}
+
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/commits?path={path}&per_page=1"
+
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200 and response.json():
+            commit = response.json()[0]
+            date_str = commit.get("commit", {}).get("committer", {}).get("date", "")
+            if date_str:
+                # ISO形式をパース
+                from datetime import datetime
+                dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                return {"last_updated": dt.strftime("%Y-%m-%d %H:%M"), "exists": True}
+        return {"exists": False}
+    except:
+        return {"exists": False}
 
 
 @st.cache_resource
@@ -1175,44 +1269,146 @@ elif mode == "📥 不足画像取得":
 
     st.divider()
 
-    st.markdown("### ステップ1: ファイルアップロード")
+    # セッション状態の初期化
+    if "github_is_list" not in st.session_state:
+        st.session_state.github_is_list = None
+    if "github_comic_list" not in st.session_state:
+        st.session_state.github_comic_list = None
+    if "github_folder_hierarchy" not in st.session_state:
+        st.session_state.github_folder_hierarchy = None
 
-    col1, col2 = st.columns(2)
+    st.markdown("### ステップ0: GitHubからファイル取得")
+    st.markdown("GitHub Actionsで生成されたファイルを取得します。")
 
-    with col1:
-        st.markdown("#### IS検索結果")
-        is_list_file = st.file_uploader(
-            "is_list.csv",
-            type=['csv'],
-            key="is_list_upload",
-            help="IS検索でダウンロードしたCSVファイル"
-        )
+    # GitHubファイル情報を表示
+    col_info1, col_info2, col_info3 = st.columns(3)
+    with col_info1:
+        is_info = get_github_file_info(GITHUB_IS_LIST_PATH)
+        if is_info.get("exists"):
+            st.success(f"is_list.csv\n更新: {is_info.get('last_updated', '不明')}")
+        else:
+            st.warning("is_list.csv\n未生成")
+    with col_info2:
+        cl_info = get_github_file_info(GITHUB_COMIC_LIST_PATH)
+        if cl_info.get("exists"):
+            st.success(f"comic_list.csv\n更新: {cl_info.get('last_updated', '不明')}")
+        else:
+            st.warning("comic_list.csv\n未生成")
+    with col_info3:
+        fh_info = get_github_file_info(GITHUB_FOLDER_HIERARCHY_PATH)
+        if fh_info.get("exists"):
+            st.success(f"フォルダ階層リスト\n更新: {fh_info.get('last_updated', '不明')}")
+        else:
+            st.warning("フォルダ階層リスト\n未配置")
 
-    with col2:
-        st.markdown("#### CL検索結果")
-        comic_list_file = st.file_uploader(
-            "comic_list.csv",
-            type=['csv'],
-            key="comic_list_upload",
-            help="CL検索でダウンロードしたCSVファイル（出版社・シリーズ情報）"
-        )
+    # GitHubから取得ボタン
+    if st.button("📥 GitHubから一括取得", type="primary"):
+        with st.spinner("GitHubからファイルを取得中..."):
+            errors = []
 
-    st.markdown("#### フォルダ階層リスト")
-    hierarchy_file = st.file_uploader(
-        "フォルダ階層リスト.xlsx",
-        type=['xlsx'],
-        key="hierarchy_upload",
-        help="RMSフォルダへのマッピング情報"
-    )
+            # is_list.csv
+            result = download_from_github(GITHUB_IS_LIST_PATH)
+            if result.get("success"):
+                st.session_state.github_is_list = result["content"]
+            else:
+                errors.append(f"is_list.csv: {result.get('error')}")
+
+            # comic_list.csv
+            result = download_from_github(GITHUB_COMIC_LIST_PATH)
+            if result.get("success"):
+                st.session_state.github_comic_list = result["content"]
+            else:
+                errors.append(f"comic_list.csv: {result.get('error')}")
+
+            # folder_hierarchy.xlsx
+            result = download_from_github(GITHUB_FOLDER_HIERARCHY_PATH)
+            if result.get("success"):
+                st.session_state.github_folder_hierarchy = result["content"]
+            else:
+                errors.append(f"フォルダ階層リスト: {result.get('error')}")
+
+        if errors:
+            for err in errors:
+                st.warning(err)
+        else:
+            st.success("全ファイルの取得が完了しました")
+        st.rerun()
+
+    # 取得済みファイルの表示
+    status_cols = st.columns(3)
+    with status_cols[0]:
+        if st.session_state.github_is_list:
+            st.info("✅ is_list.csv 取得済み")
+    with status_cols[1]:
+        if st.session_state.github_comic_list:
+            st.info("✅ comic_list.csv 取得済み")
+    with status_cols[2]:
+        if st.session_state.github_folder_hierarchy:
+            st.info("✅ フォルダ階層リスト 取得済み")
 
     st.divider()
 
+    st.markdown("### ステップ1: ファイルアップロード（オプション）")
+    st.markdown("手動でファイルをアップロードする場合、またはフォルダ階層リストを更新する場合に使用します。")
+
+    with st.expander("📁 ファイルを手動アップロード", expanded=False):
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("#### IS検索結果")
+            is_list_file = st.file_uploader(
+                "is_list.csv",
+                type=['csv'],
+                key="is_list_upload",
+                help="IS検索でダウンロードしたCSVファイル"
+            )
+
+        with col2:
+            st.markdown("#### CL検索結果")
+            comic_list_file = st.file_uploader(
+                "comic_list.csv",
+                type=['csv'],
+                key="comic_list_upload",
+                help="CL検索でダウンロードしたCSVファイル（出版社・シリーズ情報）"
+            )
+
+        st.markdown("#### フォルダ階層リスト（更新する場合のみ）")
+        hierarchy_file = st.file_uploader(
+            "フォルダ階層リスト.xlsx",
+            type=['xlsx'],
+            key="hierarchy_upload",
+            help="RMSフォルダへのマッピング情報（GitHubにアップロードして更新）"
+        )
+
+        # フォルダ階層リストをGitHubにアップロードするボタン
+        if hierarchy_file:
+            if st.button("📤 フォルダ階層リストをGitHubにアップロード"):
+                hierarchy_file.seek(0)
+                content = hierarchy_file.read()
+                result = upload_binary_to_github(
+                    content,
+                    GITHUB_FOLDER_HIERARCHY_PATH,
+                    f"Update folder_hierarchy.xlsx - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                )
+                if result.get("success"):
+                    st.success("フォルダ階層リストをGitHubにアップロードしました")
+                    st.session_state.github_folder_hierarchy = content
+                else:
+                    st.error(f"アップロード失敗: {result.get('error')}")
+
+    st.divider()
+
+    # 使用するファイルを決定（アップロードファイル優先、なければGitHubから取得したもの）
+    use_is_list = is_list_file if is_list_file else (BytesIO(st.session_state.github_is_list) if st.session_state.github_is_list else None)
+    use_comic_list = comic_list_file if comic_list_file else (BytesIO(st.session_state.github_comic_list) if st.session_state.github_comic_list else None)
+    use_hierarchy = hierarchy_file if hierarchy_file else (BytesIO(st.session_state.github_folder_hierarchy) if st.session_state.github_folder_hierarchy else None)
+
     # ファイルがアップロードされた場合のプレビュー
-    if is_list_file:
+    if use_is_list:
         st.markdown("### is_list.csv プレビュー")
         try:
-            is_list_file.seek(0)
-            df_is_preview = pd.read_csv(is_list_file, encoding='cp932', header=None)
+            use_is_list.seek(0)
+            df_is_preview = pd.read_csv(use_is_list, encoding='cp932', header=None)
             st.dataframe(df_is_preview.head(10), use_container_width=True, height=200)
             st.info(f"読み込み件数: {len(df_is_preview)}行")
         except Exception as e:
@@ -1222,24 +1418,31 @@ elif mode == "📥 不足画像取得":
 
     st.markdown("### ステップ2: 画像取得")
 
-    # 全ファイルがアップロードされているかチェック
-    all_files_uploaded = is_list_file and comic_list_file and hierarchy_file
+    # 全ファイルが利用可能かチェック
+    all_files_ready = use_is_list and use_comic_list and use_hierarchy
 
-    if not all_files_uploaded:
-        st.info("3つのファイルをすべてアップロードしてください。")
+    if not all_files_ready:
+        missing = []
+        if not use_is_list:
+            missing.append("is_list.csv")
+        if not use_comic_list:
+            missing.append("comic_list.csv")
+        if not use_hierarchy:
+            missing.append("フォルダ階層リスト.xlsx")
+        st.info(f"以下のファイルが必要です: {', '.join(missing)}\n\n「GitHubから一括取得」ボタンを押すか、手動でアップロードしてください。")
     else:
         # 画像取得ボタン
         if st.button("🖼️ 画像取得開始", type="primary"):
             try:
                 # ファイル読み込み
-                is_list_file.seek(0)
-                comic_list_file.seek(0)
-                hierarchy_file.seek(0)
+                use_is_list.seek(0)
+                use_comic_list.seek(0)
+                use_hierarchy.seek(0)
 
                 with st.spinner("ファイルを読み込み中..."):
-                    df_is = pd.read_csv(is_list_file, encoding='cp932', header=None)
-                    df_cl = pd.read_csv(comic_list_file, encoding='cp932', header=None)
-                    df_hierarchy = pd.read_excel(hierarchy_file, sheet_name="フォルダ階層リスト", header=None)
+                    df_is = pd.read_csv(use_is_list, encoding='cp932', header=None)
+                    df_cl = pd.read_csv(use_comic_list, encoding='cp932', header=None)
+                    df_hierarchy = pd.read_excel(use_hierarchy, sheet_name="フォルダ階層リスト", header=None)
 
                 st.success(f"ファイル読み込み完了: IS={len(df_is)}行, CL={len(df_cl)}行, 階層={len(df_hierarchy)}行")
 

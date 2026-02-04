@@ -7,6 +7,7 @@ import time
 import os
 import sys
 import datetime
+import base64
 from pathlib import Path
 
 import requests
@@ -28,6 +29,7 @@ ISBN_SETTING = os.environ.get("ISBN_SETTING", "1st")  # lst, dat, max, 1st
 # GitHub設定（R-Cabinetチェッカーからアップロードされたmissing_comics.csv）
 GITHUB_REPO = "uraraka-axis/tools"
 GITHUB_CSV_PATH = "comic-lister/data/missing_comics.csv"
+GITHUB_OUTPUT_PATH = "comic-lister/data/comic_list.csv"  # 出力先
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
 # 出力ディレクトリ
@@ -38,6 +40,54 @@ def log(message):
     """ログメッセージを出力"""
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}")
+
+
+def upload_to_github(file_path: str, github_path: str, message: str) -> bool:
+    """ファイルをGitHubにアップロード（上書き更新）"""
+    if not GITHUB_TOKEN:
+        log("GITHUB_TOKEN未設定のためアップロードをスキップ")
+        return False
+
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+
+    # ファイル内容を読み込み
+    with open(file_path, 'rb') as f:
+        content = f.read()
+
+    # 既存ファイルのSHAを取得（更新時に必要）
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{github_path}"
+    sha = None
+
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            sha = response.json().get("sha")
+    except:
+        pass
+
+    # ファイルをアップロード
+    data = {
+        "message": message,
+        "content": base64.b64encode(content).decode('utf-8'),
+        "branch": "master"
+    }
+    if sha:
+        data["sha"] = sha
+
+    try:
+        response = requests.put(url, headers=headers, json=data)
+        if response.status_code in [200, 201]:
+            log(f"GitHubアップロード成功: {github_path}")
+            return True
+        else:
+            log(f"GitHubアップロード失敗: HTTP {response.status_code}")
+            return False
+    except Exception as e:
+        log(f"GitHubアップロードエラー: {e}")
+        return False
 
 
 def get_comic_numbers_from_github():
@@ -514,6 +564,20 @@ def main():
     log("出力ファイル一覧:")
     for file in OUTPUT_DIR.iterdir():
         log(f"  - {file.name}")
+
+    # 6. comic_list.csvをGitHubにアップロード
+    comic_list_files = list(OUTPUT_DIR.glob("*comic*list*.csv")) + list(OUTPUT_DIR.glob("*リスト*.csv"))
+    if comic_list_files:
+        comic_list_file = comic_list_files[0]
+        log(f"GitHubにアップロード: {comic_list_file.name}")
+        today = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        upload_to_github(
+            str(comic_list_file),
+            GITHUB_OUTPUT_PATH,
+            f"Update comic_list.csv ({len(comic_numbers)}件) - {today}"
+        )
+    else:
+        log("アップロード対象のcomic_list.csvが見つかりませんでした")
 
     log("=" * 50)
     log("Comic Lister CLI Completed")
