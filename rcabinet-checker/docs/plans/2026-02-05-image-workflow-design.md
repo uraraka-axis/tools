@@ -494,9 +494,9 @@ def clear_accumulated_data():
 ### リポジトリ配置済み
 | ファイル | 用途 | 配置場所 |
 |---------|------|----------|
-| badge_free_shipping.jpg | 送料無料バッジ | images/ |
-| additional_1.jpg | ヤフー追加画像1（透明カバー）| images/ ※要配置 |
-| additional_2.jpg | ヤフー追加画像2（aaaaa）| images/ ※要配置 |
+| badge_free_shipping.jpg | 送料無料バッジ | images/ ✅ |
+| additional_1.jpg | ヤフー追加画像1（透明カバー）| images/ ✅ |
+| additional_2.jpg | ヤフー追加画像2（aaaaa）| images/ ✅ |
 
 ### 手動アップロード（Step ④で必要）
 | ファイル | 用途 | 形式 |
@@ -579,6 +579,10 @@ def clear_accumulated_data():
 2. **Step ③の入力ファイル** ✅ 解決済み
    - is_list.csv のみ（GitHub自動取得）
 
+3. **追加画像（_1, _2）** ✅ 解決済み
+   - `images/additional_1.jpg`（透明カバー）← 商品画像_透明カバーw700h700.jpg
+   - `images/additional_2.jpg`（aaaaa）← aaaaa.jpg
+
 ---
 
 ## 未決定事項
@@ -586,11 +590,7 @@ def clear_accumulated_data():
 1. **ヤフー認証トークンの取得方法**
    - OAuth 2.0フロー？
    - 手動でトークンを取得してSecrets登録？
-
-2. **追加画像（_1, _2）の元ファイル**
-   - 透明カバー画像: どこから取得？
-   - aaaaa.jpg: どこから取得？
-   - → リポジトリに `images/additional_1.jpg`, `images/additional_2.jpg` として配置予定
+   - → 別途確認予定
 
 ---
 
