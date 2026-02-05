@@ -5,7 +5,7 @@ R-Cabinet 管理ツール
 """
 
 # バージョン（デプロイ確認用）
-APP_VERSION = "2.2.1"
+APP_VERSION = "2.3.0"
 
 import streamlit as st
 import requests
@@ -96,6 +96,7 @@ SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "")
 GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN", "")
 GITHUB_REPO = "uraraka-axis/tools"
 GITHUB_MISSING_CSV_PATH = "comic-lister/data/missing_comics.csv"
+GITHUB_MISSING_TANPIN_PATH = "comic-lister/data/missing_tanpin.csv"  # 単品用
 GITHUB_IS_LIST_PATH = "comic-lister/data/is_list.csv"
 GITHUB_COMIC_LIST_PATH = "comic-lister/data/comic_list.csv"
 GITHUB_FOLDER_HIERARCHY_PATH = "comic-lister/data/folder_hierarchy.xlsx"
@@ -1601,31 +1602,59 @@ elif mode == "🔍 画像存在チェック":
             )
 
         # 2行目：GitHubアップロード、結果クリア
+        # セット品と単品を分離
+        set_comics = [c for c in not_exists_comics if '_' not in str(c)]  # セット品（_なし）
+        tanpin_comics = [c for c in not_exists_comics if '_' in str(c)]   # 単品（_あり）
+
         btn_col3, btn_col4, _ = st.columns([1.5, 1, 2])
 
         with btn_col3:
-            # GitHubにアップロードボタン
-            if not_exists_comics:
-                if st.button("📤 GitHubにアップロード", help="コミックリスター用にGitHubへアップロード"):
-                    # コミックリスター用CSV形式（J列にコミックNo.、K列に1）
-                    csv_lines = []
-                    for comic_no in not_exists_comics:
-                        row = [''] * 9 + [str(comic_no), '1']
-                        csv_lines.append(','.join(row))
-                    csv_content = '\n'.join(csv_lines)
+            # GitHubにアップロードボタン（セット品・単品を分けてアップロード）
+            if set_comics or tanpin_comics:
+                upload_label = "📤 GitHubにアップロード"
+                upload_help = f"セット品: {len(set_comics)}件, 単品: {len(tanpin_comics)}件"
+                if st.button(upload_label, help=upload_help):
+                    today = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    upload_results = []
 
-                    with st.spinner("GitHubにアップロード中..."):
-                        today = datetime.now().strftime("%Y-%m-%d %H:%M")
-                        result = upload_to_github(
-                            csv_content,
-                            GITHUB_MISSING_CSV_PATH,
-                            f"Update missing_comics.csv ({len(not_exists_comics)}件) - {today}"
-                        )
+                    # セット品をアップロード（missing_comics.csv）
+                    if set_comics:
+                        csv_lines = []
+                        for comic_no in set_comics:
+                            row = [''] * 9 + [str(comic_no), '1']
+                            csv_lines.append(','.join(row))
+                        csv_content = '\n'.join(csv_lines)
 
-                    if result.get("success"):
-                        st.success(f"GitHubにアップロード完了（{len(not_exists_comics)}件）")
-                    else:
-                        st.error(f"アップロード失敗: {result.get('error')}")
+                        with st.spinner(f"セット品をアップロード中... ({len(set_comics)}件)"):
+                            result = upload_to_github(
+                                csv_content,
+                                GITHUB_MISSING_CSV_PATH,
+                                f"Update missing_comics.csv ({len(set_comics)}件) - {today}"
+                            )
+                        if result.get("success"):
+                            upload_results.append(f"セット品: {len(set_comics)}件 ✅")
+                        else:
+                            upload_results.append(f"セット品: 失敗 ❌ {result.get('error')}")
+
+                    # 単品をアップロード（missing_tanpin.csv）
+                    if tanpin_comics:
+                        # 単品CSV形式: コミックNo_巻数
+                        tanpin_content = '\n'.join(tanpin_comics)
+
+                        with st.spinner(f"単品をアップロード中... ({len(tanpin_comics)}件)"):
+                            result = upload_to_github(
+                                tanpin_content,
+                                GITHUB_MISSING_TANPIN_PATH,
+                                f"Update missing_tanpin.csv ({len(tanpin_comics)}件) - {today}"
+                            )
+                        if result.get("success"):
+                            upload_results.append(f"単品: {len(tanpin_comics)}件 ✅")
+                        else:
+                            upload_results.append(f"単品: 失敗 ❌ {result.get('error')}")
+
+                    # 結果表示
+                    if upload_results:
+                        st.success("アップロード完了: " + ", ".join(upload_results))
             else:
                 st.button("📤 GitHubにアップロード", disabled=True, help="存在なしのコミックNoがありません")
 
