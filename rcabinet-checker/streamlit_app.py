@@ -5,7 +5,7 @@ R-Cabinet 管理ツール
 """
 
 # バージョン（デプロイ確認用）
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.1"
 
 import streamlit as st
 import requests
@@ -1174,7 +1174,7 @@ with st.sidebar:
 
     mode = st.radio(
         "機能を選択",
-        ["📂 画像一覧取得", "🔍 画像存在チェック", "📥 不足画像取得"],
+        ["📂 画像一覧取得", "🔍 画像存在チェック", "🖼️ 新規画像取得"],
         label_visibility="collapsed"
     )
 
@@ -1636,8 +1636,8 @@ elif mode == "🔍 画像存在チェック":
                 st.rerun()
 
 
-elif mode == "📥 不足画像取得":
-    st.title("📥 不足画像取得")
+elif mode == "🖼️ 新規画像取得":
+    st.title("🖼️ 新規画像取得")
     st.markdown("IS検索結果からJANコードで画像を取得し、ZIPでダウンロードします。")
 
     st.divider()
@@ -1652,41 +1652,48 @@ elif mode == "📥 不足画像取得":
     if "image_download_result" not in st.session_state:
         st.session_state.image_download_result = None
 
-    st.markdown("### ステップ0: GitHubからファイル取得")
+    st.markdown("### ステップ1: 必要なファイルをそろえよう")
     st.markdown("GitHub Actionsで生成されたファイルを取得します。")
 
-    # 自動ダウンロードフラグ（無限ループ防止）
-    if "auto_download_tried" not in st.session_state:
-        st.session_state.auto_download_tried = False
+    # まだセッションに読み込まれていないファイルがあれば自動ダウンロード
+    need_is_list = not st.session_state.github_is_list
+    need_comic_list = not st.session_state.github_comic_list
+    need_hierarchy = not st.session_state.github_folder_hierarchy
 
-    # まだセッションに読み込まれていない場合は自動ダウンロード（1回だけ試行）
-    not_loaded_yet = not st.session_state.github_is_list or not st.session_state.github_comic_list or not st.session_state.github_folder_hierarchy
-
-    if not_loaded_yet and not st.session_state.auto_download_tried:
-        st.session_state.auto_download_tried = True
+    if need_is_list or need_comic_list or need_hierarchy:
         with st.spinner("GitHubからファイルを自動取得中..."):
+            downloaded_any = False
             auto_errors = []
-            if not st.session_state.github_is_list:
+
+            if need_is_list:
                 result = download_from_github(GITHUB_IS_LIST_PATH)
                 if result.get("success"):
                     st.session_state.github_is_list = result["content"]
+                    downloaded_any = True
                 else:
                     auto_errors.append(f"is_list.csv: {result.get('error', '不明')}")
-            if not st.session_state.github_comic_list:
+
+            if need_comic_list:
                 result = download_from_github(GITHUB_COMIC_LIST_PATH)
                 if result.get("success"):
                     st.session_state.github_comic_list = result["content"]
+                    downloaded_any = True
                 else:
                     auto_errors.append(f"comic_list.csv: {result.get('error', '不明')}")
-            if not st.session_state.github_folder_hierarchy:
+
+            if need_hierarchy:
                 result = download_from_github(GITHUB_FOLDER_HIERARCHY_PATH)
                 if result.get("success"):
                     st.session_state.github_folder_hierarchy = result["content"]
+                    downloaded_any = True
                 else:
                     auto_errors.append(f"フォルダ階層リスト: {result.get('error', '不明')}")
+
             if auto_errors:
                 st.warning(f"自動取得エラー: {', '.join(auto_errors)}")
-        st.rerun()
+
+        if downloaded_any:
+            st.rerun()
 
     # GitHubファイル情報を取得（表示用）
     is_info = get_github_file_info(GITHUB_IS_LIST_PATH)
