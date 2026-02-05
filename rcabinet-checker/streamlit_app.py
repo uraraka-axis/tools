@@ -5,7 +5,7 @@ R-Cabinet 管理ツール
 """
 
 # バージョン（デプロイ確認用）
-APP_VERSION = "2.1.2"
+APP_VERSION = "2.2.0"
 
 import streamlit as st
 import requests
@@ -1088,31 +1088,59 @@ def is_exact_match(file_name: str, comic_no: str) -> bool:
 
 
 def check_comic_images(comic_numbers: list, progress_bar=None, status_text=None):
-    """コミックNoリストの画像存在チェック"""
+    """コミックNoリストの画像存在チェック（DB参照版 - 高速）"""
     results = []
     total = len(comic_numbers)
 
+    # DBから全画像データを取得（1回だけ）
+    if status_text:
+        status_text.text("DBからデータを読み込み中...")
+    if progress_bar:
+        progress_bar.progress(0.1)
+
+    all_images, _ = load_images_from_db()
+
+    if not all_images:
+        # DBにデータがない場合はエラー
+        return None
+
+    if progress_bar:
+        progress_bar.progress(0.3)
+
+    # ファイル名（拡張子除く）→ 画像情報の辞書を作成
+    if status_text:
+        status_text.text("検索インデックスを作成中...")
+
+    image_dict = {}
+    for img in all_images:
+        file_name = img.get('FileName', '')
+        name_without_ext = file_name.rsplit('.', 1)[0] if '.' in file_name else file_name
+        if name_without_ext not in image_dict:
+            image_dict[name_without_ext] = []
+        image_dict[name_without_ext].append(img)
+
+    if progress_bar:
+        progress_bar.progress(0.5)
+
+    # 各コミックNoをチェック（メモリ内検索なので高速）
+    if status_text:
+        status_text.text("チェック中...")
+
     for i, comic_no in enumerate(comic_numbers):
-        if progress_bar:
-            progress_bar.progress((i + 1) / total)
-        if status_text:
-            status_text.text(f"チェック中: {comic_no} ({i + 1}/{total})")
+        comic_no_str = str(comic_no).strip()
 
-        found_files = search_image_by_name(str(comic_no))
-
-        # 完全一致でフィルタリング
-        matched_files = [f for f in found_files if is_exact_match(f['FileName'], str(comic_no))]
-
-        if matched_files:
-            for f in matched_files:
+        if comic_no_str in image_dict:
+            # 存在する場合
+            for img in image_dict[comic_no_str]:
                 results.append({
                     'コミックNo': comic_no,
                     '存在': '✅ あり',
-                    'ファイル名': f['FileName'],
-                    'フォルダ': f['FolderName'],
-                    'URL': f['FileUrl'],
+                    'ファイル名': img.get('FileName', ''),
+                    'フォルダ': img.get('FolderName', ''),
+                    'URL': img.get('FileUrl', ''),
                 })
         else:
+            # 存在しない場合
             results.append({
                 'コミックNo': comic_no,
                 '存在': '❌ なし',
@@ -1121,7 +1149,12 @@ def check_comic_images(comic_numbers: list, progress_bar=None, status_text=None)
                 'URL': '-',
             })
 
-        time.sleep(0.4)
+        # 進捗更新（100件ごと）
+        if progress_bar and (i + 1) % 100 == 0:
+            progress_bar.progress(0.5 + 0.5 * (i + 1) / total)
+
+    if progress_bar:
+        progress_bar.progress(1.0)
 
     return results
 
@@ -1479,8 +1512,11 @@ elif mode == "🔍 画像存在チェック":
             progress_bar.empty()
             status_text.empty()
 
-            # 結果をsession_stateに保存
-            st.session_state.check_results = results
+            if results is None:
+                st.error("DBにデータがありません。先に「📂 画像一覧取得」で「最新一覧を取得」を実行してください。")
+            else:
+                # 結果をsession_stateに保存
+                st.session_state.check_results = results
 
     # 結果表示（session_stateから）
     if st.session_state.check_results:
