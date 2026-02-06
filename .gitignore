@@ -50,6 +50,7 @@ output/
 .env
 *.pem
 *.key
+.streamlit/secrets.toml
 
 # Executables (keep source code only)
 *.exe

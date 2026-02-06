@@ -5,7 +5,7 @@ R-Cabinet 管理ツール
 """
 
 # バージョン（デプロイ確認用）
-APP_VERSION = "2.3.1"
+APP_VERSION = "3.0.0"
 
 import streamlit as st
 import requests
@@ -23,6 +23,7 @@ _openpyxl_utils = None
 _supabase_module = None
 _zipfile_module = None
 _random_module = None
+_pil_module = None
 
 # Gemini AI（遅延読み込み - 起動高速化のため）
 GEMINI_AVAILABLE = None
@@ -74,6 +75,15 @@ def get_random():
         import random
         _random_module = random
     return _random_module
+
+
+def get_pil():
+    """PILを遅延読み込み"""
+    global _pil_module
+    if _pil_module is None:
+        from PIL import Image
+        _pil_module = Image
+    return _pil_module
 
 # ページ設定
 st.set_page_config(
@@ -941,6 +951,203 @@ def download_image(image_url, session):
         return None
 
 
+def resize_to_square(image_data: bytes, size: int = 600):
+    """画像を正方形にリサイズ（アスペクト比維持、白背景パディング）"""
+    Image = get_pil()
+    img = Image.open(BytesIO(image_data)).convert("RGB")
+
+    # アスペクト比を維持してリサイズ
+    img.thumbnail((size, size), Image.LANCZOS)
+
+    # 白背景の正方形キャンバスに中央配置
+    canvas = Image.new("RGB", (size, size), (255, 255, 255))
+    x = (size - img.width) // 2
+    y = (size - img.height) // 2
+    canvas.paste(img, (x, y))
+
+    return canvas
+
+
+def add_shipping_badge(base_image, badge_path: str):
+    """送料無料バッジを合成（白背景を透明化してオーバーレイ）"""
+    Image = get_pil()
+    import numpy as np
+
+    base = base_image.convert("RGBA")
+    badge = Image.open(badge_path).convert("RGBA")
+
+    # バッジを元画像サイズにリサイズ
+    badge = badge.resize(base.size, Image.LANCZOS)
+
+    # 白背景を透明化（RGB各チャンネルが240以上を透明に）
+    badge_data = np.array(badge)
+    white_mask = (badge_data[:, :, 0] > 240) & (badge_data[:, :, 1] > 240) & (badge_data[:, :, 2] > 240)
+    badge_data[white_mask, 3] = 0
+    badge = Image.fromarray(badge_data, "RGBA")
+
+    # 合成
+    result = Image.alpha_composite(base, badge)
+    return result.convert("RGB")
+
+
+def image_to_bytes(image, quality: int = 95) -> bytes:
+    """PIL ImageをJPEGバイトデータに変換"""
+    buf = BytesIO()
+    image.save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
+
+
+def process_workflow_images(missing_comics: list, is_list_content: str, comic_list_content: str, badge_path: str, progress_bar=None, status_text=None, log_container=None):
+    """ワークフロー用：不足画像を取得してバッジ合成まで行う"""
+    import os
+
+    # CSVをDataFrameに変換
+    try:
+        is_df = pd.read_csv(BytesIO(is_list_content.encode('utf-8')), header=None)
+    except:
+        is_df = pd.read_csv(BytesIO(is_list_content.encode('cp932')), header=None)
+
+    try:
+        cl_df = pd.read_csv(BytesIO(comic_list_content.encode('utf-8')), header=None)
+    except:
+        cl_df = pd.read_csv(BytesIO(comic_list_content.encode('cp932')), header=None)
+
+    # CSVマージ＋JAN抽出
+    merged_df = merge_csv_data(is_df, cl_df)
+    result_data = extract_first_volumes(merged_df)
+
+    # missing_comicsでフィルタリング
+    missing_set = set(str(c).strip() for c in missing_comics)
+    target_data = [d for d in result_data if str(d.get('comic_no', '')).strip() in missing_set]
+
+    # 単品（_あり）はis_listから直接JAN検索
+    tanpin_comics = [c for c in missing_comics if '_' in str(c)]
+    for tc in tanpin_comics:
+        parts = str(tc).split('_')
+        base_no = parts[0]
+        vol_num = int(parts[1]) if len(parts) > 1 else 1
+
+        # is_listから該当巻のJANを検索
+        jan_code = ''
+        for i in range(1, len(is_df)):
+            cno = str(is_df.iloc[i, 6]).strip() if pd.notna(is_df.iloc[i, 6]) else ''
+            cno = cno.replace('.0', '')
+            vol = str(is_df.iloc[i, 9]).strip() if pd.notna(is_df.iloc[i, 9]) else ''
+            vol = vol.replace('.0', '')
+
+            if cno == base_no and vol == str(vol_num):
+                jan_code = normalize_jan_code(is_df.iloc[i, 5])
+                break
+
+        if jan_code:
+            target_data.append({
+                'comic_no': tc,
+                'first_jan': jan_code,
+                'is_tanpin': True
+            })
+
+    # セット品フラグ追加
+    for d in target_data:
+        if 'is_tanpin' not in d:
+            d['is_tanpin'] = '_' in str(d.get('comic_no', ''))
+
+    if not target_data:
+        return {'success': False, 'error': '処理対象がありません', 'images': [], 'stats': {}}
+
+    # 画像取得
+    session = requests.Session()
+    random = get_random()
+    downloaded_images = []
+    stats = {'total': len(target_data), 'success': 0, 'failed': 0, 'bookoff': 0, 'amazon': 0, 'rakuten': 0, 'gemini_ai': 0}
+    logs = []
+
+    for i, data in enumerate(target_data):
+        comic_no = str(data.get('comic_no', '')).strip()
+        jan_code = normalize_jan_code(data.get('first_jan', ''))
+
+        if progress_bar:
+            progress_bar.progress((i + 1) / len(target_data))
+        if status_text:
+            status_text.text(f"処理中: {comic_no} ({i + 1}/{len(target_data)})")
+
+        if not jan_code:
+            logs.append(f"⚠️ {comic_no}: JANコードなし - スキップ")
+            stats['failed'] += 1
+            continue
+
+        # 画像取得（優先順）
+        image_url = None
+        source = ''
+
+        # 1. ブックオフ
+        image_url = get_bookoff_image(jan_code, session)
+        source = 'bookoff'
+
+        # 2. Amazon
+        if not image_url:
+            time.sleep(random.uniform(0.5, 1.0))
+            image_url = get_amazon_image(jan_code, session)
+            source = 'amazon'
+
+        # 3. 楽天
+        if not image_url:
+            time.sleep(random.uniform(0.3, 0.6))
+            image_url = get_rakuten_image(jan_code, session)
+            source = 'rakuten'
+
+        # 4. Gemini AI
+        if not image_url and GEMINI_API_KEY:
+            time.sleep(random.uniform(0.5, 1.0))
+            ai_result = get_image_with_gemini_ai(jan_code, session, "amazon")
+            if ai_result:
+                image_url = ai_result
+                source = 'gemini_ai'
+
+        if not image_url:
+            logs.append(f"❌ {comic_no} (JAN: {jan_code}): 画像が見つかりません")
+            stats['failed'] += 1
+            continue
+
+        # ダウンロード
+        image_data = download_image(image_url, session)
+        if not image_data:
+            logs.append(f"❌ {comic_no}: ダウンロード失敗 ({source})")
+            stats['failed'] += 1
+            continue
+
+        # 600x600にリサイズ
+        resized = resize_to_square(image_data, 600)
+
+        # バッジ合成（セット品のみ）
+        is_tanpin = data.get('is_tanpin', False)
+        if not is_tanpin and os.path.exists(badge_path):
+            final_image = add_shipping_badge(resized, badge_path)
+            badge_status = "バッジ付き"
+        else:
+            final_image = resized
+            badge_status = "バッジなし" if is_tanpin else "バッジ画像なし"
+
+        final_bytes = image_to_bytes(final_image)
+
+        downloaded_images.append({
+            'comic_no': comic_no,
+            'jan_code': jan_code,
+            'image_data': final_bytes,
+            'source': source,
+            'is_tanpin': is_tanpin,
+            'badge': not is_tanpin
+        })
+
+        stats['success'] += 1
+        stats[source] += 1
+        logs.append(f"✅ {comic_no} (JAN: {jan_code}): {source} - {badge_status}")
+
+        # レート制限
+        time.sleep(random.uniform(0.3, 0.8))
+
+    return {'success': True, 'images': downloaded_images, 'stats': stats, 'logs': logs}
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def get_all_folders():
     """R-Cabinetの全フォルダ一覧を取得"""
@@ -1175,7 +1382,7 @@ with st.sidebar:
 
     mode = st.radio(
         "機能を選択",
-        ["📂 画像一覧取得", "🔍 画像存在チェック", "🖼️ 新規画像取得"],
+        ["🔄 画像ワークフロー", "📂 画像一覧取得", "🔍 画像存在チェック", "🖼️ 新規画像取得"],
         label_visibility="collapsed"
     )
 
@@ -1184,8 +1391,816 @@ with st.sidebar:
     st.markdown("<br>", unsafe_allow_html=True)
 
 
+# ============================================================
+# 画像ワークフロー（統合モード）のカスタムCSS
+# ============================================================
+WORKFLOW_CSS = """
+<style>
+/* ステップナビゲーション */
+.workflow-nav {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 1.5rem 2rem;
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    border-radius: 16px;
+    margin-bottom: 2rem;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+    position: relative;
+    overflow: hidden;
+}
+
+.workflow-nav::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 3px;
+    background: linear-gradient(90deg, #667eea, #764ba2, #f093fb);
+}
+
+.step-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.5rem;
+    flex: 1;
+    position: relative;
+    z-index: 1;
+}
+
+.step-circle {
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    font-size: 1.1rem;
+    transition: all 0.3s ease;
+}
+
+.step-circle.completed {
+    background: linear-gradient(135deg, #00d9a5 0%, #00b894 100%);
+    color: white;
+    box-shadow: 0 4px 15px rgba(0, 217, 165, 0.4);
+}
+
+.step-circle.active {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    box-shadow: 0 4px 20px rgba(102, 126, 234, 0.5);
+    transform: scale(1.1);
+    animation: pulse 2s infinite;
+}
+
+.step-circle.pending {
+    background: rgba(255, 255, 255, 0.1);
+    color: rgba(255, 255, 255, 0.5);
+    border: 2px dashed rgba(255, 255, 255, 0.2);
+}
+
+@keyframes pulse {
+    0%, 100% { box-shadow: 0 4px 20px rgba(102, 126, 234, 0.5); }
+    50% { box-shadow: 0 4px 30px rgba(102, 126, 234, 0.8); }
+}
+
+.step-label {
+    font-size: 0.75rem;
+    color: rgba(255, 255, 255, 0.7);
+    text-align: center;
+    max-width: 80px;
+}
+
+.step-label.active {
+    color: white;
+    font-weight: 600;
+}
+
+.step-connector {
+    flex: 0.5;
+    height: 3px;
+    background: rgba(255, 255, 255, 0.1);
+    position: relative;
+    margin-top: -24px;
+}
+
+.step-connector.completed {
+    background: linear-gradient(90deg, #00d9a5, #00b894);
+}
+
+/* ステップコンテンツカード */
+.step-card {
+    background: linear-gradient(145deg, #ffffff 0%, #f8f9fa 100%);
+    border-radius: 16px;
+    padding: 2rem;
+    margin-bottom: 1.5rem;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+    border: 1px solid rgba(0, 0, 0, 0.05);
+}
+
+.step-card-header {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+    padding-bottom: 1rem;
+    border-bottom: 2px solid #f0f0f0;
+}
+
+.step-card-icon {
+    width: 56px;
+    height: 56px;
+    border-radius: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.5rem;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
+}
+
+.step-card-title {
+    font-size: 1.4rem;
+    font-weight: 700;
+    color: #1a1a2e;
+    margin: 0;
+}
+
+.step-card-desc {
+    font-size: 0.9rem;
+    color: #666;
+    margin: 0;
+}
+
+/* アクションボタン */
+.action-btn-primary {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    border: none;
+    padding: 0.8rem 2rem;
+    border-radius: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
+}
+
+.action-btn-primary:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
+}
+
+/* 結果サマリーカード */
+.result-card {
+    background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+    border-radius: 12px;
+    padding: 1.2rem;
+    text-align: center;
+    border: 1px solid rgba(0, 0, 0, 0.05);
+}
+
+.result-card.success {
+    background: linear-gradient(135deg, #d4edda 0%, #c3e6cb 100%);
+    border-color: rgba(40, 167, 69, 0.2);
+}
+
+.result-card.warning {
+    background: linear-gradient(135deg, #fff3cd 0%, #ffeeba 100%);
+    border-color: rgba(255, 193, 7, 0.2);
+}
+
+.result-card.error {
+    background: linear-gradient(135deg, #f8d7da 0%, #f5c6cb 100%);
+    border-color: rgba(220, 53, 69, 0.2);
+}
+
+.result-value {
+    font-size: 2rem;
+    font-weight: 700;
+    color: #1a1a2e;
+}
+
+.result-label {
+    font-size: 0.8rem;
+    color: #666;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+/* プログレスバー */
+.progress-container {
+    background: rgba(0, 0, 0, 0.05);
+    border-radius: 10px;
+    height: 12px;
+    overflow: hidden;
+    margin: 1rem 0;
+}
+
+.progress-bar {
+    height: 100%;
+    border-radius: 10px;
+    background: linear-gradient(90deg, #667eea, #764ba2);
+    transition: width 0.3s ease;
+}
+
+/* ログエリア */
+.log-area {
+    background: #1a1a2e;
+    border-radius: 12px;
+    padding: 1rem;
+    max-height: 300px;
+    overflow-y: auto;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 0.85rem;
+}
+
+.log-entry {
+    padding: 0.3rem 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.log-entry.success { color: #00d9a5; }
+.log-entry.error { color: #ff6b6b; }
+.log-entry.info { color: #74b9ff; }
+
+</style>
+"""
+
+
+def render_workflow_step_nav(current_step: int, completed_steps: list):
+    """ワークフローのステップナビゲーションを描画"""
+    steps = [
+        ("①", "不足特定"),
+        ("②", "JAN取得"),
+        ("③", "画像取得"),
+        ("④", "準備"),
+        ("⑤", "アップロード")
+    ]
+
+    html = '<div class="workflow-nav">'
+
+    for i, (num, label) in enumerate(steps):
+        step_num = i + 1
+        if step_num in completed_steps:
+            status = "completed"
+            icon = "✓"
+        elif step_num == current_step:
+            status = "active"
+            icon = num
+        else:
+            status = "pending"
+            icon = num
+
+        label_class = "active" if step_num == current_step else ""
+
+        html += f'''
+        <div class="step-item">
+            <div class="step-circle {status}">{icon}</div>
+            <div class="step-label {label_class}">{label}</div>
+        </div>
+        '''
+
+        # コネクター（最後以外）
+        if i < len(steps) - 1:
+            conn_status = "completed" if step_num in completed_steps else ""
+            html += f'<div class="step-connector {conn_status}"></div>'
+
+    html += '</div>'
+    return html
+
+
 # メインコンテンツ
-if mode == "📂 画像一覧取得":
+if mode == "🔄 画像ワークフロー":
+    st.markdown(WORKFLOW_CSS, unsafe_allow_html=True)
+
+    st.title("🔄 画像ワークフロー")
+    st.markdown("不足画像の特定から楽天・ヤフーへのアップロードまで、一気通貫で処理します。")
+
+    # セッション状態の初期化
+    if "workflow_step" not in st.session_state:
+        st.session_state.workflow_step = 1
+    if "workflow_completed" not in st.session_state:
+        st.session_state.workflow_completed = []
+    if "workflow_data" not in st.session_state:
+        st.session_state.workflow_data = {}
+
+    current_step = st.session_state.workflow_step
+    completed_steps = st.session_state.workflow_completed
+
+    # ステップナビゲーション
+    st.markdown(render_workflow_step_nav(current_step, completed_steps), unsafe_allow_html=True)
+
+    # ステップ選択（手動でジャンプ可能）
+    with st.expander("ステップを直接選択", expanded=False):
+        step_options = {
+            "① 不足特定": 1,
+            "② JAN取得": 2,
+            "③ 画像取得": 3,
+            "④ アップロード準備": 4,
+            "⑤ API連携": 5
+        }
+        selected = st.selectbox(
+            "移動先",
+            list(step_options.keys()),
+            index=current_step - 1,
+            label_visibility="collapsed"
+        )
+        if st.button("移動"):
+            st.session_state.workflow_step = step_options[selected]
+            st.rerun()
+
+    st.divider()
+
+    # ============================================================
+    # Step 1: 不足特定
+    # ============================================================
+    if current_step == 1:
+        st.markdown("""
+        <div class="step-card">
+            <div class="step-card-header">
+                <div class="step-card-icon">🔍</div>
+                <div>
+                    <p class="step-card-title">Step ① 不足特定</p>
+                    <p class="step-card-desc">R-Cabinetに存在しない画像を特定します</p>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # 入力方法の選択
+        input_method = st.radio(
+            "入力方法",
+            ["テキスト入力", "CSVアップロード"],
+            horizontal=True
+        )
+
+        comic_numbers = []
+
+        if input_method == "テキスト入力":
+            text_input = st.text_area(
+                "コミックNo（改行区切り）",
+                height=150,
+                placeholder="123456\n234567\n19763_003"
+            )
+            if text_input:
+                comic_numbers = [line.strip() for line in text_input.split('\n') if line.strip()]
+                st.info(f"入力: {len(comic_numbers)}件")
+        else:
+            uploaded = st.file_uploader("CSVファイル", type=['csv'])
+            if uploaded:
+                try:
+                    df = pd.read_csv(uploaded, encoding='utf-8')
+                except:
+                    df = pd.read_csv(uploaded, encoding='cp932')
+
+                st.dataframe(df.head(5), use_container_width=True)
+                col = st.selectbox("コミックNo列", df.columns.tolist())
+                if col:
+                    comic_numbers = df[col].dropna().astype(str).tolist()
+                    st.info(f"読み込み: {len(comic_numbers)}件")
+
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            if st.button("🔍 チェック実行", type="primary", disabled=not comic_numbers):
+                progress = st.progress(0)
+                status = st.empty()
+
+                results = check_comic_images(comic_numbers, progress, status)
+
+                progress.empty()
+                status.empty()
+
+                if results:
+                    st.session_state.workflow_data['check_results'] = results
+                    exists_count = len([r for r in results if r['存在'] == '✅ あり'])
+                    missing_count = len([r for r in results if r['存在'] == '❌ なし'])
+
+                    cols = st.columns(3)
+                    cols[0].metric("総数", len(results))
+                    cols[1].metric("存在あり", exists_count)
+                    cols[2].metric("存在なし", missing_count)
+
+                    if missing_count > 0:
+                        st.success(f"不足画像 {missing_count}件 を特定しました")
+                else:
+                    st.error("DBにデータがありません")
+
+        # 結果がある場合
+        if 'check_results' in st.session_state.workflow_data:
+            results = st.session_state.workflow_data['check_results']
+            missing = [r for r in results if r['存在'] == '❌ なし']
+
+            if missing:
+                st.divider()
+                st.markdown("### 不足画像一覧")
+
+                df_missing = pd.DataFrame(missing)
+                st.dataframe(df_missing, use_container_width=True, height=200)
+
+                col1, col2 = st.columns([1, 1])
+                with col1:
+                    if st.button("📤 GitHubにアップロード", type="secondary"):
+                        # セット品と単品を分離
+                        set_comics = [r['コミックNo'] for r in missing if '_' not in str(r['コミックNo'])]
+                        tanpin_comics = [r['コミックNo'] for r in missing if '_' in str(r['コミックNo'])]
+
+                        today = datetime.now().strftime('%Y-%m-%d %H:%M')
+                        upload_results = []
+
+                        if set_comics:
+                            content = '\n'.join([str(c) for c in set_comics])
+                            result = upload_to_github(content, GITHUB_MISSING_CSV_PATH, f"Update missing_comics.csv ({len(set_comics)}件) - {today}")
+                            if result.get("success"):
+                                upload_results.append(f"セット品: {len(set_comics)}件 ✅")
+
+                        if tanpin_comics:
+                            content = '\n'.join([str(c) for c in tanpin_comics])
+                            result = upload_to_github(content, GITHUB_MISSING_TANPIN_PATH, f"Update missing_tanpin.csv ({len(tanpin_comics)}件) - {today}")
+                            if result.get("success"):
+                                upload_results.append(f"単品: {len(tanpin_comics)}件 ✅")
+
+                        if upload_results:
+                            st.success(", ".join(upload_results))
+                            st.session_state.workflow_data['missing_uploaded'] = True
+
+                with col2:
+                    if st.button("次へ進む →", type="primary"):
+                        if 1 not in st.session_state.workflow_completed:
+                            st.session_state.workflow_completed.append(1)
+                        st.session_state.workflow_step = 2
+                        st.rerun()
+
+    # ============================================================
+    # Step 2: JAN取得
+    # ============================================================
+    elif current_step == 2:
+        st.markdown("""
+        <div class="step-card">
+            <div class="step-card-header">
+                <div class="step-card-icon">📊</div>
+                <div>
+                    <p class="step-card-title">Step ② JAN取得</p>
+                    <p class="step-card-desc">コミックリスターでJAN情報を取得します（GitHub Actions）</p>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # 最新の実行履歴を表示
+        runs = get_workflow_runs("weekly-comic-lister.yml", limit=3)
+        if runs:
+            st.markdown("### 実行履歴")
+            for run in runs:
+                status_icon = "🟢" if run["conclusion"] == "success" else "🔴" if run["conclusion"] == "failure" else "🟡"
+                st.write(f"{status_icon} {run['created_at']} - {run['conclusion'] or '実行中'}")
+
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            if st.button("📊 CSV生成を開始", type="primary"):
+                with st.spinner("GitHub Actionsを起動中..."):
+                    result = trigger_github_actions("weekly-comic-lister.yml")
+                if result.get("success"):
+                    st.success("CSV生成を開始しました（2〜3分後に完了）")
+                else:
+                    st.error(f"エラー: {result.get('error')}")
+
+        with col2:
+            if st.button("📥 CSVをダウンロード", type="secondary"):
+                with st.spinner("GitHubからファイルを取得中..."):
+                    is_result = download_from_github(GITHUB_IS_LIST_PATH)
+                    cl_result = download_from_github(GITHUB_COMIC_LIST_PATH)
+
+                if is_result.get("success") and cl_result.get("success"):
+                    st.session_state.workflow_data['is_list'] = is_result["content"]
+                    st.session_state.workflow_data['comic_list'] = cl_result["content"]
+                    st.success("ファイル取得完了")
+                else:
+                    st.error("ファイル取得に失敗しました")
+
+        # ファイル状態表示
+        st.divider()
+        st.markdown("### ファイル状態")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.session_state.workflow_data.get('is_list'):
+                st.success("✅ is_list.csv 取得済み")
+            else:
+                st.warning("⬜ is_list.csv 未取得")
+        with col2:
+            if st.session_state.workflow_data.get('comic_list'):
+                st.success("✅ comic_list.csv 取得済み")
+            else:
+                st.warning("⬜ comic_list.csv 未取得")
+
+        # 次へ進むボタン
+        st.divider()
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            if st.button("← 戻る"):
+                st.session_state.workflow_step = 1
+                st.rerun()
+        with col2:
+            files_ready = st.session_state.workflow_data.get('is_list') and st.session_state.workflow_data.get('comic_list')
+            if st.button("次へ進む →", type="primary", disabled=not files_ready):
+                if 2 not in st.session_state.workflow_completed:
+                    st.session_state.workflow_completed.append(2)
+                st.session_state.workflow_step = 3
+                st.rerun()
+
+    # ============================================================
+    # Step 3: 画像取得
+    # ============================================================
+    elif current_step == 3:
+        import os
+        st.markdown("""
+        <div class="step-card">
+            <div class="step-card-header">
+                <div class="step-card-icon">🖼️</div>
+                <div>
+                    <p class="step-card-title">Step ③ 画像取得＋加工</p>
+                    <p class="step-card-desc">JANコードで画像を取得し、送料無料バッジを合成します（600×600px）</p>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # --- 入力データの確認 ---
+        st.markdown("### 入力データ")
+
+        # 不足リスト（Step ①の結果 or GitHubから取得済み）
+        missing_comics = []
+        if 'check_results' in st.session_state.workflow_data:
+            missing = [r for r in st.session_state.workflow_data['check_results'] if r['存在'] == '❌ なし']
+            missing_comics = [str(r['コミックNo']) for r in missing]
+        elif st.session_state.workflow_data.get('missing_from_github'):
+            missing_comics = st.session_state.workflow_data['missing_from_github']
+
+        col_s1, col_s2, col_s3 = st.columns(3)
+        with col_s1:
+            if missing_comics:
+                st.success(f"✅ 不足リスト: {len(missing_comics)}件")
+            else:
+                st.warning("⬜ 不足リスト: なし")
+                st.caption("Step ①を実行するか、GitHubから取得してください")
+        with col_s2:
+            if st.session_state.workflow_data.get('is_list'):
+                st.success("✅ is_list.csv 取得済み")
+            else:
+                st.warning("⬜ is_list.csv 未取得")
+        with col_s3:
+            if st.session_state.workflow_data.get('comic_list'):
+                st.success("✅ comic_list.csv 取得済み")
+            else:
+                st.warning("⬜ comic_list.csv 未取得")
+
+        # GitHubから取得ボタン群
+        need_fetch = not missing_comics or not st.session_state.workflow_data.get('is_list') or not st.session_state.workflow_data.get('comic_list')
+        if need_fetch:
+            st.divider()
+            fetch_cols = st.columns(3)
+            with fetch_cols[0]:
+                if not missing_comics and st.button("📥 不足リスト取得"):
+                    with st.spinner("GitHubから取得中..."):
+                        result = download_from_github(GITHUB_MISSING_CSV_PATH)
+                    content = result.get("content", b"")
+                    if isinstance(content, bytes):
+                        content = content.decode('utf-8', errors='replace')
+                    if result.get("success") and content.strip():
+                        lines = content.strip().split('\n')
+                        parsed_comics = []
+                        for l in lines:
+                            l = l.strip()
+                            if not l:
+                                continue
+                            if ',' in l:
+                                # CSV行からcomic_noを抽出（非空フィールドで2桁以上の数値）
+                                fields = [f.strip() for f in l.split(',') if f.strip()]
+                                for f in fields:
+                                    if f.replace('_', '').replace('.0', '').isdigit() and len(f.replace('.0', '')) > 1:
+                                        parsed_comics.append(f.replace('.0', ''))
+                                        break
+                            else:
+                                parsed_comics.append(l)
+                        missing_comics = parsed_comics
+                        # session_stateにも反映
+                        st.session_state.workflow_data['missing_from_github'] = missing_comics
+                        st.success(f"{len(missing_comics)}件取得")
+                        st.rerun()
+                    else:
+                        st.error("取得失敗またはデータなし")
+            with fetch_cols[1]:
+                if not st.session_state.workflow_data.get('is_list') and st.button("📥 is_list.csv取得"):
+                    with st.spinner("取得中..."):
+                        result = download_from_github(GITHUB_IS_LIST_PATH)
+                    if result.get("success"):
+                        content = result["content"]
+                        if isinstance(content, bytes):
+                            content = content.decode('utf-8', errors='replace')
+                        st.session_state.workflow_data['is_list'] = content
+                        st.success("取得完了")
+                        st.rerun()
+                    else:
+                        st.error("取得失敗")
+            with fetch_cols[2]:
+                if not st.session_state.workflow_data.get('comic_list') and st.button("📥 comic_list.csv取得"):
+                    with st.spinner("取得中..."):
+                        result = download_from_github(GITHUB_COMIC_LIST_PATH)
+                    if result.get("success"):
+                        content = result["content"]
+                        if isinstance(content, bytes):
+                            content = content.decode('utf-8', errors='replace')
+                        st.session_state.workflow_data['comic_list'] = content
+                        st.success("取得完了")
+                        st.rerun()
+                    else:
+                        st.error("取得失敗")
+
+        # GitHubから取得した不足リストも反映
+        if not missing_comics and st.session_state.workflow_data.get('missing_from_github'):
+            missing_comics = st.session_state.workflow_data['missing_from_github']
+
+        # --- 実行セクション ---
+        st.divider()
+        all_ready = missing_comics and st.session_state.workflow_data.get('is_list') and st.session_state.workflow_data.get('comic_list')
+
+        # セット品と単品の内訳
+        if missing_comics:
+            set_count = len([c for c in missing_comics if '_' not in str(c)])
+            tanpin_count = len([c for c in missing_comics if '_' in str(c)])
+            st.markdown(f"**対象: {len(missing_comics)}件**（セット品: {set_count}件 / 単品: {tanpin_count}件）")
+
+        if st.button("🖼️ 画像取得開始", type="primary", disabled=not all_ready):
+            badge_path = os.path.join(os.path.dirname(__file__), "images", "badge_free_shipping.jpg")
+
+            progress = st.progress(0)
+            status = st.empty()
+
+            result = process_workflow_images(
+                missing_comics=missing_comics,
+                is_list_content=st.session_state.workflow_data['is_list'],
+                comic_list_content=st.session_state.workflow_data['comic_list'],
+                badge_path=badge_path,
+                progress_bar=progress,
+                status_text=status
+            )
+
+            progress.empty()
+            status.empty()
+
+            if result.get('success'):
+                st.session_state.workflow_data['downloaded_images'] = result['images']
+                st.session_state.workflow_data['image_stats'] = result['stats']
+                st.session_state.workflow_data['image_logs'] = result['logs']
+                st.rerun()
+            else:
+                st.error(result.get('error', '画像取得に失敗しました'))
+
+        # --- 結果表示セクション ---
+        if 'downloaded_images' in st.session_state.workflow_data:
+            images = st.session_state.workflow_data['downloaded_images']
+            stats = st.session_state.workflow_data.get('image_stats', {})
+            logs = st.session_state.workflow_data.get('image_logs', [])
+
+            st.divider()
+            st.markdown("### 取得結果")
+
+            # 統計
+            stat_cols = st.columns(6)
+            stat_cols[0].metric("対象", stats.get('total', 0))
+            stat_cols[1].metric("成功", stats.get('success', 0))
+            stat_cols[2].metric("失敗", stats.get('failed', 0))
+            stat_cols[3].metric("ブックオフ", stats.get('bookoff', 0))
+            stat_cols[4].metric("Amazon", stats.get('amazon', 0))
+            stat_cols[5].metric("楽天/AI", f"{stats.get('rakuten', 0)}/{stats.get('gemini_ai', 0)}")
+
+            # 画像プレビュー（3列グリッド、最大6件）
+            if images:
+                preview_count = min(len(images), 6)
+                st.markdown(f"### プレビュー（{preview_count}/{len(images)}件）")
+                for row_start in range(0, preview_count, 3):
+                    cols = st.columns(3)
+                    for j, col in enumerate(cols):
+                        idx = row_start + j
+                        if idx < len(images):
+                            img = images[idx]
+                            with col:
+                                st.image(img['image_data'], width=200)
+                                badge_label = "🏷️ バッジ付き" if img['badge'] else "📷 バッジなし"
+                                st.caption(f"{img['comic_no']} ({img['source']}) {badge_label}")
+
+                # ZIPダウンロード
+                st.divider()
+                zipfile = get_zipfile()
+                zip_buffer = BytesIO()
+                with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    for img in images:
+                        filename = f"{img['comic_no']}.jpg"
+                        zf.writestr(filename, img['image_data'])
+
+                st.download_button(
+                    label=f"📦 ZIPダウンロード（{len(images)}件）",
+                    data=zip_buffer.getvalue(),
+                    file_name="workflow_images.zip",
+                    mime="application/zip"
+                )
+
+            # ログ
+            with st.expander("ログ", expanded=False):
+                for log in logs:
+                    st.text(log)
+
+        # ナビゲーション
+        st.divider()
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            if st.button("← 戻る"):
+                st.session_state.workflow_step = 2
+                st.rerun()
+        with col2:
+            has_images = 'downloaded_images' in st.session_state.workflow_data and st.session_state.workflow_data['downloaded_images']
+            if st.button("次へ進む →", type="primary", disabled=not has_images):
+                if 3 not in st.session_state.workflow_completed:
+                    st.session_state.workflow_completed.append(3)
+                st.session_state.workflow_step = 4
+                st.rerun()
+
+    # ============================================================
+    # Step 4: アップロード準備
+    # ============================================================
+    elif current_step == 4:
+        st.markdown("""
+        <div class="step-card">
+            <div class="step-card-header">
+                <div class="step-card-icon">📦</div>
+                <div>
+                    <p class="step-card-title">Step ④ アップロード準備</p>
+                    <p class="step-card-desc">楽天・ヤフー向けにファイルを整形します</p>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.info("🚧 この機能は現在実装中です。")
+
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            if st.button("← 戻る"):
+                st.session_state.workflow_step = 3
+                st.rerun()
+        with col2:
+            if st.button("次へ進む →", type="primary"):
+                if 4 not in st.session_state.workflow_completed:
+                    st.session_state.workflow_completed.append(4)
+                st.session_state.workflow_step = 5
+                st.rerun()
+
+    # ============================================================
+    # Step 5: API連携
+    # ============================================================
+    elif current_step == 5:
+        st.markdown("""
+        <div class="step-card">
+            <div class="step-card-header">
+                <div class="step-card-icon">🚀</div>
+                <div>
+                    <p class="step-card-title">Step ⑤ API連携</p>
+                    <p class="step-card-desc">楽天・ヤフーにAPIで画像をアップロードします</p>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.info("🚧 この機能は現在実装中です。Yahoo認証の設定が必要です。")
+
+        tab1, tab2 = st.tabs(["🛒 ヤフー", "🏪 楽天"])
+
+        with tab1:
+            st.markdown("### ヤフーショッピング")
+            st.warning("Yahoo認証トークンが未設定です。設定後にアップロードが可能になります。")
+
+        with tab2:
+            st.markdown("### 楽天")
+            st.success("楽天API認証は設定済みです。")
+
+        st.divider()
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            if st.button("← 戻る"):
+                st.session_state.workflow_step = 4
+                st.rerun()
+        with col2:
+            if st.button("ワークフローをリセット", type="secondary"):
+                st.session_state.workflow_step = 1
+                st.session_state.workflow_completed = []
+                st.session_state.workflow_data = {}
+                st.rerun()
+
+
+elif mode == "📂 画像一覧取得":
     st.title("📂 画像一覧取得")
     st.markdown("R-Cabinetのフォルダを選択して、画像を一覧表示します。")
 
