@@ -443,14 +443,15 @@ def create_template_excel() -> bytes:
         'C': ('JANコード ★', 'required', 18),
         'D': ('ASIN ★', 'required', 16),
         'E': ('品名', 'optional', 30),
-        'F': ('ジャンル1', 'optional', 12),
-        'G': ('ジャンル2', 'optional', 12),
-        'H': ('ジャンル3', 'optional', 12),
-        'I': ('ジャンル4', 'optional', 12),
+        'F': ('ディレクトリ1', 'optional', 14),
+        'G': ('ディレクトリ2', 'optional', 14),
+        'H': ('ディレクトリ3', 'optional', 14),
+        'I': ('ディレクトリ4', 'optional', 14),
         'J': ('DL枚数', 'auto', 10),
         'K': ('棚番', 'required', 8),
         'L': ('', 'unused', 4),
         'M': ('拠点コード', 'required', 12),
+        'N': ('ファイル名（自動）', 'auto', 28),
     }
 
     # ヘッダー色の定義
@@ -479,15 +480,17 @@ def create_template_excel() -> bytes:
 
     # 2行目: 補足説明
     notes = {
+        'A': '▼ 3行目から入力',
         'B': '※必須', 'C': '※C or D 必須', 'D': '※C or D 必須',
         'E': '任意', 'F': '任意', 'G': '任意', 'H': '任意', 'I': '任意',
-        'J': '※自動記入', 'K': '※必須', 'M': '※必須',
+        'J': '※自動記入', 'K': '※必須', 'M': '※必須', 'N': '※自動表示',
     }
     note_font = Font(name=FONT, size=8, color="808080")
+    note_highlight = Font(name=FONT, size=8, bold=True, color="FF0000")
     for col, note in notes.items():
         cell = ws[f'{col}2']
         cell.value = note
-        cell.font = note_font
+        cell.font = note_highlight if col == 'A' else note_font
         cell.alignment = Alignment(horizontal='center')
         cell.border = thin_border
 
@@ -495,18 +498,30 @@ def create_template_excel() -> bytes:
     sample = {
         'B': 1, 'C': '4902370549560', 'D': 'B0CHY3GYW4',
         'E': 'サンプル商品名', 'F': 'ゲーム', 'G': 'Switch',
-        'K': 'CD', 'M': 'TK',
+        'K': '999', 'M': 'TK',
     }
     data_font = Font(name=FONT, size=10)
+    sample_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
     for col_letter in columns:
         cell = ws[f'{col_letter}3']
         cell.value = sample.get(col_letter)
         cell.font = data_font
+        cell.fill = sample_fill
+        cell.border = thin_border
+
+    # N列: ファイル名プレビュー関数（3行目〜102行目）
+    formula_font = Font(name=FONT, size=10, color="808080")
+    for row in range(3, 103):
+        cell = ws[f'N{row}']
+        cell.value = f'=IF(B{row}="","",LOWER(K{row}&"-"&M{row}&"-"&TEXT(B{row},"000000")&".jpg"))'
+        cell.font = formula_font
+        if row == 3:
+            cell.fill = sample_fill
         cell.border = thin_border
 
     # 行の高さ
     ws.row_dimensions[1].height = 28
-    ws.row_dimensions[2].height = 18
+    ws.row_dimensions[2].height = 20
 
     buf = BytesIO()
     wb.save(buf)
