@@ -10,7 +10,6 @@ from datetime import datetime
 import random
 import re
 import os
-import shutil
 import tempfile
 import zipfile
 from pathlib import Path
@@ -44,7 +43,8 @@ if not check_password():
 SURUGAYA_SEARCH_URL = "https://www.suruga-ya.jp/kaitori/search_buy"
 BOOKOFF_BASE_URL = "https://shopping.bookoff.co.jp/search/keyword/"
 NO_IMAGE_PATTERNS = ['item_ll.gif', 'no_image', 'noimage', 'no-image', 'now_printing']
-MIN_FILE_SIZE = 2 * 1024  # 2KB
+MIN_FILE_SIZE = 2 * 1024  # 2KB（これ以下はスキップ）
+MAX_FOLDER_SIZE = 23 * 1024 * 1024  # 23MB（フォルダ上限）
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
                   '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -101,16 +101,6 @@ def sanitize(name) -> str | None:
     if not name or str(name).strip() == "":
         return None
     return re.sub(r'[<>:"/\\|?*]', '_', str(name)).strip('. ')
-
-
-def build_genre_path(h_dir: Path, genres: list) -> Path:
-    valid_genres = [g for g in genres if g is not None]
-    if not valid_genres:
-        return h_dir / "未分類"
-    target_path = h_dir
-    for genre in valid_genres:
-        target_path = target_path / genre
-    return target_path
 
 
 # ===== 画像取得関数 =====
@@ -187,9 +177,43 @@ def get_bookoff_images(driver, jan: str) -> list:
     return []
 
 
+# ===== フォルダ振り分け管理 =====
+class FolderManager:
+    """23MB以下でフォルダを自動振り分け"""
+
+    def __init__(self, output_base: Path):
+        self.output_base = output_base
+        self.folder_index = 1
+        self.folder_size = 0
+        self.folder_names = []  # 各フォルダのパスを記録
+
+    def get_folder(self, files_size: int, base_fname: str) -> Path:
+        """現在のフォルダを返す。容量超過なら次のフォルダへ。
+        画像セットは同一フォルダに格納する。
+        フォルダ名は最初に格納される商品のbase_fnameを使用。"""
+        if self.folder_size > 0 and self.folder_size + files_size > MAX_FOLDER_SIZE:
+            self.folder_index += 1
+            self.folder_size = 0
+
+        if self.folder_index > len(self.folder_names):
+            # 新しいフォルダ: 最初の商品名で命名
+            folder_name = base_fname.lower()
+            folder_path = self.output_base / folder_name
+            folder_path.mkdir(parents=True, exist_ok=True)
+            self.folder_names.append(folder_path)
+        else:
+            folder_path = self.folder_names[self.folder_index - 1]
+
+        return folder_path
+
+    def add_size(self, size: int):
+        self.folder_size += size
+
+
 # ===== ダウンロード＆フィルタ =====
-def download_and_filter_images(session, images, base_fname, h_dir, f_dir, genres, main_only):
-    valid_images = []
+def download_and_filter_images(session, images, base_fname, folder_mgr, main_only):
+    """画像をダウンロードし、2KB以下をスキップ、フォルダに振り分け保存"""
+    valid_images = []  # (fname, content) のリスト
     for idx, url in enumerate(images):
         if idx > 0 and main_only:
             break
@@ -198,41 +222,71 @@ def download_and_filter_images(session, images, base_fname, h_dir, f_dir, genres
             if resp.status_code == 200:
                 content = resp.content
                 if len(content) > MIN_FILE_SIZE:
-                    valid_images.append(content)
+                    suffix = "" if len(valid_images) == 0 else f"_{len(valid_images)}"
+                    fname = f"{base_fname}{suffix}.jpg".lower()
+                    valid_images.append((fname, content))
         except Exception:
             pass
 
     if not valid_images:
         return 0
 
-    target_path = build_genre_path(h_dir, genres)
-    target_path.mkdir(parents=True, exist_ok=True)
+    # セット全体のサイズを計算
+    total_size = sum(len(c) for _, c in valid_images)
+
+    # フォルダを取得（23MB制限で自動振り分け）
+    folder = folder_mgr.get_folder(total_size, base_fname)
 
     saved_count = 0
-    for idx, content in enumerate(valid_images):
-        suffix = "" if idx == 0 else f"_{idx}"
-        fname = f"{base_fname}{suffix}.jpg"
-        save_h = target_path / fname
-        save_f = f_dir / fname
+    saved_size = 0
+    for fname, content in valid_images:
         try:
-            with open(save_h, 'wb') as f:
+            with open(folder / fname, 'wb') as f:
                 f.write(content)
-            shutil.copy2(save_h, save_f)
             saved_count += 1
+            saved_size += len(content)
         except Exception:
             pass
+
+    folder_mgr.add_size(saved_size)
     return saved_count
 
 
 # ===== ZIP 作成 =====
-def create_zip(base_dir: Path) -> BytesIO:
+def create_zip_files(output_base: Path, folder_mgr) -> Path:
+    """各フォルダの中身をフラットなZIPに圧縮。
+    ZIP名 = フォルダ内の最初のファイル名（拡張子なし）.zip"""
+    zip_dir = output_base / "圧縮ファイル"
+    zip_dir.mkdir(parents=True, exist_ok=True)
+
+    for folder_path in folder_mgr.folder_names:
+        if not folder_path.exists():
+            continue
+
+        files = sorted([f for f in folder_path.iterdir() if f.is_file()], key=lambda x: x.name)
+        if not files:
+            continue
+
+        zip_filename = f"{files[0].stem}.zip"
+        zip_path = zip_dir / zip_filename
+
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for file_path in files:
+                zf.write(file_path, file_path.name)  # フラット格納
+
+    return zip_dir
+
+
+def create_final_zip(zip_dir: Path, excel_path: Path) -> BytesIO:
+    """個別ZIPファイル + 更新済みExcelを1つのZIPにまとめる"""
     zip_buffer = BytesIO()
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for root, _dirs, files in os.walk(base_dir):
-            for file in files:
-                file_path = Path(root) / file
-                arcname = file_path.relative_to(base_dir)
-                zf.write(file_path, arcname)
+        # 個別ZIPを格納
+        for f in sorted(zip_dir.iterdir()):
+            if f.is_file() and f.suffix == '.zip':
+                zf.write(f, f.name)
+        # 更新済みExcelを格納
+        zf.write(excel_path, excel_path.name)
     zip_buffer.seek(0)
     return zip_buffer
 
@@ -250,10 +304,9 @@ def process(uploaded_file, main_only):
         wb = load_workbook(excel_path)
         ws = wb.active
 
-        h_dir = tmp_dir / "1_階層管理"
-        f_dir = tmp_dir / "2_一括管理"
-        h_dir.mkdir(exist_ok=True)
-        f_dir.mkdir(exist_ok=True)
+        # 画像保存用ディレクトリ
+        img_dir = tmp_dir / "images"
+        img_dir.mkdir(exist_ok=True)
 
         rows = [r for r in range(2, ws.max_row + 1) if ws[f'C{r}'].value or ws[f'D{r}'].value]
         total = len(rows)
@@ -261,6 +314,9 @@ def process(uploaded_file, main_only):
         if total == 0:
             st.warning("処理対象の行が見つかりませんでした（C列またはD列にデータが必要です）")
             return None
+
+        # フォルダ振り分け管理
+        folder_mgr = FolderManager(img_dir)
 
         # ブラウザ起動
         with st.status("処理中...", expanded=True) as status:
@@ -287,7 +343,6 @@ def process(uploaded_file, main_only):
                     seq = str(ws[f'B{r}'].value or "0").zfill(6)
                     jan = str(ws[f'C{r}'].value or "").strip()
                     asin = str(ws[f'D{r}'].value or "").strip()
-                    genres = [sanitize(ws[f'{col}{r}'].value) for col in ['F', 'G', 'H', 'I']]
                     shelf = sanitize(ws[f'K{r}'].value) or "00"
                     base_code = sanitize(ws[f'M{r}'].value) or "XX"
                     base_fname = f"{shelf}-{base_code}-{seq}"
@@ -319,7 +374,7 @@ def process(uploaded_file, main_only):
 
                     if images:
                         downloaded_count = download_and_filter_images(
-                            session, images, base_fname, h_dir, f_dir, genres, main_only
+                            session, images, base_fname, folder_mgr, main_only
                         )
                         if downloaded_count > 0:
                             ws[f'J{r}'].value = downloaded_count
@@ -340,13 +395,19 @@ def process(uploaded_file, main_only):
             finally:
                 driver.quit()
 
+            # ZIP圧縮
+            status.update(label="ZIP圧縮中...")
+            zip_dir = create_zip_files(img_dir, folder_mgr)
+
             status.update(label="✅ 処理完了", state="complete", expanded=False)
 
         # Excel 保存
         wb.save(excel_path)
 
-        # ZIP 作成（メモリ上に保持）
-        zip_buffer = create_zip(tmp_dir)
+        # 最終ZIP作成（個別ZIP + Excel）
+        zip_buffer = create_final_zip(zip_dir, excel_path)
+
+        stats['folder_count'] = len(folder_mgr.folder_names)
 
         return {
             'zip': zip_buffer,
@@ -364,8 +425,9 @@ with st.container(border=True):
     uploaded_file = st.file_uploader("Excelファイル", type=["xlsx"])
     mode = st.radio("取得モード", ["全画像を取得", "メインのみ"], horizontal=True)
     st.info(
-        "**保存仕様**: 1\_階層管理（ジャンル別）／ 2\_一括管理（全集約）  \n"
-        "**命名規則**: 棚番-拠点コード-連番.jpg  \n"
+        "**命名規則**: 棚番-拠点コード-連番.jpg（小文字）  \n"
+        "**フォルダ振り分け**: 各フォルダ23MB以下で自動分割  \n"
+        "**ZIP形式**: フォルダごとにフラットなZIP（ZIP名＝先頭ファイル名）  \n"
         "**フィルタ**: 2KB以下の画像は自動スキップ"
     )
 
@@ -375,10 +437,11 @@ if uploaded_file:
 
         if result:
             st.divider()
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
             col1.metric("合計", result['stats']['total'])
             col2.metric("成功", result['stats']['success'])
             col3.metric("未取得", result['stats']['not_found'])
+            col4.metric("ZIPファイル数", result['stats']['folder_count'])
 
             st.download_button(
                 label="📥 結果をダウンロード（ZIP）",
