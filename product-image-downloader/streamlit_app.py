@@ -421,53 +421,92 @@ def process(uploaded_file, main_only):
 @st.cache_data
 def create_template_excel() -> bytes:
     from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
     wb = Workbook()
     ws = wb.active
     ws.title = "商品リスト"
 
-    headers = {
-        'A': 'A（未使用）',
-        'B': '連番',
-        'C': 'JANコード',
-        'D': 'ASIN',
-        'E': '品名',
-        'F': 'ジャンル1',
-        'G': 'ジャンル2',
-        'H': 'ジャンル3',
-        'I': 'ジャンル4',
-        'J': 'DL枚数（自動）',
-        'K': '棚番',
-        'L': 'L（未使用）',
-        'M': '拠点コード',
+    FONT = "メイリオ"
+    thin_border = Border(
+        left=Side(style='thin', color='D0D0D0'),
+        right=Side(style='thin', color='D0D0D0'),
+        top=Side(style='thin', color='D0D0D0'),
+        bottom=Side(style='thin', color='D0D0D0'),
+    )
+
+    # 列定義: (ヘッダー名, 必須レベル, 幅)
+    # 必須レベル: "required"=必須, "optional"=任意, "auto"=自動, "unused"=未使用
+    columns = {
+        'A': ('', 'unused', 4),
+        'B': ('連番', 'required', 8),
+        'C': ('JANコード ★', 'required', 18),
+        'D': ('ASIN ★', 'required', 16),
+        'E': ('品名', 'optional', 30),
+        'F': ('ジャンル1', 'optional', 12),
+        'G': ('ジャンル2', 'optional', 12),
+        'H': ('ジャンル3', 'optional', 12),
+        'I': ('ジャンル4', 'optional', 12),
+        'J': ('DL枚数', 'auto', 10),
+        'K': ('棚番', 'required', 8),
+        'L': ('', 'unused', 4),
+        'M': ('拠点コード', 'required', 12),
     }
 
-    header_font = Font(bold=True, size=10)
-    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-    header_font_white = Font(bold=True, size=10, color="FFFFFF")
+    # ヘッダー色の定義
+    fills = {
+        'required': PatternFill(start_color="2E75B6", end_color="2E75B6", fill_type="solid"),
+        'optional': PatternFill(start_color="9BC2E6", end_color="9BC2E6", fill_type="solid"),
+        'auto':     PatternFill(start_color="A9D18E", end_color="A9D18E", fill_type="solid"),
+        'unused':   PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid"),
+    }
+    font_colors = {
+        'required': Font(name=FONT, bold=True, size=10, color="FFFFFF"),
+        'optional': Font(name=FONT, bold=True, size=10, color="1F4E79"),
+        'auto':     Font(name=FONT, bold=True, size=10, color="375623"),
+        'unused':   Font(name=FONT, bold=True, size=10, color="808080"),
+    }
 
-    for col, title in headers.items():
+    # 1行目: ヘッダー
+    for col, (title, level, width) in columns.items():
         cell = ws[f'{col}1']
         cell.value = title
-        cell.font = header_font_white
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal='center')
+        cell.font = font_colors[level]
+        cell.fill = fills[level]
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+        cell.border = thin_border
+        ws.column_dimensions[col].width = width
 
-    # サンプルデータ
+    # 2行目: 補足説明
+    notes = {
+        'B': '※必須', 'C': '※C or D 必須', 'D': '※C or D 必須',
+        'E': '任意', 'F': '任意', 'G': '任意', 'H': '任意', 'I': '任意',
+        'J': '※自動記入', 'K': '※必須', 'M': '※必須',
+    }
+    note_font = Font(name=FONT, size=8, color="808080")
+    for col, note in notes.items():
+        cell = ws[f'{col}2']
+        cell.value = note
+        cell.font = note_font
+        cell.alignment = Alignment(horizontal='center')
+        cell.border = thin_border
+
+    # 3行目: サンプルデータ
     sample = {
         'B': 1, 'C': '4902370549560', 'D': 'B0CHY3GYW4',
         'E': 'サンプル商品名', 'F': 'ゲーム', 'G': 'Switch',
         'K': 'CD', 'M': 'TK',
     }
-    for col, val in sample.items():
-        ws[f'{col}2'].value = val
+    data_font = Font(name=FONT, size=10)
+    for col_letter in columns:
+        cell = ws[f'{col_letter}3']
+        cell.value = sample.get(col_letter)
+        cell.font = data_font
+        cell.border = thin_border
 
-    # 列幅調整
-    widths = {'A': 10, 'B': 8, 'C': 16, 'D': 14, 'E': 30,
-              'F': 12, 'G': 12, 'H': 12, 'I': 12, 'J': 14, 'K': 8, 'L': 10, 'M': 10}
-    for col, w in widths.items():
-        ws.column_dimensions[col].width = w
+    # 行の高さ
+    ws.row_dimensions[1].height = 28
+    ws.row_dimensions[2].height = 18
 
     buf = BytesIO()
     wb.save(buf)
