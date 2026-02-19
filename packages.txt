@@ -1,4 +1,0 @@
-chromium
-chromium-driver
-chromium-browser
-chromium-chromedriver
