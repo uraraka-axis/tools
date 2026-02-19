@@ -417,12 +417,81 @@ def process(uploaded_file, main_only):
         }
 
 
+# ===== ひな形Excel生成 =====
+@st.cache_data
+def create_template_excel() -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "商品リスト"
+
+    headers = {
+        'A': 'A（未使用）',
+        'B': '連番',
+        'C': 'JANコード',
+        'D': 'ASIN',
+        'E': '品名',
+        'F': 'ジャンル1',
+        'G': 'ジャンル2',
+        'H': 'ジャンル3',
+        'I': 'ジャンル4',
+        'J': 'DL枚数（自動）',
+        'K': '棚番',
+        'L': 'L（未使用）',
+        'M': '拠点コード',
+    }
+
+    header_font = Font(bold=True, size=10)
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_font_white = Font(bold=True, size=10, color="FFFFFF")
+
+    for col, title in headers.items():
+        cell = ws[f'{col}1']
+        cell.value = title
+        cell.font = header_font_white
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal='center')
+
+    # サンプルデータ
+    sample = {
+        'B': 1, 'C': '4902370549560', 'D': 'B0CHY3GYW4',
+        'E': 'サンプル商品名', 'F': 'ゲーム', 'G': 'Switch',
+        'K': 'CD', 'M': 'TK',
+    }
+    for col, val in sample.items():
+        ws[f'{col}2'].value = val
+
+    # 列幅調整
+    widths = {'A': 10, 'B': 8, 'C': 16, 'D': 14, 'E': 30,
+              'F': 12, 'G': 12, 'H': 12, 'I': 12, 'J': 14, 'K': 8, 'L': 10, 'M': 10}
+    for col, w in widths.items():
+        ws.column_dimensions[col].width = w
+
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 # ===== UI =====
 st.title("📦 商品画像一括ダウンロード")
 st.caption("Excelリストに基づき、ネット上の商品画像を自動収集・整理します")
 
 with st.container(border=True):
-    uploaded_file = st.file_uploader("Excelファイル", type=["xlsx"])
+    col_upload, col_template = st.columns([3, 1])
+    with col_upload:
+        uploaded_file = st.file_uploader("Excelファイル", type=["xlsx"])
+    with col_template:
+        st.write("")  # スペーサー
+        st.write("")
+        st.download_button(
+            label="📄 ひな形ダウンロード",
+            data=create_template_excel(),
+            file_name="商品画像DL_テンプレート.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
     mode = st.radio("取得モード", ["全画像を取得", "メインのみ"], horizontal=True)
     st.info(
         "**命名規則**: 棚番-拠点コード-連番.jpg（小文字）  \n"
