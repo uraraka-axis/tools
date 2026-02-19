@@ -42,7 +42,7 @@ if not check_password():
 # ===== 定数 =====
 SURUGAYA_SEARCH_URL = "https://www.suruga-ya.jp/kaitori/search_buy"
 BOOKOFF_BASE_URL = "https://shopping.bookoff.co.jp/search/keyword/"
-NO_IMAGE_PATTERNS = ['item_ll.gif', 'no_image', 'noimage', 'no-image', 'now_printing']
+NO_IMAGE_PATTERNS = ['item_ll', 'no_image', 'noimage', 'no-image', 'now_printing', 'placeholder']
 MIN_FILE_SIZE = 2 * 1024  # 2KB（これ以下はスキップ）
 MAX_FOLDER_SIZE = 23 * 1024 * 1024  # 23MB（フォルダ上限）
 HEADERS = {
@@ -135,43 +135,94 @@ def get_amazon_images(driver, asin: str, main_only: bool) -> list:
 
 
 def get_surugaya_images(driver, jan: str) -> list:
+    """駿河屋から画像取得（セレクタ更新版）"""
     url = f"{SURUGAYA_SEARCH_URL}?search_word={jan}&key_flag=1"
     try:
         driver.get(url)
-        time.sleep(2)
+        time.sleep(random.uniform(3, 4))
         soup = BeautifulSoup(driver.page_source, 'html.parser')
-        title_a = soup.select_one('div.title a')
-        if not title_a:
+
+        # 検索結果から商品リンクを取得（複数セレクタで試行）
+        product_link = (
+            soup.select_one('a[href*="kaitori_detail"]')
+            or soup.select_one('div.title a')
+            or soup.select_one('h3 a')
+        )
+        if not product_link:
             return []
 
-        detail_url = title_a['href']
+        detail_url = product_link['href']
         if detail_url.startswith('/'):
             detail_url = "https://www.suruga-ya.jp" + detail_url
 
         driver.get(detail_url)
-        time.sleep(2)
+        time.sleep(random.uniform(3, 4))
         soup = BeautifulSoup(driver.page_source, 'html.parser')
-        img_up = soup.find('div', {'id': 'imgUp'})
-        if img_up and img_up.find('a'):
-            img_url = img_up.find('a')['href']
+
+        # 画像リンクを取得（複数セレクタで試行）
+        img_link = (
+            soup.select_one('a[href*="database/pics"]')
+            or soup.select_one('div#imgUp a')
+            or soup.select_one('.photo_img a')
+        )
+        if img_link and img_link.get('href'):
+            img_url = img_link['href']
             if img_url.startswith('/'):
                 img_url = "https://www.suruga-ya.jp" + img_url
             return [img_url]
+
+        # フォールバック: 画像タグから直接取得
+        img_tag = soup.select_one('.photo_img img, img[src*="suruga-ya"]')
+        if img_tag and img_tag.get('src'):
+            img_url = img_tag['src']
+            if not is_no_image(img_url):
+                return [img_url]
     except Exception:
         pass
     return []
 
 
 def get_bookoff_images(driver, jan: str) -> list:
+    """ブックオフから画像取得（セレクタ更新版）"""
     url = f"{BOOKOFF_BASE_URL}{jan}"
     try:
         driver.get(url)
-        time.sleep(2)
+        time.sleep(random.uniform(3, 4))
         soup = BeautifulSoup(driver.page_source, 'html.parser')
-        img_tag = soup.select_one('img.js-gridImg, .productItem__image img')
-        if img_tag and img_tag.get('src'):
-            img_url = img_tag['src'].replace('/SS/', '/LL/').replace('SS.jpg', 'LL.jpg')
-            return [img_url]
+
+        # 商品詳細ページへのリンクを取得
+        detail_link = soup.select_one('a[href*="/used/"]')
+        if detail_link:
+            detail_url = detail_link['href']
+            if detail_url.startswith('/'):
+                detail_url = "https://shopping.bookoff.co.jp" + detail_url
+
+            # 詳細ページに遷移してJS実行後の画像を取得
+            driver.get(detail_url)
+            time.sleep(random.uniform(3, 4))
+            soup = BeautifulSoup(driver.page_source, 'html.parser')
+
+            # 詳細ページの画像（複数セレクタで試行）
+            for selector in [
+                'img[src*="content.bookoff.co.jp"][src*="/LL/"]',
+                'img[src*="content.bookoff.co.jp"][src*="LL.jpg"]',
+                '.productDetail__image img',
+                '.productImage img',
+                'img[src*="content.bookoff.co.jp"]',
+            ]:
+                img_tag = soup.select_one(selector)
+                if img_tag:
+                    img_url = img_tag.get('data-src') or img_tag.get('src')
+                    if img_url and not is_no_image(img_url):
+                        img_url = img_url.replace('/SS/', '/LL/').replace('SS.jpg', 'LL.jpg')
+                        return [img_url]
+
+        # フォールバック: 検索結果ページの画像
+        for img_tag in soup.select('a[href*="/used/"] img, img[src*="content.bookoff.co.jp"]'):
+            img_url = img_tag.get('data-src') or img_tag.get('src')
+            if img_url and not is_no_image(img_url):
+                img_url = img_url.replace('/SS/', '/LL/').replace('SS.jpg', 'LL.jpg')
+                return [img_url]
     except Exception:
         pass
     return []
