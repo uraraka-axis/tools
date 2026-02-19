@@ -53,33 +53,33 @@ HEADERS = {
 
 # ===== Selenium セットアップ =====
 def setup_driver():
+    import shutil
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
 
     options = Options()
-    options.add_argument('--headless')
+    options.add_argument('--headless=new')
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
     options.add_argument('--disable-gpu')
     options.add_argument('--log-level=3')
     options.add_argument('--disable-blink-features=AutomationControlled')
+    options.add_argument('--window-size=1920,1080')
 
-    # Streamlit Cloud (Debian) のシステム Chromium を検索
-    for chrome_path in ['/usr/bin/chromium-browser', '/usr/bin/chromium', '/usr/bin/google-chrome']:
-        if os.path.exists(chrome_path):
-            options.binary_location = chrome_path
-            break
+    # ブラウザ検出（shutil.whichで動的に検索）
+    browser = shutil.which('chromium') or shutil.which('chromium-browser') or shutil.which('google-chrome')
+    if browser:
+        options.binary_location = browser
 
+    # ドライバー検出
+    chromedriver = shutil.which('chromedriver')
     driver = None
-    for driver_path in ['/usr/bin/chromedriver', '/usr/lib/chromium-browser/chromedriver',
-                        '/usr/lib/chromium/chromedriver']:
-        if os.path.exists(driver_path):
-            service = Service(driver_path)
-            driver = webdriver.Chrome(service=service, options=options)
-            break
 
-    if driver is None:
+    if chromedriver:
+        service = Service(chromedriver)
+        driver = webdriver.Chrome(service=service, options=options)
+    else:
         # ローカル環境: webdriver-manager でフォールバック
         from webdriver_manager.chrome import ChromeDriverManager
         service = Service(ChromeDriverManager().install())
