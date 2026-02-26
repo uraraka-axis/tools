@@ -1135,7 +1135,11 @@ def process_workflow_images(missing_comics: list, is_list_content: str, comic_li
             'image_data': final_bytes,
             'source': source,
             'is_tanpin': is_tanpin,
-            'badge': not is_tanpin
+            'badge': not is_tanpin,
+            'genre': data.get('genre', ''),
+            'publisher': data.get('publisher', ''),
+            'series': data.get('series', ''),
+            'title': data.get('title', '')
         })
 
         stats['success'] += 1
@@ -1146,6 +1150,196 @@ def process_workflow_images(missing_comics: list, is_list_content: str, comic_li
         time.sleep(random.uniform(0.3, 0.8))
 
     return {'success': True, 'images': downloaded_images, 'stats': stats, 'logs': logs}
+
+
+def prepare_yahoo_zips(images: list, excel_set_df, excel_tanpin_df, additional_dir: str) -> dict:
+    """ヤフー用にリネーム＋追加画像＋ZIP分割生成"""
+    import os
+    zipfile = get_zipfile()
+    Image = get_pil()
+
+    MAX_ZIP_SIZE = 25 * 1024 * 1024  # 25MB
+
+    # コミックNo → 商品コード のマッピング構築
+    comic_to_product = {}
+
+    # セット品シート: A列=商品コード, D列=コミックNo
+    if excel_set_df is not None:
+        for i in range(len(excel_set_df)):
+            try:
+                product_code = str(excel_set_df.iloc[i, 0]).strip()
+                comic_no = str(excel_set_df.iloc[i, 3]).strip().replace('.0', '')
+                if product_code and comic_no and product_code != 'nan' and comic_no != 'nan':
+                    comic_to_product[comic_no] = {'code': product_code, 'type': 'set'}
+            except:
+                continue
+
+    # 単品シート: A列=商品コード, E列=コミックNo
+    if excel_tanpin_df is not None:
+        for i in range(len(excel_tanpin_df)):
+            try:
+                product_code = str(excel_tanpin_df.iloc[i, 0]).strip()
+                comic_no = str(excel_tanpin_df.iloc[i, 4]).strip().replace('.0', '')
+                if product_code and comic_no and product_code != 'nan' and comic_no != 'nan':
+                    comic_to_product[comic_no] = {'code': product_code, 'type': 'tanpin'}
+            except:
+                continue
+
+    # 追加画像読み込み
+    additional_1_path = os.path.join(additional_dir, "additional_1.jpg")
+    additional_2_path = os.path.join(additional_dir, "additional_2.jpg")
+    additional_1_data = None
+    additional_2_data = None
+    if os.path.exists(additional_1_path):
+        with open(additional_1_path, 'rb') as f:
+            additional_1_data = f.read()
+    if os.path.exists(additional_2_path):
+        with open(additional_2_path, 'rb') as f:
+            additional_2_data = f.read()
+
+    # ファイルリスト構築
+    file_entries = []  # [(filename, bytes)]
+    mapped_count = 0
+    unmapped = []
+    logs = []
+
+    for img in images:
+        comic_no = str(img['comic_no']).strip()
+        mapping = comic_to_product.get(comic_no)
+
+        if not mapping:
+            unmapped.append(comic_no)
+            logs.append(f"⚠️ {comic_no}: 商品コードが見つかりません")
+            continue
+
+        product_code = mapping['code']
+        is_set = mapping['type'] == 'set'
+
+        # メイン画像
+        file_entries.append((f"{product_code}.jpg", img['image_data']))
+
+        # セット品のみ追加画像
+        if is_set:
+            if additional_1_data:
+                file_entries.append((f"{product_code}_1.jpg", additional_1_data))
+            if additional_2_data:
+                file_entries.append((f"{product_code}_2.jpg", additional_2_data))
+
+        mapped_count += 1
+        logs.append(f"✅ {comic_no} → {product_code} {'(セット品+追加画像)' if is_set else '(単品)'}")
+
+    # ZIP分割生成
+    zip_buffers = []
+    current_files = []
+    current_size = 0
+
+    for filename, data in file_entries:
+        file_size = len(data)
+        if current_size + file_size > MAX_ZIP_SIZE and current_files:
+            # 現在のZIPを保存
+            buf = BytesIO()
+            with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for fn, fd in current_files:
+                    zf.writestr(fn, fd)
+            zip_buffers.append(buf.getvalue())
+            current_files = []
+            current_size = 0
+
+        current_files.append((filename, data))
+        current_size += file_size
+
+    # 残りを保存
+    if current_files:
+        buf = BytesIO()
+        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for fn, fd in current_files:
+                zf.writestr(fn, fd)
+        zip_buffers.append(buf.getvalue())
+
+    return {
+        'zips': zip_buffers,
+        'mapped': mapped_count,
+        'unmapped': unmapped,
+        'total_files': len(file_entries),
+        'logs': logs
+    }
+
+
+def prepare_rakuten_queue(images: list, hierarchy_df, folders: list) -> dict:
+    """楽天用にフォルダマッピング＋アップロードキュー生成"""
+    # フォルダパス → FolderId の辞書
+    folder_map = {}
+    for f in folders:
+        folder_map[f['FolderName']] = f['FolderId']
+
+    # 階層情報パース
+    hierarchy_list = []
+    if hierarchy_df is not None:
+        for i in range(1, len(hierarchy_df)):
+            try:
+                row = hierarchy_df.iloc[i]
+                hierarchy_list.append({
+                    'genre': str(row[0]).strip() if pd.notna(row[0]) else '',
+                    'publisher': str(row[1]).strip() if pd.notna(row[1]) else '',
+                    'series': str(row[2]).strip() if len(row) > 2 and pd.notna(row[2]) else '',
+                    'main_folder': str(row[3]).strip() if len(row) > 3 and pd.notna(row[3]) else '',
+                    'sub_folder': str(row[4]).strip() if len(row) > 4 and pd.notna(row[4]) else ''
+                })
+            except:
+                continue
+
+    # 画像ごとにフォルダを決定
+    queue = []
+    unmapped = []
+    logs = []
+
+    # is_listのresult_dataが必要だが、workflow_dataから取得する形
+    # ここではcomic_noベースでシンプルにマッチング
+    for img in images:
+        comic_no = str(img['comic_no']).strip()
+        file_name = f"{comic_no}.jpg"
+
+        # sub_folderをフォルダ名として使用
+        matched_folder = None
+        matched_folder_id = None
+
+        # result_dataにgenre/publisher情報がある場合はマッチング
+        genre = img.get('genre', '')
+        publisher = img.get('publisher', '')
+        series = img.get('series', '')
+
+        for h in hierarchy_list:
+            if genre == h['genre'] and publisher == h['publisher']:
+                if series and h['series'] and series == h['series']:
+                    matched_folder = h['sub_folder'] or h['main_folder']
+                    break
+                elif not h['series']:
+                    matched_folder = h['sub_folder'] or h['main_folder']
+                    break
+
+        if matched_folder and matched_folder in folder_map:
+            matched_folder_id = folder_map[matched_folder]
+            queue.append({
+                'file_bytes': img['image_data'],
+                'folder_id': matched_folder_id,
+                'folder_name': matched_folder,
+                'file_name': file_name,
+                'comic_no': comic_no
+            })
+            logs.append(f"✅ {comic_no} → {matched_folder} (ID: {matched_folder_id})")
+        else:
+            unmapped.append(comic_no)
+            if matched_folder:
+                logs.append(f"⚠️ {comic_no}: フォルダ '{matched_folder}' がR-Cabinetに見つかりません")
+            else:
+                logs.append(f"⚠️ {comic_no}: フォルダ階層にマッチしません")
+
+    return {
+        'queue': queue,
+        'mapped': len(queue),
+        'unmapped': unmapped,
+        'logs': logs
+    }
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -1875,8 +2069,14 @@ if mode == "🔄 画像ワークフロー":
                     cl_result = download_from_github(GITHUB_COMIC_LIST_PATH)
 
                 if is_result.get("success") and cl_result.get("success"):
-                    st.session_state.workflow_data['is_list'] = is_result["content"]
-                    st.session_state.workflow_data['comic_list'] = cl_result["content"]
+                    is_content = is_result["content"]
+                    if isinstance(is_content, bytes):
+                        is_content = is_content.decode('utf-8', errors='replace')
+                    cl_content = cl_result["content"]
+                    if isinstance(cl_content, bytes):
+                        cl_content = cl_content.decode('utf-8', errors='replace')
+                    st.session_state.workflow_data['is_list'] = is_content
+                    st.session_state.workflow_data['comic_list'] = cl_content
                     st.success("ファイル取得完了")
                 else:
                     st.error("ファイル取得に失敗しました")
@@ -2132,6 +2332,7 @@ if mode == "🔄 画像ワークフロー":
     # Step 4: アップロード準備
     # ============================================================
     elif current_step == 4:
+        import os as _os
         st.markdown("""
         <div class="step-card">
             <div class="step-card-header">
@@ -2144,19 +2345,238 @@ if mode == "🔄 画像ワークフロー":
         </div>
         """, unsafe_allow_html=True)
 
-        st.info("🚧 この機能は現在実装中です。")
-
-        col1, col2 = st.columns([1, 1])
-        with col1:
-            if st.button("← 戻る"):
+        # Step ③の画像確認
+        images = st.session_state.workflow_data.get('downloaded_images', [])
+        if not images:
+            st.warning("Step ③で画像を取得してください。")
+            if st.button("← Step ③に戻る"):
                 st.session_state.workflow_step = 3
                 st.rerun()
-        with col2:
-            if st.button("次へ進む →", type="primary"):
-                if 4 not in st.session_state.workflow_completed:
-                    st.session_state.workflow_completed.append(4)
-                st.session_state.workflow_step = 5
-                st.rerun()
+        else:
+            st.info(f"対象画像: {len(images)}件（セット品: {len([i for i in images if not i.get('is_tanpin')])}件 / 単品: {len([i for i in images if i.get('is_tanpin')])}件）")
+
+            tab_yahoo, tab_rakuten = st.tabs(["🛒 ヤフー準備", "🏪 楽天準備"])
+
+            # ============================================
+            # ヤフータブ
+            # ============================================
+            with tab_yahoo:
+                st.markdown("### データフォーマットExcel")
+                st.caption("セット品シート: A列=商品コード, D列=コミックNo / 単品シート: A列=商品コード, E列=コミックNo")
+
+                yahoo_excel = st.file_uploader("Excelファイル", type=['xlsx', 'xls'], key="yahoo_excel")
+
+                excel_set_df = None
+                excel_tanpin_df = None
+
+                if yahoo_excel:
+                    try:
+                        xls = pd.ExcelFile(yahoo_excel)
+                        sheet_names = xls.sheet_names
+                        st.caption(f"シート: {', '.join(sheet_names)}")
+
+                        # シート選択
+                        col_sh1, col_sh2 = st.columns(2)
+                        with col_sh1:
+                            set_sheet = st.selectbox("セット品シート", sheet_names, key="yahoo_set_sheet")
+                        with col_sh2:
+                            tanpin_idx = min(1, len(sheet_names) - 1)
+                            tanpin_sheet = st.selectbox("単品シート", sheet_names, index=tanpin_idx, key="yahoo_tanpin_sheet")
+
+                        excel_set_df = pd.read_excel(yahoo_excel, sheet_name=set_sheet, header=None)
+                        yahoo_excel.seek(0)
+                        excel_tanpin_df = pd.read_excel(yahoo_excel, sheet_name=tanpin_sheet, header=None)
+
+                        # プレビュー
+                        with st.expander("マッピングプレビュー", expanded=True):
+                            # セット品マッピング
+                            set_mappings = []
+                            for i in range(len(excel_set_df)):
+                                try:
+                                    code = str(excel_set_df.iloc[i, 0]).strip()
+                                    cno = str(excel_set_df.iloc[i, 3]).strip().replace('.0', '')
+                                    if code != 'nan' and cno != 'nan' and code and cno:
+                                        matched = any(str(img['comic_no']) == cno for img in images)
+                                        set_mappings.append({'商品コード': code, 'コミックNo': cno, '対象画像': '✅' if matched else '❌'})
+                                except:
+                                    continue
+
+                            tanpin_mappings = []
+                            for i in range(len(excel_tanpin_df)):
+                                try:
+                                    code = str(excel_tanpin_df.iloc[i, 0]).strip()
+                                    cno = str(excel_tanpin_df.iloc[i, 4]).strip().replace('.0', '')
+                                    if code != 'nan' and cno != 'nan' and code and cno:
+                                        matched = any(str(img['comic_no']) == cno for img in images)
+                                        tanpin_mappings.append({'商品コード': code, 'コミックNo': cno, '対象画像': '✅' if matched else '❌'})
+                                except:
+                                    continue
+
+                            if set_mappings:
+                                st.markdown(f"**セット品: {len(set_mappings)}件**")
+                                st.dataframe(pd.DataFrame(set_mappings), use_container_width=True, height=150)
+                            if tanpin_mappings:
+                                st.markdown(f"**単品: {len(tanpin_mappings)}件**")
+                                st.dataframe(pd.DataFrame(tanpin_mappings), use_container_width=True, height=150)
+
+                    except Exception as e:
+                        st.error(f"Excel読み込みエラー: {e}")
+
+                # ZIP生成ボタン
+                st.divider()
+                can_generate = yahoo_excel is not None and excel_set_df is not None
+                if st.button("📦 ZIP生成", type="primary", disabled=not can_generate, key="yahoo_zip_btn"):
+                    additional_dir = _os.path.join(_os.path.dirname(__file__), "images")
+                    result = prepare_yahoo_zips(images, excel_set_df, excel_tanpin_df, additional_dir)
+
+                    st.session_state.workflow_data['yahoo_zips'] = result
+                    st.rerun()
+
+                # ZIP結果表示
+                if 'yahoo_zips' in st.session_state.workflow_data:
+                    result = st.session_state.workflow_data['yahoo_zips']
+                    zips = result['zips']
+
+                    col_m1, col_m2, col_m3 = st.columns(3)
+                    col_m1.metric("マッピング成功", result['mapped'])
+                    col_m2.metric("未マッチ", len(result['unmapped']))
+                    col_m3.metric("ZIP数", len(zips))
+
+                    for i, zip_data in enumerate(zips):
+                        size_mb = len(zip_data) / (1024 * 1024)
+                        st.download_button(
+                            label=f"📥 yahoo_upload_{i+1:03d}.zip ({size_mb:.1f}MB)",
+                            data=zip_data,
+                            file_name=f"yahoo_upload_{i+1:03d}.zip",
+                            mime="application/zip",
+                            key=f"yahoo_zip_dl_{i}"
+                        )
+
+                    with st.expander("ログ", expanded=False):
+                        for log in result['logs']:
+                            st.text(log)
+
+            # ============================================
+            # 楽天タブ
+            # ============================================
+            with tab_rakuten:
+                st.markdown("### フォルダマッピング")
+
+                # フォルダ階層リスト取得
+                col_r1, col_r2 = st.columns(2)
+                with col_r1:
+                    if st.button("📥 フォルダ階層リスト取得", key="rakuten_hierarchy_btn"):
+                        with st.spinner("GitHubから取得中..."):
+                            result = download_from_github(GITHUB_FOLDER_HIERARCHY_PATH)
+                        if result.get("success"):
+                            content = result["content"]
+                            if isinstance(content, bytes):
+                                st.session_state.workflow_data['hierarchy_xlsx'] = content
+                            st.success("フォルダ階層リスト取得完了")
+                            st.rerun()
+                        else:
+                            st.error(f"取得失敗: {result.get('error')}")
+
+                with col_r2:
+                    if st.button("📂 楽天フォルダ一覧取得", key="rakuten_folders_btn"):
+                        with st.spinner("R-Cabinet APIから取得中..."):
+                            folders, error = get_all_folders()
+                        if error:
+                            st.error(error)
+                        elif folders:
+                            st.session_state.workflow_data['rakuten_folders'] = folders
+                            st.success(f"{len(folders)}フォルダ取得")
+                            st.rerun()
+
+                # 状態表示
+                col_s1, col_s2 = st.columns(2)
+                with col_s1:
+                    if st.session_state.workflow_data.get('hierarchy_xlsx'):
+                        st.success("✅ フォルダ階層リスト取得済み")
+                    else:
+                        st.warning("⬜ フォルダ階層リスト未取得")
+                with col_s2:
+                    folders = st.session_state.workflow_data.get('rakuten_folders')
+                    if folders:
+                        st.success(f"✅ 楽天フォルダ: {len(folders)}件")
+                    else:
+                        st.warning("⬜ 楽天フォルダ未取得")
+
+                # データ確認エリア
+                with st.expander("データ確認（中身を見る）", expanded=False):
+                    # 1. 画像に紐づく情報（merge_csv_data結果）
+                    st.markdown("**画像の出版社・シリーズ情報**")
+                    img_info_df = pd.DataFrame([
+                        {'コミックNo': img['comic_no'], 'ジャンル': img.get('genre', ''), '出版社': img.get('publisher', ''), 'シリーズ': img.get('series', ''), 'タイトル': img.get('title', '')}
+                        for img in images
+                    ])
+                    st.dataframe(img_info_df, use_container_width=True, height=150)
+
+                    # 2. フォルダ階層リスト
+                    if st.session_state.workflow_data.get('hierarchy_xlsx'):
+                        st.markdown("**フォルダ階層リスト**")
+                        try:
+                            h_df = pd.read_excel(BytesIO(st.session_state.workflow_data['hierarchy_xlsx']), sheet_name="フォルダ階層リスト", header=None)
+                            col_names = ['ジャンル', '出版社', 'シリーズ', 'メインフォルダ', 'サブフォルダ'] + [f'列{i}' for i in range(6, 20)]
+                            h_df.columns = col_names[:len(h_df.columns)]
+                            st.dataframe(h_df, use_container_width=True, height=200)
+                        except Exception as e:
+                            st.error(f"表示エラー: {e}")
+
+                    # 3. 楽天フォルダ一覧
+                    if st.session_state.workflow_data.get('rakuten_folders'):
+                        st.markdown("**楽天フォルダ一覧（R-Cabinet API）**")
+                        f_df = pd.DataFrame(st.session_state.workflow_data['rakuten_folders'])
+                        st.dataframe(f_df, use_container_width=True, height=200)
+
+                # キュー生成
+                st.divider()
+                hierarchy_ready = st.session_state.workflow_data.get('hierarchy_xlsx')
+                folders_ready = st.session_state.workflow_data.get('rakuten_folders')
+
+                if st.button("🏪 アップロードキュー生成", type="primary", disabled=not (hierarchy_ready and folders_ready), key="rakuten_queue_btn"):
+                    hierarchy_bytes = st.session_state.workflow_data['hierarchy_xlsx']
+                    hierarchy_df = pd.read_excel(BytesIO(hierarchy_bytes), sheet_name="フォルダ階層リスト", header=None)
+                    folders = st.session_state.workflow_data['rakuten_folders']
+
+                    result = prepare_rakuten_queue(images, hierarchy_df, folders)
+                    st.session_state.workflow_data['rakuten_queue'] = result
+                    st.rerun()
+
+                # キュー結果表示
+                if 'rakuten_queue' in st.session_state.workflow_data:
+                    result = st.session_state.workflow_data['rakuten_queue']
+
+                    col_m1, col_m2 = st.columns(2)
+                    col_m1.metric("マッピング成功", result['mapped'])
+                    col_m2.metric("未マッチ", len(result['unmapped']))
+
+                    if result['queue']:
+                        queue_df = pd.DataFrame([
+                            {'コミックNo': q['comic_no'], 'フォルダ': q['folder_name'], 'FolderId': q['folder_id']}
+                            for q in result['queue']
+                        ])
+                        st.dataframe(queue_df, use_container_width=True, height=200)
+
+                    with st.expander("ログ", expanded=False):
+                        for log in result['logs']:
+                            st.text(log)
+
+            # ナビゲーション
+            st.divider()
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                if st.button("← 戻る"):
+                    st.session_state.workflow_step = 3
+                    st.rerun()
+            with col2:
+                yahoo_ready = 'yahoo_zips' in st.session_state.workflow_data
+                rakuten_ready = 'rakuten_queue' in st.session_state.workflow_data
+                if st.button("次へ進む →", type="primary", disabled=not (yahoo_ready or rakuten_ready)):
+                    if 4 not in st.session_state.workflow_completed:
+                        st.session_state.workflow_completed.append(4)
+                    st.session_state.workflow_step = 5
+                    st.rerun()
 
     # ============================================================
     # Step 5: API連携
