@@ -1021,9 +1021,8 @@ def process_workflow_images(missing_comics: list, is_list_content: str, comic_li
     target_data = [d for d in result_data if str(d.get('comic_no', '')).strip() in missing_set]
 
     # 単品（_あり）はis_listから直接JAN検索
-    # まずis_dfから (comic_no, volume) → JAN の辞書を構築
+    # is_dfから (comic_no, volume) → JAN の辞書を構築
     is_jan_lookup = {}  # (comic_no, volume) → JAN
-    is_jan_by_comic = {}  # comic_no → [(volume, JAN)]
     for i in range(1, len(is_df)):
         try:
             cno = str(is_df.iloc[i, 6]).strip() if pd.notna(is_df.iloc[i, 6]) else ''
@@ -1033,13 +1032,9 @@ def process_workflow_images(missing_comics: list, is_list_content: str, comic_li
             jan = normalize_jan_code(is_df.iloc[i, 5])
             if cno and jan:
                 is_jan_lookup[(cno, vol)] = jan
-                if cno not in is_jan_by_comic:
-                    is_jan_by_comic[cno] = []
-                is_jan_by_comic[cno].append((vol, jan))
         except:
             continue
 
-    # result_dataからcomic_no → first_jan の辞書（フォールバック用）
     result_data_dict = {str(d.get('comic_no', '')).strip(): d for d in result_data}
 
     tanpin_comics = [c for c in missing_comics if '_' in str(c)]
@@ -1048,16 +1043,8 @@ def process_workflow_images(missing_comics: list, is_list_content: str, comic_li
         base_no = parts[0]
         vol_num = int(parts[1]) if len(parts) > 1 else 1
 
-        # 優先1: (comic_no, volume) 完全一致
+        # (comic_no, volume) 完全一致でJAN検索
         jan_code = is_jan_lookup.get((base_no, str(vol_num)), '')
-
-        # 優先2: comic_noの任意のJAN（巻数不一致でもOK）
-        if not jan_code and base_no in is_jan_by_comic:
-            jan_code = is_jan_by_comic[base_no][0][1]
-
-        # 優先3: result_data（extract_first_volumes）のfirst_jan
-        if not jan_code and base_no in result_data_dict:
-            jan_code = result_data_dict[base_no].get('first_jan', '')
 
         base_info = result_data_dict.get(base_no, {})
         if jan_code:
