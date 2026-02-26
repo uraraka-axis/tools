@@ -1021,29 +1021,54 @@ def process_workflow_images(missing_comics: list, is_list_content: str, comic_li
     target_data = [d for d in result_data if str(d.get('comic_no', '')).strip() in missing_set]
 
     # 単品（_あり）はis_listから直接JAN検索
+    # まずis_dfから (comic_no, volume) → JAN の辞書を構築
+    is_jan_lookup = {}  # (comic_no, volume) → JAN
+    is_jan_by_comic = {}  # comic_no → [(volume, JAN)]
+    for i in range(1, len(is_df)):
+        try:
+            cno = str(is_df.iloc[i, 6]).strip() if pd.notna(is_df.iloc[i, 6]) else ''
+            cno = cno.replace('.0', '')
+            vol = str(is_df.iloc[i, 9]).strip() if pd.notna(is_df.iloc[i, 9]) else ''
+            vol = vol.replace('.0', '')
+            jan = normalize_jan_code(is_df.iloc[i, 5])
+            if cno and jan:
+                is_jan_lookup[(cno, vol)] = jan
+                if cno not in is_jan_by_comic:
+                    is_jan_by_comic[cno] = []
+                is_jan_by_comic[cno].append((vol, jan))
+        except:
+            continue
+
+    # result_dataからcomic_no → first_jan の辞書（フォールバック用）
+    result_data_dict = {str(d.get('comic_no', '')).strip(): d for d in result_data}
+
     tanpin_comics = [c for c in missing_comics if '_' in str(c)]
     for tc in tanpin_comics:
         parts = str(tc).split('_')
         base_no = parts[0]
         vol_num = int(parts[1]) if len(parts) > 1 else 1
 
-        # is_listから該当巻のJANを検索
-        jan_code = ''
-        for i in range(1, len(is_df)):
-            cno = str(is_df.iloc[i, 6]).strip() if pd.notna(is_df.iloc[i, 6]) else ''
-            cno = cno.replace('.0', '')
-            vol = str(is_df.iloc[i, 9]).strip() if pd.notna(is_df.iloc[i, 9]) else ''
-            vol = vol.replace('.0', '')
+        # 優先1: (comic_no, volume) 完全一致
+        jan_code = is_jan_lookup.get((base_no, str(vol_num)), '')
 
-            if cno == base_no and vol == str(vol_num):
-                jan_code = normalize_jan_code(is_df.iloc[i, 5])
-                break
+        # 優先2: comic_noの任意のJAN（巻数不一致でもOK）
+        if not jan_code and base_no in is_jan_by_comic:
+            jan_code = is_jan_by_comic[base_no][0][1]
 
+        # 優先3: result_data（extract_first_volumes）のfirst_jan
+        if not jan_code and base_no in result_data_dict:
+            jan_code = result_data_dict[base_no].get('first_jan', '')
+
+        base_info = result_data_dict.get(base_no, {})
         if jan_code:
             target_data.append({
                 'comic_no': tc,
                 'first_jan': jan_code,
-                'is_tanpin': True
+                'is_tanpin': True,
+                'genre': base_info.get('genre', ''),
+                'publisher': base_info.get('publisher', ''),
+                'series': base_info.get('series', ''),
+                'title': base_info.get('title', ''),
             })
 
     # セット品フラグ追加
