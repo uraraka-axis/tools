@@ -27,6 +27,7 @@ HARU_PASSWORD = os.environ.get("HARU_PASSWORD", "Haru@9999")
 # GitHub設定
 GITHUB_REPO = "uraraka-axis/tools"
 GITHUB_INPUT_PATH = "comic-lister/data/missing_comics.csv"
+GITHUB_TANPIN_INPUT_PATH = "comic-lister/data/missing_tanpin.csv"
 GITHUB_OUTPUT_PATH = "comic-lister/data/is_list.csv"
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
@@ -120,6 +121,41 @@ def get_comic_numbers_from_github():
 
     except Exception as e:
         log(f"GitHubからのデータ取得エラー: {e}")
+        return []
+
+
+def get_tanpin_comic_numbers_from_github():
+    """GitHubからmissing_tanpin.csvを取得してベースのコミックNo.を抽出"""
+    try:
+        log("GitHubから単品データ取得中...")
+
+        raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/master/{GITHUB_TANPIN_INPUT_PATH}"
+
+        headers = {}
+        if GITHUB_TOKEN:
+            headers["Authorization"] = f"token {GITHUB_TOKEN}"
+
+        response = requests.get(raw_url, headers=headers)
+
+        if response.status_code != 200:
+            log(f"missing_tanpin.csv取得エラー: HTTP {response.status_code}")
+            return []
+
+        # 各行は "12345_3" 形式 → ベースのコミックNo "12345" を抽出
+        comic_numbers = set()
+        for line in response.text.strip().split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            base_no = line.split('_')[0].split(',')[0].strip()
+            if base_no:
+                comic_numbers.add(base_no)
+
+        log(f"単品から取得したベースコミックNo.: {len(comic_numbers)}件")
+        return list(comic_numbers)
+
+    except Exception as e:
+        log(f"単品データ取得エラー: {e}")
         return []
 
 
@@ -310,8 +346,13 @@ def main():
     # 出力ディレクトリ作成
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 1. GitHubからコミックNo.を取得
-    comic_numbers = get_comic_numbers_from_github()
+    # 1. GitHubからコミックNo.を取得（セット品 + 単品のベース）
+    set_comic_numbers = get_comic_numbers_from_github()
+    tanpin_comic_numbers = get_tanpin_comic_numbers_from_github()
+
+    # 重複排除して統合
+    comic_numbers = list(set(set_comic_numbers + tanpin_comic_numbers))
+    log(f"統合コミックNo.: {len(comic_numbers)}件（セット品: {len(set_comic_numbers)}件, 単品ベース: {len(tanpin_comic_numbers)}件）")
 
     if not comic_numbers:
         log("コミックNo.が取得できませんでした。終了します。")
