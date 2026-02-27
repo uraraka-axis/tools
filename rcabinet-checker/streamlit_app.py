@@ -2004,11 +2004,13 @@ if mode == "🔄 画像ワークフロー":
         if 'check_results' in st.session_state.workflow_data:
             results = st.session_state.workflow_data['check_results']
             exists_items = [r for r in results if r['存在'] == '✅ あり']
+            # RECフォルダを除外した画像
+            exists_items_no_rec = [r for r in exists_items if 'REC' not in (r.get('フォルダ', '') or '').upper()]
             missing = [r for r in results if r['存在'] == '❌ なし']
 
             # 存在あり画像のダウンロード
-            if exists_items:
-                with st.expander(f"📦 存在あり画像をダウンロード（{len(exists_items)}件）"):
+            if exists_items_no_rec:
+                with st.expander(f"📦 存在あり画像をダウンロード（{len(exists_items_no_rec)}件、REC除外）"):
                     if 'wf_rcab_dl_result' not in st.session_state:
                         st.session_state.wf_rcab_dl_result = None
 
@@ -2020,7 +2022,7 @@ if mode == "🔄 画像ワークフロー":
 
                         downloaded = []
                         failed = []
-                        for i, item in enumerate(exists_items):
+                        for i, item in enumerate(exists_items_no_rec):
                             comic_no = str(item['コミックNo'])
                             url = item.get('URL', '')
                             folder = item.get('フォルダ', '')
@@ -2028,8 +2030,8 @@ if mode == "🔄 画像ワークフロー":
                             if '.' not in file_name:
                                 file_name = f"{file_name}.jpg"
 
-                            status.text(f"ダウンロード中: {comic_no} ({i+1}/{len(exists_items)})")
-                            progress.progress((i + 1) / len(exists_items))
+                            status.text(f"ダウンロード中: {comic_no} ({i+1}/{len(exists_items_no_rec)})")
+                            progress.progress((i + 1) / len(exists_items_no_rec))
 
                             if not url or url == '-':
                                 failed.append(comic_no)
@@ -3130,7 +3132,8 @@ elif mode == "🔍 画像存在チェック":
         # --- 存在あり画像のダウンロード ---
         if exists_count > 0:
             exists_items = [r for r in results if r['存在'] == '✅ あり']
-            with st.expander(f"📦 存在あり画像をダウンロード（{exists_count}件）"):
+            exists_items_no_rec = [r for r in exists_items if 'REC' not in (r.get('フォルダ', '') or '').upper()]
+            with st.expander(f"📦 存在あり画像をダウンロード（{len(exists_items_no_rec)}件、REC除外）"):
                 if 'rcab_dl_result' not in st.session_state:
                     st.session_state.rcab_dl_result = None
 
@@ -3142,14 +3145,16 @@ elif mode == "🔍 画像存在チェック":
 
                     downloaded = []
                     failed = []
-                    for i, item in enumerate(exists_items):
+                    for i, item in enumerate(exists_items_no_rec):
                         comic_no = str(item['コミックNo'])
                         url = item.get('URL', '')
                         folder = item.get('フォルダ', '')
-                        file_name = item.get('ファイル名', f"{comic_no}.jpg")
+                        file_name = item.get('ファイル名', '') or f"{comic_no}.jpg"
+                        if '.' not in file_name:
+                            file_name = f"{file_name}.jpg"
 
-                        status.text(f"ダウンロード中: {comic_no} ({i+1}/{len(exists_items)})")
-                        progress.progress((i + 1) / len(exists_items))
+                        status.text(f"ダウンロード中: {comic_no} ({i+1}/{len(exists_items_no_rec)})")
+                        progress.progress((i + 1) / len(exists_items_no_rec))
 
                         if not url or url == '-':
                             failed.append(comic_no)
