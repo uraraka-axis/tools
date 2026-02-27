@@ -2182,30 +2182,44 @@ if mode == "🔄 画像ワークフロー":
             with fetch_cols[0]:
                 if not missing_comics and st.button("📥 不足リスト取得"):
                     with st.spinner("GitHubから取得中..."):
-                        result = download_from_github(GITHUB_MISSING_CSV_PATH)
-                    content = result.get("content", b"")
-                    if isinstance(content, bytes):
-                        content = content.decode('utf-8', errors='replace')
-                    if result.get("success") and content.strip():
-                        lines = content.strip().split('\n')
                         parsed_comics = []
-                        for l in lines:
-                            l = l.strip()
-                            if not l:
-                                continue
-                            if ',' in l:
-                                # CSV行からcomic_noを抽出（非空フィールドで2桁以上の数値）
-                                fields = [f.strip() for f in l.split(',') if f.strip()]
-                                for f in fields:
-                                    if f.replace('_', '').replace('.0', '').isdigit() and len(f.replace('.0', '')) > 1:
-                                        parsed_comics.append(f.replace('.0', ''))
-                                        break
-                            else:
-                                parsed_comics.append(l)
+
+                        # セット品（missing_comics.csv）
+                        result_set = download_from_github(GITHUB_MISSING_CSV_PATH)
+                        if result_set.get("success"):
+                            content = result_set.get("content", b"")
+                            if isinstance(content, bytes):
+                                content = content.decode('utf-8', errors='replace')
+                            for l in content.strip().split('\n'):
+                                l = l.strip()
+                                if not l:
+                                    continue
+                                if ',' in l:
+                                    fields = [f.strip() for f in l.split(',') if f.strip()]
+                                    for f in fields:
+                                        if f.replace('_', '').replace('.0', '').isdigit() and len(f.replace('.0', '')) > 1:
+                                            parsed_comics.append(f.replace('.0', ''))
+                                            break
+                                else:
+                                    parsed_comics.append(l)
+
+                        # 単品（missing_tanpin.csv）
+                        result_tanpin = download_from_github(GITHUB_MISSING_TANPIN_PATH)
+                        if result_tanpin.get("success"):
+                            content = result_tanpin.get("content", b"")
+                            if isinstance(content, bytes):
+                                content = content.decode('utf-8', errors='replace')
+                            for l in content.strip().split('\n'):
+                                l = l.strip()
+                                if l:
+                                    parsed_comics.append(l)
+
+                    if parsed_comics:
                         missing_comics = parsed_comics
-                        # session_stateにも反映
                         st.session_state.workflow_data['missing_from_github'] = missing_comics
-                        st.success(f"{len(missing_comics)}件取得")
+                        set_c = len([c for c in parsed_comics if '_' not in str(c)])
+                        tanpin_c = len([c for c in parsed_comics if '_' in str(c)])
+                        st.success(f"{len(parsed_comics)}件取得（セット品: {set_c}件 / 単品: {tanpin_c}件）")
                         st.rerun()
                     else:
                         st.error("取得失敗またはデータなし")
