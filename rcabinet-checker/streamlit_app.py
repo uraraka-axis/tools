@@ -1129,19 +1129,22 @@ def process_workflow_images(missing_comics: list, is_list_content: str, comic_li
             stats['failed'] += 1
             continue
 
-        # 600x600にリサイズ
-        resized = resize_to_square(image_data, 600)
-
-        # バッジ合成（セット品のみ）
         is_tanpin = data.get('is_tanpin', False)
-        if not is_tanpin and os.path.exists(badge_path):
-            final_image = add_shipping_badge(resized, badge_path)
-            badge_status = "バッジ付き"
-        else:
-            final_image = resized
-            badge_status = "バッジなし" if is_tanpin else "バッジ画像なし"
 
-        final_bytes = image_to_bytes(final_image)
+        if is_tanpin:
+            # 単品：取得した画像をそのまま使用（加工なし）
+            final_bytes = image_data
+            badge_status = "加工なし"
+        else:
+            # セット品：600x600リサイズ＋バッジ合成
+            resized = resize_to_square(image_data, 600)
+            if os.path.exists(badge_path):
+                final_image = add_shipping_badge(resized, badge_path)
+                badge_status = "バッジ付き"
+            else:
+                final_image = resized
+                badge_status = "バッジ画像なし"
+            final_bytes = image_to_bytes(final_image)
 
         downloaded_images.append({
             'comic_no': comic_no,
