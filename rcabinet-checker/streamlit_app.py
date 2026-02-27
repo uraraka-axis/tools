@@ -2240,6 +2240,43 @@ if mode == "🔄 画像ワークフロー":
         if not missing_comics and st.session_state.workflow_data.get('missing_from_github'):
             missing_comics = st.session_state.workflow_data['missing_from_github']
 
+        # --- CSVダウンロード ---
+        with st.expander("📄 CSVファイルをダウンロード"):
+            dl_cols = st.columns(4)
+            csv_files = [
+                ("missing_tanpin.csv", GITHUB_MISSING_TANPIN_PATH),
+                ("missing_comics.csv", GITHUB_MISSING_CSV_PATH),
+                ("is_list.csv", GITHUB_IS_LIST_PATH),
+                ("comic_list.csv", GITHUB_COMIC_LIST_PATH),
+            ]
+            # キャッシュキー
+            if 'csv_downloads' not in st.session_state:
+                st.session_state.csv_downloads = {}
+            for idx, (fname, gpath) in enumerate(csv_files):
+                with dl_cols[idx]:
+                    if fname in st.session_state.csv_downloads:
+                        data = st.session_state.csv_downloads[fname]
+                        st.download_button(
+                            label=f"💾 {fname}",
+                            data=data,
+                            file_name=fname,
+                            mime="text/csv",
+                            key=f"dl_{fname}"
+                        )
+                    else:
+                        if st.button(f"📥 {fname}", key=f"fetch_{fname}"):
+                            with st.spinner("取得中..."):
+                                result = download_from_github(gpath)
+                            if result.get("success"):
+                                content = result["content"]
+                                if isinstance(content, bytes):
+                                    st.session_state.csv_downloads[fname] = content
+                                else:
+                                    st.session_state.csv_downloads[fname] = content.encode('utf-8')
+                                st.rerun()
+                            else:
+                                st.error(f"取得失敗: {result.get('error')}")
+
         # --- 実行セクション ---
         st.divider()
         all_ready = missing_comics and st.session_state.workflow_data.get('is_list') and st.session_state.workflow_data.get('comic_list')
