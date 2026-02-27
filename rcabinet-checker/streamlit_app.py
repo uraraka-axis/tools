@@ -2024,7 +2024,9 @@ if mode == "🔄 画像ワークフロー":
                             comic_no = str(item['コミックNo'])
                             url = item.get('URL', '')
                             folder = item.get('フォルダ', '')
-                            file_name = item.get('ファイル名', f"{comic_no}.jpg")
+                            file_name = item.get('ファイル名', '') or f"{comic_no}.jpg"
+                            if '.' not in file_name:
+                                file_name = f"{file_name}.jpg"
 
                             status.text(f"ダウンロード中: {comic_no} ({i+1}/{len(exists_items)})")
                             progress.progress((i + 1) / len(exists_items))
