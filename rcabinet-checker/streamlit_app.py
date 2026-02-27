@@ -2003,7 +2003,95 @@ if mode == "🔄 画像ワークフロー":
         # 結果がある場合
         if 'check_results' in st.session_state.workflow_data:
             results = st.session_state.workflow_data['check_results']
+            exists_items = [r for r in results if r['存在'] == '✅ あり']
             missing = [r for r in results if r['存在'] == '❌ なし']
+
+            # 存在あり画像のダウンロード
+            if exists_items:
+                with st.expander(f"📦 存在あり画像をダウンロード（{len(exists_items)}件）"):
+                    if 'wf_rcab_dl_result' not in st.session_state:
+                        st.session_state.wf_rcab_dl_result = None
+
+                    if st.button("🖼️ R-Cabinetから画像を取得", type="primary", key="wf_rcab_dl_btn"):
+                        _zipfile = get_zipfile()
+                        progress = st.progress(0)
+                        status = st.empty()
+                        session = requests.Session()
+
+                        downloaded = []
+                        failed = []
+                        for i, item in enumerate(exists_items):
+                            comic_no = str(item['コミックNo'])
+                            url = item.get('URL', '')
+                            folder = item.get('フォルダ', '')
+                            file_name = item.get('ファイル名', f"{comic_no}.jpg")
+
+                            status.text(f"ダウンロード中: {comic_no} ({i+1}/{len(exists_items)})")
+                            progress.progress((i + 1) / len(exists_items))
+
+                            if not url or url == '-':
+                                failed.append(comic_no)
+                                continue
+                            try:
+                                resp = session.get(url, timeout=15)
+                                if resp.status_code == 200 and len(resp.content) > 100:
+                                    downloaded.append({
+                                        'comic_no': comic_no,
+                                        'file_name': file_name,
+                                        'folder': folder,
+                                        'data': resp.content,
+                                    })
+                                else:
+                                    failed.append(comic_no)
+                            except Exception:
+                                failed.append(comic_no)
+
+                        progress.empty()
+                        status.empty()
+                        st.session_state.wf_rcab_dl_result = {'downloaded': downloaded, 'failed': failed}
+                        st.rerun()
+
+                    if st.session_state.wf_rcab_dl_result:
+                        dl_result = st.session_state.wf_rcab_dl_result
+                        downloaded = dl_result['downloaded']
+                        failed = dl_result['failed']
+
+                        st.success(f"取得完了: {len(downloaded)}件成功" + (f", {len(failed)}件失敗" if failed else ""))
+
+                        if downloaded:
+                            _zipfile = get_zipfile()
+                            dl_cols = st.columns(2)
+
+                            with dl_cols[0]:
+                                buf_flat = BytesIO()
+                                with _zipfile.ZipFile(buf_flat, 'w', _zipfile.ZIP_DEFLATED) as zf:
+                                    for img in downloaded:
+                                        zf.writestr(img['file_name'], img['data'])
+                                buf_flat.seek(0)
+                                st.download_button(
+                                    label=f"📦 フラットZIP（{len(downloaded)}件）",
+                                    data=buf_flat,
+                                    file_name="rcabinet_images_flat.zip",
+                                    mime="application/zip",
+                                    key="wf_rcab_dl_flat"
+                                )
+                                st.caption("全画像を直下に配置")
+
+                            with dl_cols[1]:
+                                buf_folder = BytesIO()
+                                with _zipfile.ZipFile(buf_folder, 'w', _zipfile.ZIP_DEFLATED) as zf:
+                                    for img in downloaded:
+                                        folder = img['folder'] if img['folder'] and img['folder'] != '-' else 'その他'
+                                        zf.writestr(f"{folder}/{img['file_name']}", img['data'])
+                                buf_folder.seek(0)
+                                st.download_button(
+                                    label=f"📂 フォルダ付きZIP（{len(downloaded)}件）",
+                                    data=buf_folder,
+                                    file_name="rcabinet_images_by_folder.zip",
+                                    mime="application/zip",
+                                    key="wf_rcab_dl_folder"
+                                )
+                                st.caption("R-Cabinetのフォルダ構成を保持")
 
             if missing:
                 st.divider()
