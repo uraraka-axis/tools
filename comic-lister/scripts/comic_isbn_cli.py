@@ -7,6 +7,9 @@ import time
 import os
 import sys
 import datetime
+from datetime import timezone, timedelta
+
+JST = timezone(timedelta(hours=9))
 import base64
 from pathlib import Path
 import urllib.parse
@@ -37,7 +40,7 @@ OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/tmp/comic-lister-output"))
 
 def log(message):
     """ログメッセージを出力"""
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}")
 
 
@@ -367,7 +370,7 @@ def main():
         if downloaded_file:
             # 3. is_list.csvをGitHubにアップロード
             log(f"GitHubにアップロード: {downloaded_file.name}")
-            today = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+            today = datetime.datetime.now(JST).strftime("%Y-%m-%d %H:%M")
             upload_to_github(
                 str(downloaded_file),
                 GITHUB_OUTPUT_PATH,

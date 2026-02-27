@@ -7,6 +7,9 @@ import time
 import os
 import sys
 import datetime
+from datetime import timezone, timedelta
+
+JST = timezone(timedelta(hours=9))
 import base64
 from pathlib import Path
 
@@ -39,7 +42,7 @@ OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/tmp/comic-lister-output"))
 
 def log(message):
     """ログメッセージを出力"""
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}")
 
 
@@ -586,10 +589,10 @@ def main():
     csv_path = create_list_csv(comic_numbers)
 
     # 3. 設定を準備
-    today = datetime.datetime.now().strftime("%Y/%m/%d")
+    today = datetime.datetime.now(JST).strftime("%Y/%m/%d")
     config = {
         'csv_path': csv_path,
-        'list_name': f"不足画像リスト_{datetime.datetime.now().strftime('%Y%m%d')}",
+        'list_name': f"不足画像リスト_{datetime.datetime.now(JST).strftime('%Y%m%d')}",
         'assignee_name': ASSIGNEE_NAME,
         'submission_date': today,
         'isbn_setting': ISBN_SETTING
@@ -611,7 +614,7 @@ def main():
     if comic_list_files:
         comic_list_file = comic_list_files[0]
         log(f"GitHubにアップロード: {comic_list_file.name}")
-        today = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        today = datetime.datetime.now(JST).strftime("%Y-%m-%d %H:%M")
         upload_to_github(
             str(comic_list_file),
             GITHUB_OUTPUT_PATH,

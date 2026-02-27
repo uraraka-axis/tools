@@ -14,7 +14,9 @@ import xml.etree.ElementTree as ET
 import pandas as pd
 import time
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+JST = timezone(timedelta(hours=9))
 
 # 重いライブラリは遅延読み込み（起動高速化）
 _bs4_module = None
@@ -260,10 +262,9 @@ def get_github_file_info(path: str) -> dict:
             commit = response.json()[0]
             date_str = commit.get("commit", {}).get("committer", {}).get("date", "")
             if date_str:
-                # ISO形式をパースして日本時間に変換（+9時間）
-                from datetime import datetime, timedelta, timezone
+                # ISO形式をパースして日本時間に変換
                 dt_utc = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-                dt_jst = dt_utc + timedelta(hours=9)
+                dt_jst = dt_utc.astimezone(JST)
                 return {"last_updated": dt_jst.strftime("%Y-%m-%d %H:%M"), "exists": True}
         return {"exists": False}
     except:
@@ -315,7 +316,7 @@ def get_workflow_runs(workflow_file: str, limit: int = 3) -> list:
                 created = run.get("created_at", "")
                 if created:
                     dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                    created = dt.strftime("%Y-%m-%d %H:%M")
+                    created = dt.astimezone(JST).strftime("%Y-%m-%d %H:%M")
                 result.append({
                     "status": run.get("status"),
                     "conclusion": run.get("conclusion"),
@@ -480,7 +481,8 @@ def get_db_stats() -> dict:
         if all_data:
             dates = [row.get("created_at") for row in all_data if row.get("created_at")]
             if dates:
-                last_updated = max(dates)[:16].replace("T", " ")  # "2025-02-04 10:30"形式
+                dt = datetime.fromisoformat(max(dates).replace("Z", "+00:00"))
+                last_updated = dt.astimezone(JST).strftime("%Y-%m-%d %H:%M")
 
         return {"total": total, "duplicates": duplicates, "last_updated": last_updated}
     except Exception:
@@ -2014,7 +2016,7 @@ if mode == "🔄 画像ワークフロー":
                         set_comics = [r['コミックNo'] for r in missing if '_' not in str(r['コミックNo'])]
                         tanpin_comics = [r['コミックNo'] for r in missing if '_' in str(r['コミックNo'])]
 
-                        today = datetime.now().strftime('%Y-%m-%d %H:%M')
+                        today = datetime.now(JST).strftime('%Y-%m-%d %H:%M')
                         upload_results = []
 
                         if set_comics:
@@ -3071,7 +3073,7 @@ elif mode == "🔍 画像存在チェック":
                     if new_bases:
                         upload_help += f" (単品ベース追加: {len(new_bases)}件)"
                 if st.button(upload_label, help=upload_help):
-                    today = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    today = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
                     upload_results = []
 
                     # セット品＋単品ベースをアップロード（missing_comics.csv）
@@ -3218,7 +3220,7 @@ elif mode == "🖼️ 新規画像取得":
             result = upload_binary_to_github(
                 content,
                 GITHUB_FOLDER_HIERARCHY_PATH,
-                f"Update folder_hierarchy.xlsx - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                f"Update folder_hierarchy.xlsx - {datetime.now(JST).strftime('%Y-%m-%d %H:%M')}"
             )
             if result.get("success"):
                 st.success("フォルダ階層リストを更新しました")
