@@ -503,25 +503,21 @@ def load_images_from_db() -> tuple[list, str]:
 
 
 def get_db_stats() -> dict:
-    """DBの統計情報を取得（ページネーション対応）"""
+    """DBの統計情報を取得（カウントクエリで高速化）"""
     supabase = get_supabase_client()
     if not supabase:
         return {}
 
     try:
-        all_data = fetch_all_from_supabase(supabase, "rcabinet_images", "folder_names, created_at")
-        total = len(all_data)
-        duplicates = sum(1 for row in all_data if ", " in row.get("folder_names", ""))
+        # 全件数をカウント（全件フェッチせず高速）
+        total_resp = supabase.table("rcabinet_images").select("*", count="exact").limit(1).execute()
+        total = total_resp.count or 0
 
-        # 最終更新日時を取得
-        last_updated = None
-        if all_data:
-            dates = [row.get("created_at") for row in all_data if row.get("created_at")]
-            if dates:
-                dt = datetime.fromisoformat(max(dates).replace("Z", "+00:00"))
-                last_updated = dt.astimezone(JST).strftime("%Y-%m-%d %H:%M")
+        # 重複ファイル数（folder_namesにカンマを含む件数）
+        dup_resp = supabase.table("rcabinet_images").select("*", count="exact").ilike("folder_names", "%, %").limit(1).execute()
+        duplicates = dup_resp.count or 0
 
-        return {"total": total, "duplicates": duplicates, "last_updated": last_updated}
+        return {"total": total, "duplicates": duplicates, "last_updated": None}
     except Exception:
         return {}
 
@@ -2891,26 +2887,24 @@ elif mode == "📂 画像一覧取得":
         st.success(f"📁 {len(folders)} フォルダ")
         st.info(f"📷 {total_files} 画像（全体）")
 
-    # DB統計情報を表示
+    # DB統計情報を表示（常に表示）
     db_stats = get_db_stats()
-    if db_stats.get("total", 0) > 0:
-        stat_cols = st.columns(4)
-        with stat_cols[0]:
-            st.metric("DB登録数", db_stats.get("total", 0))
-        with stat_cols[1]:
-            st.metric("重複ファイル", db_stats.get("duplicates", 0))
-        with stat_cols[2]:
-            st.metric("API総数", total_files)
-        with stat_cols[3]:
-            last_updated = st.session_state.get("last_sync_time") or db_stats.get("last_updated", "-")
-            st.metric("最終更新", last_updated if last_updated else "-")
+    stat_cols = st.columns(4)
+    with stat_cols[0]:
+        st.metric("DB登録数", db_stats.get("total", 0))
+    with stat_cols[1]:
+        st.metric("重複ファイル", db_stats.get("duplicates", 0))
+    with stat_cols[2]:
+        st.metric("API総数", total_files)
+    with stat_cols[3]:
+        last_updated = st.session_state.get("last_sync_time") or "-"
+        st.metric("最終更新", last_updated)
 
     # 操作ボタン（2つ）
     btn_col1, btn_col2, _ = st.columns([1.5, 1.5, 1])
     with btn_col1:
         show_db_btn = st.button(
             "📋 前回取得データを表示",
-            disabled=(db_stats.get("total", 0) == 0),
             help="前回APIから取得してDBに保存したデータを表示（高速）"
         )
     with btn_col2:
