@@ -13,6 +13,7 @@ import base64
 import xml.etree.ElementTree as ET
 import pandas as pd
 import time
+import json
 from io import BytesIO
 from datetime import datetime, timezone, timedelta
 
@@ -371,20 +372,25 @@ def sync_images_to_db(images: list) -> dict:
 
     try:
         # file_nameごとにグループ化（重複検出）
+        # file_urlはJSONで {フォルダ名: URL} 形式で保存（複数フォルダの場合でも正確なURLを保持）
         file_dict = {}
         for img in images:
             file_name = img.get("FileName", "")
             folder_name = img.get("FolderName", "")
+            file_url = img.get("FileUrl", "")
             if file_name in file_dict:
-                # 重複: folder_namesに追加
+                # 重複: folder_namesに追加、URLもフォルダ別に記録
                 existing_folders = file_dict[file_name]["folder_names"].split(", ")
                 if folder_name not in existing_folders:
                     file_dict[file_name]["folder_names"] += f", {folder_name}"
+                    url_dict = json.loads(file_dict[file_name]["file_url"])
+                    url_dict[folder_name] = file_url
+                    file_dict[file_name]["file_url"] = json.dumps(url_dict, ensure_ascii=False)
             else:
                 file_dict[file_name] = {
                     "file_name": file_name,
                     "folder_names": folder_name,
-                    "file_url": img.get("FileUrl", ""),
+                    "file_url": json.dumps({folder_name: file_url}, ensure_ascii=False),
                     "file_size": img.get("FileSize", 0),
                     "file_timestamp": img.get("TimeStamp", "")
                 }
@@ -453,13 +459,44 @@ def load_images_from_db() -> tuple[list, str]:
         all_data = fetch_all_from_supabase(supabase, "rcabinet_images", "*")
         images = []
         for row in all_data:
-            images.append({
-                "FolderName": row.get("folder_names", ""),
-                "FileName": row.get("file_name", ""),
-                "FileUrl": row.get("file_url", ""),
-                "FileSize": row.get("file_size", 0),
-                "TimeStamp": row.get("file_timestamp", "")
-            })
+            folder_names_str = row.get("folder_names", "")
+            file_url_raw = row.get("file_url", "")
+            file_name = row.get("file_name", "")
+            file_size = row.get("file_size", 0)
+            file_timestamp = row.get("file_timestamp", "")
+            # file_urlをJSONとして解析（新形式: {フォルダ名: URL} の辞書）
+            try:
+                url_data = json.loads(file_url_raw)
+                if isinstance(url_data, dict) and url_data:
+                    # 新形式: フォルダ別に行を展開（各フォルダが正確なURLを持つ）
+                    for folder in folder_names_str.split(", "):
+                        folder = folder.strip()
+                        if folder:
+                            url = url_data.get(folder, next(iter(url_data.values()), ""))
+                            images.append({
+                                "FolderName": folder,
+                                "FileName": file_name,
+                                "FileUrl": url,
+                                "FileSize": file_size,
+                                "TimeStamp": file_timestamp
+                            })
+                else:
+                    images.append({
+                        "FolderName": folder_names_str,
+                        "FileName": file_name,
+                        "FileUrl": file_url_raw,
+                        "FileSize": file_size,
+                        "TimeStamp": file_timestamp
+                    })
+            except (json.JSONDecodeError, TypeError):
+                # 旧形式: URLが文字列のまま（DB移行前のデータ）
+                images.append({
+                    "FolderName": folder_names_str,
+                    "FileName": file_name,
+                    "FileUrl": file_url_raw,
+                    "FileSize": file_size,
+                    "TimeStamp": file_timestamp
+                })
         return images, f"{len(images)}件を読み込みました"
     except Exception as e:
         return [], str(e)
@@ -499,13 +536,42 @@ def load_images_from_db_by_folder(folder_name: str) -> list:
         all_data = fetch_all_from_supabase(supabase, "rcabinet_images", "*", "folder_names", folder_name)
         images = []
         for row in all_data:
-            images.append({
-                "FolderName": row.get("folder_names", ""),
-                "FileName": row.get("file_name", ""),
-                "FileUrl": row.get("file_url", ""),
-                "FileSize": row.get("file_size", 0),
-                "TimeStamp": row.get("file_timestamp", "")
-            })
+            folder_names_str = row.get("folder_names", "")
+            file_url_raw = row.get("file_url", "")
+            file_name = row.get("file_name", "")
+            file_size = row.get("file_size", 0)
+            file_timestamp = row.get("file_timestamp", "")
+            try:
+                url_data = json.loads(file_url_raw)
+                if isinstance(url_data, dict) and url_data:
+                    # 新形式: フォルダ別に行を展開
+                    for folder in folder_names_str.split(", "):
+                        folder = folder.strip()
+                        if folder:
+                            url = url_data.get(folder, next(iter(url_data.values()), ""))
+                            images.append({
+                                "FolderName": folder,
+                                "FileName": file_name,
+                                "FileUrl": url,
+                                "FileSize": file_size,
+                                "TimeStamp": file_timestamp
+                            })
+                else:
+                    images.append({
+                        "FolderName": folder_names_str,
+                        "FileName": file_name,
+                        "FileUrl": file_url_raw,
+                        "FileSize": file_size,
+                        "TimeStamp": file_timestamp
+                    })
+            except (json.JSONDecodeError, TypeError):
+                images.append({
+                    "FolderName": folder_names_str,
+                    "FileName": file_name,
+                    "FileUrl": file_url_raw,
+                    "FileSize": file_size,
+                    "TimeStamp": file_timestamp
+                })
         return images
     except Exception:
         return []
