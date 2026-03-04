@@ -2859,17 +2859,14 @@ elif mode == "📂 画像一覧取得":
         st.session_state.images_loaded = False
         st.session_state.images_data = None
 
-    # ステップ1: フォルダ一覧を取得（まだの場合）
+    # フォルダ一覧を自動取得（初回のみ）
     if not st.session_state.folders_loaded:
-        st.markdown("### ステップ1: フォルダ一覧を取得")
-        if st.button("📂 フォルダ一覧を取得", type="primary"):
-            with st.spinner("フォルダ一覧を取得中..."):
-                folders, error = get_all_folders()
-            st.session_state.folders_data = folders
-            st.session_state.folders_error = error
-            st.session_state.folders_loaded = True
-            st.rerun()
-        st.stop()
+        with st.spinner("フォルダ一覧を取得中..."):
+            folders, error = get_all_folders()
+        st.session_state.folders_data = folders
+        st.session_state.folders_error = error
+        st.session_state.folders_loaded = True
+        st.rerun()
 
     folders = st.session_state.folders_data
     error = st.session_state.folders_error
