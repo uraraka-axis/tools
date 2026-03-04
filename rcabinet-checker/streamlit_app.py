@@ -2922,7 +2922,7 @@ elif mode == "📂 画像一覧取得":
         with stat_cols[2]:
             st.metric("API総数", total_files)
         with stat_cols[3]:
-            last_updated = db_stats.get("last_updated", "-")
+            last_updated = st.session_state.get("last_sync_time") or db_stats.get("last_updated", "-")
             st.metric("最終更新", last_updated if last_updated else "-")
 
     # ステップ3: 操作ボタン（2つ）
@@ -3024,6 +3024,7 @@ elif mode == "📂 画像一覧取得":
                 st.success(f"🔄 API取得完了・DB同期済み（新規: {sync_result['new']} / 更新: {sync_result['updated']} / 重複: {sync_result['duplicate']}）")
                 if sync_result['duplicate'] > 0:
                     st.warning(f"⚠️ {sync_result['duplicate']}件のファイルが複数フォルダに存在")
+                st.session_state.last_sync_time = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
             else:
                 st.error(f"DB同期エラー: {sync_result.get('error')}")
 
@@ -3051,6 +3052,7 @@ elif mode == "📂 画像一覧取得":
 
                 if sync_result.get("success"):
                     st.success(f"🔄 取得完了（{len(files)}件）・DB同期済み")
+                    st.session_state.last_sync_time = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
 
                 st.session_state.images_data = files
                 st.session_state.error_folders = []
