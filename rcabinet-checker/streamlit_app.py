@@ -2886,27 +2886,10 @@ elif mode == "📂 画像一覧取得":
     # 総ファイル数を計算
     total_files = sum(f['FileCount'] for f in folders)
 
-    # サイドバーにフォルダ情報
+    # サイドバーにフォルダ情報（再取得ボタンは最新一覧を取得に統合したため不要）
     with st.sidebar:
         st.success(f"📁 {len(folders)} フォルダ")
         st.info(f"📷 {total_files} 画像（全体）")
-        if st.button("🔄 フォルダ再取得"):
-            st.session_state.folders_loaded = False
-            st.session_state.images_loaded = False
-            st.cache_data.clear()
-            st.rerun()
-
-    # ステップ2: フォルダ選択
-    st.markdown("### フォルダを選択")
-
-    folder_options = {"📁 すべて（全フォルダ）": None}
-    folder_options.update({f"{f['FolderName']} ({f['FileCount']}件)": f for f in folders})
-
-    selected_folder_name = st.selectbox(
-        "取得するフォルダ",
-        list(folder_options.keys()),
-        label_visibility="collapsed"
-    )
 
     # DB統計情報を表示
     db_stats = get_db_stats()
@@ -2922,22 +2905,31 @@ elif mode == "📂 画像一覧取得":
             last_updated = st.session_state.get("last_sync_time") or db_stats.get("last_updated", "-")
             st.metric("最終更新", last_updated if last_updated else "-")
 
-    # ステップ3: 操作ボタン（2つ）
-    btn_col1, btn_col2, _ = st.columns([1.2, 1.2, 2])
+    # 操作ボタン（2つ）
+    btn_col1, btn_col2, _ = st.columns([1.5, 1.5, 1])
     with btn_col1:
         show_db_btn = st.button(
-            "📂 保存済み一覧を表示",
+            "📋 前回取得データを表示",
             disabled=(db_stats.get("total", 0) == 0),
-            help="DBに保存された一覧を表示（高速）"
+            help="前回APIから取得してDBに保存したデータを表示（高速）"
         )
     with btn_col2:
         fetch_api_btn = st.button(
             "🔄 最新一覧を取得",
             type="primary",
-            help="APIから最新データを取得してDBに同期"
+            help="APIから最新データを取得してDBに同期（フォルダ一覧も更新）"
         )
 
     st.divider()
+
+    # フォルダ選択（絞り込み）
+    folder_options = {"📁 すべて（全フォルダ）": None}
+    folder_options.update({f"{f['FolderName']} ({f['FileCount']}件)": f for f in folders})
+
+    selected_folder_name = st.selectbox(
+        "フォルダで絞り込み",
+        list(folder_options.keys()),
+    )
 
     # ボタン押下時の処理
     if show_db_btn:
@@ -2982,6 +2974,14 @@ elif mode == "📂 画像一覧取得":
         st.session_state.data_source = "api"
         st.session_state.images_loaded = False
         st.session_state.images_data = None
+
+        # フォルダ一覧も最新化
+        with st.spinner("フォルダ一覧を更新中..."):
+            new_folders, folder_error = get_all_folders()
+        if not folder_error and new_folders:
+            st.session_state.folders_data = new_folders
+            folders = new_folders
+            total_files = sum(f['FileCount'] for f in folders)
 
         if selected_folder_name == "📁 すべて（全フォルダ）":
             # 全フォルダの画像を取得
