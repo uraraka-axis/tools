@@ -2233,52 +2233,85 @@ if mode == "🔄 画像ワークフロー":
                 status_icon = "🟢" if run["conclusion"] == "success" else "🔴" if run["conclusion"] == "failure" else "🟡"
                 st.write(f"{status_icon} {run['created_at']} - {run['conclusion'] or '実行中'}")
 
-        col1, col2 = st.columns([1, 1])
-        with col1:
-            if st.button("📊 CSV生成を開始", type="primary"):
-                # 不足リストが未アップロードなら自動アップロード
-                if not st.session_state.workflow_data.get('missing_uploaded'):
-                    check_results = st.session_state.workflow_data.get('check_results', [])
-                    missing = [r for r in check_results if r.get('存在') == '❌ なし']
-                    if missing:
-                        set_comics = [r['コミックNo'] for r in missing if '_' not in str(r['コミックNo'])]
-                        tanpin_comics = [r['コミックNo'] for r in missing if '_' in str(r['コミックNo'])]
-                        today = datetime.now(JST).strftime('%Y-%m-%d %H:%M')
-                        with st.spinner("不足リストをGitHubにアップロード中..."):
-                            if set_comics:
-                                content = '\n'.join([str(c) for c in set_comics])
-                                upload_to_github(content, GITHUB_MISSING_CSV_PATH, f"Update missing_comics.csv ({len(set_comics)}件) - {today}")
-                            if tanpin_comics:
-                                content = '\n'.join([str(c) for c in tanpin_comics])
-                                upload_to_github(content, GITHUB_MISSING_TANPIN_PATH, f"Update missing_tanpin.csv ({len(tanpin_comics)}件) - {today}")
-                            st.session_state.workflow_data['missing_uploaded'] = True
-                            st.info(f"不足リストをアップロードしました（セット品: {len(set_comics)}件, 単品: {len(tanpin_comics)}件）")
+        if st.button("📊 CSV生成・取得", type="primary"):
+            status_area = st.empty()
+            progress_area = st.empty()
 
-                with st.spinner("GitHub Actionsを起動中..."):
-                    result = trigger_github_actions("weekly-comic-lister.yml")
-                if result.get("success"):
-                    st.success("CSV生成を開始しました（2〜3分後に完了）")
-                else:
-                    st.error(f"エラー: {result.get('error')}")
+            # 1. 不足リストが未アップロードなら自動アップロード
+            if not st.session_state.workflow_data.get('missing_uploaded'):
+                check_results = st.session_state.workflow_data.get('check_results', [])
+                missing = [r for r in check_results if r.get('存在') == '❌ なし']
+                if missing:
+                    set_comics = [r['コミックNo'] for r in missing if '_' not in str(r['コミックNo'])]
+                    tanpin_comics = [r['コミックNo'] for r in missing if '_' in str(r['コミックNo'])]
+                    today = datetime.now(JST).strftime('%Y-%m-%d %H:%M')
+                    status_area.info("📤 不足リストをGitHubにアップロード中...")
+                    if set_comics:
+                        content = '\n'.join([str(c) for c in set_comics])
+                        upload_to_github(content, GITHUB_MISSING_CSV_PATH, f"Update missing_comics.csv ({len(set_comics)}件) - {today}")
+                    if tanpin_comics:
+                        content = '\n'.join([str(c) for c in tanpin_comics])
+                        upload_to_github(content, GITHUB_MISSING_TANPIN_PATH, f"Update missing_tanpin.csv ({len(tanpin_comics)}件) - {today}")
+                    st.session_state.workflow_data['missing_uploaded'] = True
 
-        with col2:
-            if st.button("📥 CSVをダウンロード", type="secondary"):
-                with st.spinner("GitHubからファイルを取得中..."):
+            # 2. GitHub Actionsを起動
+            status_area.info("🚀 GitHub Actionsを起動中...")
+            result = trigger_github_actions("weekly-comic-lister.yml")
+            if not result.get("success"):
+                status_area.error(f"エラー: {result.get('error')}")
+            else:
+                # 3. ワークフロー完了をポーリング（最大5分）
+                import time as _time
+                max_wait = 300
+                poll_interval = 15
+                elapsed = 0
+                completed = False
+
+                # トリガー直後は少し待つ（新しいrunが作られるまで）
+                _time.sleep(5)
+                elapsed += 5
+
+                while elapsed < max_wait:
+                    _time.sleep(poll_interval)
+                    elapsed += poll_interval
+                    progress_area.progress(min(elapsed / max_wait, 0.95), text=f"⏳ ワークフロー実行中... ({elapsed}秒経過)")
+
+                    runs = get_workflow_runs("weekly-comic-lister.yml", limit=1)
+                    if not runs:
+                        continue
+                    run = runs[0]
+                    # まだ実行中なら待機を続ける
+                    if run.get("status") in ("queued", "in_progress"):
+                        continue
+                    # 完了した場合
+                    if run.get("conclusion") == "success":
+                        completed = True
+                    break
+
+                progress_area.empty()
+
+                if completed:
+                    # 4. 完了後にCSVを自動ダウンロード
+                    status_area.info("📥 CSVをダウンロード中...")
                     is_result = download_from_github(GITHUB_IS_LIST_PATH)
                     cl_result = download_from_github(GITHUB_COMIC_LIST_PATH)
 
-                if is_result.get("success") and cl_result.get("success"):
-                    is_content = is_result["content"]
-                    if isinstance(is_content, bytes):
-                        is_content = is_content.decode('utf-8', errors='replace')
-                    cl_content = cl_result["content"]
-                    if isinstance(cl_content, bytes):
-                        cl_content = cl_content.decode('utf-8', errors='replace')
-                    st.session_state.workflow_data['is_list'] = is_content
-                    st.session_state.workflow_data['comic_list'] = cl_content
-                    st.success("ファイル取得完了")
+                    if is_result.get("success") and cl_result.get("success"):
+                        is_content = is_result["content"]
+                        if isinstance(is_content, bytes):
+                            is_content = is_content.decode('utf-8', errors='replace')
+                        cl_content = cl_result["content"]
+                        if isinstance(cl_content, bytes):
+                            cl_content = cl_content.decode('utf-8', errors='replace')
+                        st.session_state.workflow_data['is_list'] = is_content
+                        st.session_state.workflow_data['comic_list'] = cl_content
+                        status_area.success("✅ CSV生成・取得が完了しました")
+                    else:
+                        status_area.error("CSVのダウンロードに失敗しました")
+                elif elapsed >= max_wait:
+                    status_area.warning("⏱️ タイムアウト（5分）しました。完了後に再度ボタンを押してください")
                 else:
-                    st.error("ファイル取得に失敗しました")
+                    status_area.error("❌ ワークフローが失敗しました")
 
         # ファイル状態表示
         st.divider()
