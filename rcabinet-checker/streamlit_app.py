@@ -2267,6 +2267,8 @@ if mode == "🔄 画像ワークフロー":
                 elapsed = 0
                 completed = False
 
+                status_area.info("⏳ ワークフロー実行中... 完了まで2〜3分かかります")
+
                 # トリガー直後は少し待つ（新しいrunが作られるまで）
                 _time.sleep(5)
                 elapsed += 5
@@ -2274,7 +2276,10 @@ if mode == "🔄 画像ワークフロー":
                 while elapsed < max_wait:
                     _time.sleep(poll_interval)
                     elapsed += poll_interval
-                    progress_area.progress(min(elapsed / max_wait, 0.95), text=f"⏳ ワークフロー実行中... ({elapsed}秒経過)")
+                    minutes = elapsed // 60
+                    seconds = elapsed % 60
+                    time_str = f"{minutes}分{seconds}秒" if minutes > 0 else f"{seconds}秒"
+                    progress_area.progress(min(elapsed / max_wait, 0.95), text=f"⏳ ワークフロー実行中... ({time_str}経過)")
 
                     runs = get_workflow_runs("weekly-comic-lister.yml", limit=1)
                     if not runs:
@@ -2292,7 +2297,7 @@ if mode == "🔄 画像ワークフロー":
 
                 if completed:
                     # 4. 完了後にCSVを自動ダウンロード
-                    status_area.info("📥 CSVをダウンロード中...")
+                    status_area.info("📥 ワークフロー完了。CSVをダウンロード中...")
                     is_result = download_from_github(GITHUB_IS_LIST_PATH)
                     cl_result = download_from_github(GITHUB_COMIC_LIST_PATH)
 
@@ -2305,7 +2310,8 @@ if mode == "🔄 画像ワークフロー":
                             cl_content = cl_content.decode('utf-8', errors='replace')
                         st.session_state.workflow_data['is_list'] = is_content
                         st.session_state.workflow_data['comic_list'] = cl_content
-                        status_area.success("✅ CSV生成・取得が完了しました")
+                        status_area.success("✅ CSV生成・取得が完了しました。Step ③に進めます")
+                        st.balloons()
                     else:
                         status_area.error("CSVのダウンロードに失敗しました")
                 elif elapsed >= max_wait:
