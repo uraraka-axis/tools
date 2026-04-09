@@ -109,13 +109,20 @@ def get_comic_numbers_from_github():
             log(f"GitHub取得エラー: HTTP {response.status_code}")
             return []
 
-        # CSVをパース（J列=9列目にコミックNo.が入っている）
+        # CSVをパース
         df = pd.read_csv(pd.io.common.StringIO(response.text), header=None)
 
         comic_numbers = []
-        for i in range(len(df)):
-            if len(df.columns) > 9:
-                value = df.iloc[i, 9]  # J列（0始まりで9）
+        if len(df.columns) > 9:
+            # 旧形式: J列=9列目にコミックNo.が入っている
+            for i in range(len(df)):
+                value = df.iloc[i, 9]
+                if pd.notna(value) and str(value).strip():
+                    comic_numbers.append(str(value).strip())
+        else:
+            # 新形式: Streamlitアプリからアップロードされた1列形式
+            for i in range(len(df)):
+                value = df.iloc[i, 0]
                 if pd.notna(value) and str(value).strip():
                     comic_numbers.append(str(value).strip())
 

@@ -1082,17 +1082,9 @@ def process_workflow_images(missing_comics: list, is_list_content: str, comic_li
 
     # missing_comicsでフィルタリング（.0除去で正規化して比較）
     missing_set = set(normalize_jan_code(c) for c in missing_comics if normalize_jan_code(c))
-    # セット品のみ（_なし）でフィルタリング
+    # セット品のみ（_なし）でresult_dataをフィルタリング
     missing_set_only = set(c for c in missing_set if '_' not in c)
-    result_data_keys = set(str(d.get('comic_no', '')).strip() for d in result_data)
     target_data = [d for d in result_data if str(d.get('comic_no', '')).strip() in missing_set_only]
-
-    # デバッグ: マッチしない場合にログ出力
-    if status_text and missing_set_only and not target_data:
-        missing_sample = sorted(list(missing_set_only))[:5]
-        result_sample = sorted(list(result_data_keys))[:5]
-        import streamlit as _st
-        _st.warning(f"⚠️ セット品マッチ0件 - missing例: {missing_sample} / result_data例: {result_sample} / missing_set: {len(missing_set_only)}件 / result_data: {len(result_data)}件")
 
     # 単品（_あり）はis_listから直接JAN検索
     # is_dfから (comic_no, volume) → JAN の辞書を構築
@@ -2244,6 +2236,24 @@ if mode == "🔄 画像ワークフロー":
         col1, col2 = st.columns([1, 1])
         with col1:
             if st.button("📊 CSV生成を開始", type="primary"):
+                # 不足リストが未アップロードなら自動アップロード
+                if not st.session_state.workflow_data.get('missing_uploaded'):
+                    check_results = st.session_state.workflow_data.get('check_results', [])
+                    missing = [r for r in check_results if r.get('存在') == '❌ なし']
+                    if missing:
+                        set_comics = [r['コミックNo'] for r in missing if '_' not in str(r['コミックNo'])]
+                        tanpin_comics = [r['コミックNo'] for r in missing if '_' in str(r['コミックNo'])]
+                        today = datetime.now(JST).strftime('%Y-%m-%d %H:%M')
+                        with st.spinner("不足リストをGitHubにアップロード中..."):
+                            if set_comics:
+                                content = '\n'.join([str(c) for c in set_comics])
+                                upload_to_github(content, GITHUB_MISSING_CSV_PATH, f"Update missing_comics.csv ({len(set_comics)}件) - {today}")
+                            if tanpin_comics:
+                                content = '\n'.join([str(c) for c in tanpin_comics])
+                                upload_to_github(content, GITHUB_MISSING_TANPIN_PATH, f"Update missing_tanpin.csv ({len(tanpin_comics)}件) - {today}")
+                            st.session_state.workflow_data['missing_uploaded'] = True
+                            st.info(f"不足リストをアップロードしました（セット品: {len(set_comics)}件, 単品: {len(tanpin_comics)}件）")
+
                 with st.spinner("GitHub Actionsを起動中..."):
                     result = trigger_github_actions("weekly-comic-lister.yml")
                 if result.get("success"):
