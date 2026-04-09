@@ -1080,8 +1080,8 @@ def process_workflow_images(missing_comics: list, is_list_content: str, comic_li
     merged_df = merge_csv_data(is_df, cl_df)
     result_data = extract_first_volumes(merged_df)
 
-    # missing_comicsでフィルタリング
-    missing_set = set(str(c).strip() for c in missing_comics)
+    # missing_comicsでフィルタリング（.0除去で正規化して比較）
+    missing_set = set(normalize_jan_code(c) for c in missing_comics if normalize_jan_code(c))
     target_data = [d for d in result_data if str(d.get('comic_no', '')).strip() in missing_set]
 
     # 単品（_あり）はis_listから直接JAN検索
@@ -2033,7 +2033,7 @@ if mode == "🔄 画像ワークフロー":
                 st.dataframe(df.head(5), use_container_width=True)
                 col = st.selectbox("コミックNo列", df.columns.tolist())
                 if col:
-                    comic_numbers = df[col].dropna().astype(str).tolist()
+                    comic_numbers = [normalize_jan_code(v) for v in df[col].dropna().tolist() if normalize_jan_code(v)]
                     st.info(f"読み込み: {len(comic_numbers)}件")
 
         col1, col2 = st.columns([1, 1])
@@ -2306,7 +2306,7 @@ if mode == "🔄 画像ワークフロー":
         missing_comics = []
         if 'check_results' in st.session_state.workflow_data:
             missing = [r for r in st.session_state.workflow_data['check_results'] if r['存在'] == '❌ なし']
-            missing_comics = [str(r['コミックNo']) for r in missing]
+            missing_comics = [normalize_jan_code(r['コミックNo']) for r in missing]
         elif st.session_state.workflow_data.get('missing_from_github'):
             missing_comics = st.session_state.workflow_data['missing_from_github']
 
