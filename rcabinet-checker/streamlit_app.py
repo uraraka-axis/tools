@@ -1082,7 +1082,17 @@ def process_workflow_images(missing_comics: list, is_list_content: str, comic_li
 
     # missing_comicsでフィルタリング（.0除去で正規化して比較）
     missing_set = set(normalize_jan_code(c) for c in missing_comics if normalize_jan_code(c))
-    target_data = [d for d in result_data if str(d.get('comic_no', '')).strip() in missing_set]
+    # セット品のみ（_なし）でフィルタリング
+    missing_set_only = set(c for c in missing_set if '_' not in c)
+    result_data_keys = set(str(d.get('comic_no', '')).strip() for d in result_data)
+    target_data = [d for d in result_data if str(d.get('comic_no', '')).strip() in missing_set_only]
+
+    # デバッグ: マッチしない場合にログ出力
+    if status_text and missing_set_only and not target_data:
+        missing_sample = sorted(list(missing_set_only))[:5]
+        result_sample = sorted(list(result_data_keys))[:5]
+        import streamlit as _st
+        _st.warning(f"⚠️ セット品マッチ0件 - missing例: {missing_sample} / result_data例: {result_sample} / missing_set: {len(missing_set_only)}件 / result_data: {len(result_data)}件")
 
     # 単品（_あり）はis_listから直接JAN検索
     # is_dfから (comic_no, volume) → JAN の辞書を構築
