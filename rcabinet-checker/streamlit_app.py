@@ -2071,12 +2071,20 @@ if mode == "🔄 画像ワークフロー":
             missing = [r for r in results if r['存在'] == '❌ なし']
 
             # 存在あり画像のダウンロード
-            if exists_items_no_rec:
-                with st.expander(f"📦 存在あり画像をダウンロード（{len(exists_items_no_rec)}件、REC除外）"):
+            if exists_items:
+                rec_count = len(exists_items) - len(exists_items_no_rec)
+                if exists_items_no_rec:
+                    expander_label = f"📦 存在あり画像をダウンロード（{len(exists_items_no_rec)}件、REC {rec_count}件除外）"
+                else:
+                    expander_label = f"📦 存在あり画像（{len(exists_items)}件すべてRECフォルダ）"
+                with st.expander(expander_label):
                     if 'wf_rcab_dl_result' not in st.session_state:
                         st.session_state.wf_rcab_dl_result = None
 
-                    if st.button("🖼️ R-Cabinetから画像を取得", type="primary", key="wf_rcab_dl_btn"):
+                    if not exists_items_no_rec:
+                        st.info("REC除外後の対象が0件のためダウンロードできません")
+
+                    if st.button("🖼️ R-Cabinetから画像を取得", type="primary", key="wf_rcab_dl_btn", disabled=not exists_items_no_rec):
                         _zipfile = get_zipfile()
                         progress = st.progress(0)
                         status = st.empty()
