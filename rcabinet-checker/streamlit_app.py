@@ -2033,59 +2033,63 @@ if mode == "🔄 画像ワークフロー":
 
         if input_method == "出品シートExcel":
             st.info(
-                "**必要なシートと列**\n\n"
-                "- セット品シート → A列: 商品コード ／ D列: コミックNo\n"
-                "- 単品シート → A列: 商品コード ／ E列: コミックNo\n\n"
-                "ヤフー出品シートをそのままアップロードできます。Step④のヤフーマッピングにも自動連携されます。"
+                "**出品シートExcelをアップロード（複数可）**\n\n"
+                "- セット品 → A列: 商品コード ／ D列: コミックNo\n"
+                "- 単品 → A列: 商品コード ／ E列: コミックNo\n\n"
+                "各ファイルの **Sheet1** が読み込まれます。Step④のヤフーマッピングにも自動連携されます。"
             )
-            excel_file = st.file_uploader("出品シートExcel", type=['xlsx', 'xls'], key="step1_excel")
-            if excel_file:
-                try:
-                    xls = pd.ExcelFile(excel_file)
-                    sheet_names = xls.sheet_names
-                    st.caption(f"シート: {', '.join(sheet_names)}")
+            excel_files = st.file_uploader("出品シートExcel", type=['xlsx', 'xls'], key="step1_excel", accept_multiple_files=True)
 
-                    col_sh1, col_sh2 = st.columns(2)
-                    with col_sh1:
-                        set_sheet = st.selectbox("セット品シート", sheet_names, key="step1_set_sheet")
-                    with col_sh2:
-                        tanpin_idx = min(1, len(sheet_names) - 1)
-                        tanpin_sheet = st.selectbox("単品シート", sheet_names, index=tanpin_idx, key="step1_tanpin_sheet")
+            if excel_files:
+                set_comics = []
+                tanpin_comics = []
+                yahoo_files_data = []  # ヤフー連携用
 
-                    excel_set_df = pd.read_excel(excel_file, sheet_name=set_sheet, header=None)
-                    excel_file.seek(0)
-                    excel_tanpin_df = pd.read_excel(excel_file, sheet_name=tanpin_sheet, header=None)
+                for idx, excel_file in enumerate(excel_files):
+                    file_type = st.radio(
+                        f"📄 {excel_file.name}",
+                        ["セット品", "単品"],
+                        horizontal=True,
+                        key=f"step1_ftype_{idx}"
+                    )
 
-                    # コミックNo抽出（セット: D列, 単品: E列）
-                    set_comics = []
-                    for i in range(len(excel_set_df)):
-                        try:
-                            cno = str(excel_set_df.iloc[i, 3]).strip().replace('.0', '')
-                            if cno and cno != 'nan':
-                                set_comics.append(cno)
-                        except:
-                            continue
+                    try:
+                        df = pd.read_excel(excel_file, sheet_name=0, header=None)
+                        excel_file.seek(0)
+                        file_bytes = excel_file.read()
 
-                    tanpin_comics = []
-                    for i in range(len(excel_tanpin_df)):
-                        try:
-                            cno = str(excel_tanpin_df.iloc[i, 4]).strip().replace('.0', '')
-                            if cno and cno != 'nan':
-                                tanpin_comics.append(cno)
-                        except:
-                            continue
+                        if file_type == "セット品":
+                            col_idx = 3  # D列
+                            for i in range(len(df)):
+                                try:
+                                    cno = str(df.iloc[i, col_idx]).strip().replace('.0', '')
+                                    if cno and cno != 'nan':
+                                        set_comics.append(cno)
+                                except:
+                                    continue
+                            yahoo_files_data.append({'bytes': file_bytes, 'type': 'set'})
+                        else:
+                            col_idx = 4  # E列
+                            for i in range(len(df)):
+                                try:
+                                    cno = str(df.iloc[i, col_idx]).strip().replace('.0', '')
+                                    if cno and cno != 'nan':
+                                        tanpin_comics.append(cno)
+                                except:
+                                    continue
+                            yahoo_files_data.append({'bytes': file_bytes, 'type': 'tanpin'})
 
-                    comic_numbers = list(set(set_comics + tanpin_comics))
-                    st.info(f"抽出: {len(comic_numbers)}件（セット: {len(set_comics)}件, 単品: {len(tanpin_comics)}件）")
+                        st.caption(f"→ {len(df)}行 / コミックNo抽出済み")
 
-                    # ヤフーマッピング用にセッションに保存
-                    excel_file.seek(0)
-                    st.session_state.workflow_data['yahoo_excel_bytes'] = excel_file.read()
-                    st.session_state.workflow_data['yahoo_set_sheet'] = set_sheet
-                    st.session_state.workflow_data['yahoo_tanpin_sheet'] = tanpin_sheet
+                    except Exception as e:
+                        st.error(f"{excel_file.name} 読み込みエラー: {e}")
 
-                except Exception as e:
-                    st.error(f"Excel読み込みエラー: {e}")
+                comic_numbers = list(set(set_comics + tanpin_comics))
+                if comic_numbers:
+                    st.info(f"合計: {len(comic_numbers)}件（セット: {len(set_comics)}件, 単品: {len(tanpin_comics)}件）")
+
+                # ヤフーマッピング用にセッションに保存
+                st.session_state.workflow_data['yahoo_excel_files'] = yahoo_files_data
         else:
             # テキスト入力
             text_input = st.text_area(
@@ -2715,42 +2719,60 @@ if mode == "🔄 画像ワークフロー":
                 excel_tanpin_df = None
 
                 # Step ①で出品シートExcelが読み込み済みか確認
-                yahoo_from_step1 = st.session_state.workflow_data.get('yahoo_excel_bytes')
+                yahoo_from_step1 = st.session_state.workflow_data.get('yahoo_excel_files')
 
                 if yahoo_from_step1:
-                    st.success("Step ①で出品シートExcelを読み込み済み")
+                    st.success(f"Step ①で出品シートExcel {len(yahoo_from_step1)}件 を読み込み済み")
                     try:
-                        set_sheet = st.session_state.workflow_data['yahoo_set_sheet']
-                        tanpin_sheet = st.session_state.workflow_data['yahoo_tanpin_sheet']
-                        excel_set_df = pd.read_excel(BytesIO(yahoo_from_step1), sheet_name=set_sheet, header=None)
-                        excel_tanpin_df = pd.read_excel(BytesIO(yahoo_from_step1), sheet_name=tanpin_sheet, header=None)
-                        st.caption(f"セット品シート: {set_sheet} / 単品シート: {tanpin_sheet}")
+                        set_dfs = []
+                        tanpin_dfs = []
+                        for fd in yahoo_from_step1:
+                            df = pd.read_excel(BytesIO(fd['bytes']), sheet_name=0, header=None)
+                            if fd['type'] == 'set':
+                                set_dfs.append(df)
+                            else:
+                                tanpin_dfs.append(df)
+                        if set_dfs:
+                            excel_set_df = pd.concat(set_dfs, ignore_index=True)
+                        if tanpin_dfs:
+                            excel_tanpin_df = pd.concat(tanpin_dfs, ignore_index=True)
+                        st.caption(f"セット品: {len(set_dfs)}ファイル / 単品: {len(tanpin_dfs)}ファイル")
                     except Exception as e:
                         st.error(f"Excel読み込みエラー: {e}")
                         yahoo_from_step1 = None
 
                 if not yahoo_from_step1:
-                    st.caption("セット品シート: A列=商品コード, D列=コミックNo / 単品シート: A列=商品コード, E列=コミックNo")
-                    yahoo_excel = st.file_uploader("Excelファイル", type=['xlsx', 'xls'], key="yahoo_excel")
+                    st.info(
+                        "**出品シートExcelをアップロード（複数可）**\n\n"
+                        "- セット品 → A列: 商品コード ／ D列: コミックNo\n"
+                        "- 単品 → A列: 商品コード ／ E列: コミックNo\n\n"
+                        "各ファイルの **Sheet1** が読み込まれます。"
+                    )
+                    yahoo_excels = st.file_uploader("Excelファイル", type=['xlsx', 'xls'], key="yahoo_excel", accept_multiple_files=True)
 
-                    if yahoo_excel:
-                        try:
-                            xls = pd.ExcelFile(yahoo_excel)
-                            sheet_names = xls.sheet_names
-                            st.caption(f"シート: {', '.join(sheet_names)}")
+                    if yahoo_excels:
+                        set_dfs = []
+                        tanpin_dfs = []
+                        for idx, yf in enumerate(yahoo_excels):
+                            file_type = st.radio(
+                                f"📄 {yf.name}",
+                                ["セット品", "単品"],
+                                horizontal=True,
+                                key=f"yahoo_ftype_{idx}"
+                            )
+                            try:
+                                df = pd.read_excel(yf, sheet_name=0, header=None)
+                                if file_type == "セット品":
+                                    set_dfs.append(df)
+                                else:
+                                    tanpin_dfs.append(df)
+                            except Exception as e:
+                                st.error(f"{yf.name} 読み込みエラー: {e}")
 
-                            col_sh1, col_sh2 = st.columns(2)
-                            with col_sh1:
-                                set_sheet = st.selectbox("セット品シート", sheet_names, key="yahoo_set_sheet")
-                            with col_sh2:
-                                tanpin_idx = min(1, len(sheet_names) - 1)
-                                tanpin_sheet = st.selectbox("単品シート", sheet_names, index=tanpin_idx, key="yahoo_tanpin_sheet")
-
-                            excel_set_df = pd.read_excel(yahoo_excel, sheet_name=set_sheet, header=None)
-                            yahoo_excel.seek(0)
-                            excel_tanpin_df = pd.read_excel(yahoo_excel, sheet_name=tanpin_sheet, header=None)
-                        except Exception as e:
-                            st.error(f"Excel読み込みエラー: {e}")
+                        if set_dfs:
+                            excel_set_df = pd.concat(set_dfs, ignore_index=True)
+                        if tanpin_dfs:
+                            excel_tanpin_df = pd.concat(tanpin_dfs, ignore_index=True)
 
                 # プレビュー（どちらの読み込み方法でも共通）
                 if excel_set_df is not None:
