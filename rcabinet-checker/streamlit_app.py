@@ -2949,15 +2949,17 @@ if mode == "🔄 画像ワークフロー":
                         ws.append(headers)
                         for idx, row in enumerate(mapping_rows, 1):
                             ws.append([idx, row['コミックNo'], row['メインフォルダ'], row['サブフォルダ'], row['ファイル名'], row['ZIPパス']])
-                        # フォント適用・列幅調整
+                        # フォント適用・列幅調整（全角文字は幅2として計算）
+                        def calc_display_width(text):
+                            return sum(2 if ord(c) > 0x7F else 1 for c in str(text))
+
                         for col_idx, header in enumerate(headers, 1):
-                            max_len = len(header)
+                            max_w = calc_display_width(header)
                             for r in range(1, ws.max_row + 1):
                                 cell = ws.cell(row=r, column=col_idx)
                                 cell.font = font
-                                val = str(cell.value or '')
-                                max_len = max(max_len, len(val))
-                            ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = min(max_len + 2, 40)
+                                max_w = max(max_w, calc_display_width(cell.value or ''))
+                            ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = min(max_w + 2, 80)
                         xlsx_buffer = BytesIO()
                         wb.save(xlsx_buffer)
                         zf.writestr("振り分け一覧.xlsx", xlsx_buffer.getvalue())
