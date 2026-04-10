@@ -205,6 +205,13 @@ class ComicISBNSearchAutomation:
 
         self.driver = webdriver.Chrome(options=chrome_options)
         self.driver.implicitly_wait(10)
+
+        # ヘッドレスモードでのダウンロードを明示的に許可
+        self.driver.execute_cdp_cmd("Page.setDownloadBehavior", {
+            "behavior": "allow",
+            "downloadPath": str(self.download_folder)
+        })
+
         log("Chromeドライバー起動成功（ヘッドレスモード）")
         return self.driver
 
@@ -285,45 +292,57 @@ class ComicISBNSearchAutomation:
             time.sleep(10)
             log(f"検索後のURL: {self.driver.current_url}")
 
-            # 結果ファイルのダウンロードリンクを探してクリック
+            # 結果ファイルのダウンロードリンクを探す
             log("結果ファイルのダウンロードリンクを探索中...")
+            download_url = None
             try:
                 download_link = self.driver.find_element(By.XPATH, "//a[contains(@href, 'cn_search_dlf.asp') and contains(text(), '結果ファイル')]")
                 download_url = download_link.get_attribute("href")
                 log(f"結果ファイルリンクを発見: {download_url}")
-
-                download_link.click()
-                log("結果ファイルリンクをクリックしました")
-
             except Exception as e:
                 log(f"結果ファイルリンクが見つかりません: {e}")
-
                 # フォールバック: cn_search_dlf.aspを含むリンクを探す
                 try:
                     all_links = self.driver.find_elements(By.TAG_NAME, "a")
                     for link in all_links:
                         href = link.get_attribute("href") or ""
                         if "cn_search_dlf.asp" in href and "is_list.csv" in href:
-                            log(f"フォールバックでダウンロードリンクを発見: {href}")
-                            link.click()
-                            log("ダウンロードリンクをクリックしました")
+                            download_url = href
+                            log(f"フォールバックでダウンロードリンクを発見: {download_url}")
                             break
-                    else:
-                        log("ダウンロードリンクが見つかりませんでした")
-                        return None
-
                 except Exception as e2:
                     log(f"フォールバック処理でもエラー: {e2}")
+
+            if not download_url:
+                log("ダウンロードリンクが見つかりませんでした")
+                return None
+
+            # requestsで直接ダウンロード（Seleniumのファイルダウンロードに依存しない）
+            log("requestsで結果ファイルを直接ダウンロード中...")
+            try:
+                # セッションCookieをSeleniumから取得してrequestsに渡す
+                session = requests.Session()
+                for cookie in self.driver.get_cookies():
+                    session.cookies.set(cookie['name'], cookie['value'])
+
+                # Basic認証付きでダウンロード
+                dl_response = session.get(
+                    download_url,
+                    auth=(self.username, self.password),
+                    timeout=60
+                )
+
+                if dl_response.status_code == 200 and len(dl_response.content) > 0:
+                    output_path = self.download_folder / "is_list.csv"
+                    with open(output_path, 'wb') as f:
+                        f.write(dl_response.content)
+                    log(f"ダウンロード成功: {output_path} ({len(dl_response.content)} bytes)")
+                    return output_path
+                else:
+                    log(f"ダウンロード失敗: HTTP {dl_response.status_code}, size={len(dl_response.content)}")
                     return None
-
-            # CSVダウンロード完了を待機
-            downloaded_file = self.wait_for_download_complete(timeout=120)
-
-            if downloaded_file:
-                log(f"ダウンロード成功: {downloaded_file}")
-                return downloaded_file
-            else:
-                log("CSVダウンロードに失敗しました")
+            except Exception as e:
+                log(f"requestsダウンロードエラー: {e}")
                 return None
 
         except Exception as e:
