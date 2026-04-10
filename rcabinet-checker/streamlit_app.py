@@ -1389,6 +1389,7 @@ def prepare_rakuten_queue(images: list, hierarchy_df, folders: list) -> dict:
 
         # sub_folderをフォルダ名として使用
         matched_folder = None
+        matched_main_folder = None
         matched_folder_id = None
 
         # result_dataにgenre/publisher情報がある場合はマッチング
@@ -1400,9 +1401,11 @@ def prepare_rakuten_queue(images: list, hierarchy_df, folders: list) -> dict:
             if genre == h['genre'] and publisher == h['publisher']:
                 if series and h['series'] and series == h['series']:
                     matched_folder = h['sub_folder'] or h['main_folder']
+                    matched_main_folder = h['main_folder']
                     break
                 elif not h['series']:
                     matched_folder = h['sub_folder'] or h['main_folder']
+                    matched_main_folder = h['main_folder']
                     break
 
         if matched_folder and matched_folder in folder_map:
@@ -1411,10 +1414,11 @@ def prepare_rakuten_queue(images: list, hierarchy_df, folders: list) -> dict:
                 'file_bytes': img['image_data'],
                 'folder_id': matched_folder_id,
                 'folder_name': matched_folder,
+                'main_folder': matched_main_folder,
                 'file_name': file_name,
                 'comic_no': comic_no
             })
-            logs.append(f"✅ {comic_no} → {matched_folder} (ID: {matched_folder_id})")
+            logs.append(f"✅ {comic_no} → {matched_main_folder}/{matched_folder} (ID: {matched_folder_id})")
         else:
             unmapped.append(comic_no)
             if matched_folder:
@@ -2849,7 +2853,7 @@ if mode == "🔄 画像ワークフロー":
 
                     if result['queue']:
                         queue_df = pd.DataFrame([
-                            {'コミックNo': q['comic_no'], 'フォルダ': q['folder_name'], 'FolderId': q['folder_id']}
+                            {'コミックNo': q['comic_no'], 'メインフォルダ': q.get('main_folder', ''), 'サブフォルダ': q['folder_name'], 'FolderId': q['folder_id']}
                             for q in result['queue']
                         ])
                         st.dataframe(queue_df, use_container_width=True, height=200)
@@ -2890,17 +2894,80 @@ if mode == "🔄 画像ワークフロー":
         </div>
         """, unsafe_allow_html=True)
 
-        st.info("🚧 この機能は現在実装中です。Yahoo認証の設定が必要です。")
+        tab_manual, tab_api = st.tabs(["📁 手動アップロード", "🤖 APIアップロード"])
 
-        tab1, tab2 = st.tabs(["🛒 ヤフー", "🏪 楽天"])
+        with tab_manual:
+            st.markdown("### 手動アップロード用ZIP")
+            st.caption("フォルダ構成どおりに画像を振り分けたZIPをダウンロードし、R-Cabinetに手動でアップロードします。")
 
-        with tab1:
-            st.markdown("### ヤフーショッピング")
-            st.warning("Yahoo認証トークンが未設定です。設定後にアップロードが可能になります。")
+            rakuten_queue = st.session_state.workflow_data.get('rakuten_queue')
+            yahoo_zips = st.session_state.workflow_data.get('yahoo_zips')
 
-        with tab2:
-            st.markdown("### 楽天")
-            st.success("楽天API認証は設定済みです。")
+            # 楽天ZIP生成
+            st.markdown("#### 楽天（R-Cabinet）")
+            if rakuten_queue and rakuten_queue.get('queue'):
+                queue = rakuten_queue['queue']
+                st.info(f"対象: {len(queue)}件（{len(rakuten_queue.get('unmapped', []))}件未マッチ）")
+
+                if st.button("📦 楽天用ZIP生成", type="primary", key="rakuten_manual_zip"):
+                    import zipfile
+                    zip_buffer = BytesIO()
+                    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                        for q in queue:
+                            main_folder = q.get('main_folder', 'その他')
+                            sub_folder = q.get('folder_name', '')
+                            file_name = q['file_name']
+                            if sub_folder:
+                                zip_path = f"{main_folder}/{sub_folder}/{file_name}"
+                            else:
+                                zip_path = f"{main_folder}/{file_name}"
+                            zf.writestr(zip_path, q['file_bytes'])
+
+                    st.session_state.workflow_data['rakuten_manual_zip'] = zip_buffer.getvalue()
+                    st.rerun()
+
+                if st.session_state.workflow_data.get('rakuten_manual_zip'):
+                    zip_data = st.session_state.workflow_data['rakuten_manual_zip']
+                    size_mb = len(zip_data) / (1024 * 1024)
+                    st.download_button(
+                        label=f"📥 rakuten_upload.zip ({size_mb:.1f}MB)",
+                        data=zip_data,
+                        file_name="rakuten_upload.zip",
+                        mime="application/zip",
+                        key="rakuten_manual_zip_dl"
+                    )
+            else:
+                st.warning("Step ④でアップロードキューを生成してください。")
+
+            # ヤフーZIP
+            st.divider()
+            st.markdown("#### ヤフー")
+            if yahoo_zips and yahoo_zips.get('zips'):
+                zips = yahoo_zips['zips']
+                st.info(f"マッピング成功: {yahoo_zips['mapped']}件 / ZIP数: {len(zips)}")
+                for i, zip_data in enumerate(zips):
+                    size_mb = len(zip_data) / (1024 * 1024)
+                    st.download_button(
+                        label=f"📥 yahoo_upload_{i+1:03d}.zip ({size_mb:.1f}MB)",
+                        data=zip_data,
+                        file_name=f"yahoo_upload_{i+1:03d}.zip",
+                        mime="application/zip",
+                        key=f"yahoo_manual_zip_dl_{i}"
+                    )
+            else:
+                st.warning("Step ④でヤフー用ZIPを生成してください。")
+
+        with tab_api:
+            st.markdown("### APIアップロード")
+            st.info("🚧 この機能は現在実装中です。")
+
+            tab_api_yahoo, tab_api_rakuten = st.tabs(["🛒 ヤフー", "🏪 楽天"])
+
+            with tab_api_yahoo:
+                st.warning("Yahoo認証トークンが未設定です。設定後にアップロードが可能になります。")
+
+            with tab_api_rakuten:
+                st.success("楽天API認証は設定済みです。実装予定。")
 
         st.divider()
         col1, col2 = st.columns([1, 1])
