@@ -1016,17 +1016,24 @@ def download_image(image_url, session):
 
 
 def resize_to_square(image_data: bytes, size: int = 600):
-    """画像を正方形にリサイズ（アスペクト比維持、白背景パディング）"""
+    """画像を正方形にリサイズ（アスペクト比維持、白背景パディング、表紙を大きく表示）"""
     Image = get_pil()
     img = Image.open(BytesIO(image_data)).convert("RGB")
 
-    # アスペクト比を維持してリサイズ
-    img.thumbnail((size, size), Image.LANCZOS)
+    # バッジ領域を考慮した表示領域（右側にバッジがあるため左寄せ）
+    display_w = int(size * 0.75)  # 横は75%まで使用
+    display_h = int(size * 0.90)  # 縦は90%まで使用
 
-    # 白背景の正方形キャンバスに中央配置
+    # アスペクト比を維持して表示領域にフィット（拡大も許可）
+    ratio = min(display_w / img.width, display_h / img.height)
+    new_w = int(img.width * ratio)
+    new_h = int(img.height * ratio)
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+
+    # 白背景の正方形キャンバスに左寄せ・上下中央配置
     canvas = Image.new("RGB", (size, size), (255, 255, 255))
-    x = (size - img.width) // 2
-    y = (size - img.height) // 2
+    x = (display_w - new_w) // 2 + int(size * 0.02)  # 左寄せ（少し余白）
+    y = (size - new_h) // 2
     canvas.paste(img, (x, y))
 
     return canvas
