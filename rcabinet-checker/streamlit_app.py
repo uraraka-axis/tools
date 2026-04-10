@@ -2025,37 +2025,23 @@ if mode == "🔄 画像ワークフロー":
         # 入力方法の選択
         input_method = st.radio(
             "入力方法",
-            ["テキスト入力", "CSVアップロード", "出品シートExcel"],
+            ["出品シートExcel", "テキスト入力"],
             horizontal=True
         )
 
         comic_numbers = []
 
-        if input_method == "テキスト入力":
-            text_input = st.text_area(
-                "コミックNo（改行区切り）",
-                height=150,
-                placeholder="123456\n234567\n19763_003"
-            )
-            if text_input:
-                comic_numbers = [line.strip() for line in text_input.split('\n') if line.strip()]
-                st.info(f"入力: {len(comic_numbers)}件")
-        elif input_method == "CSVアップロード":
-            uploaded = st.file_uploader("CSVファイル", type=['csv'])
-            if uploaded:
-                try:
-                    df = pd.read_csv(uploaded, encoding='utf-8')
-                except:
-                    df = pd.read_csv(uploaded, encoding='cp932')
-
-                st.dataframe(df.head(5), use_container_width=True)
-                col = st.selectbox("コミックNo列", df.columns.tolist())
-                if col:
-                    comic_numbers = [normalize_jan_code(v) for v in df[col].dropna().tolist() if normalize_jan_code(v)]
-                    st.info(f"読み込み: {len(comic_numbers)}件")
-        else:
-            # 出品シートExcel
-            st.caption("セット品シート: A列=商品コード, D列=コミックNo / 単品シート: A列=商品コード, E列=コミックNo")
+        if input_method == "出品シートExcel":
+            st.markdown("""
+            <div style="background-color: #f0f2f6; padding: 12px 16px; border-radius: 8px; margin-bottom: 12px; font-size: 13px;">
+                <b>📋 必要なシートと列</b><br>
+                <table style="margin-top: 6px; border-collapse: collapse; width: 100%;">
+                    <tr><td style="padding: 2px 8px;">セット品シート</td><td style="padding: 2px 8px;">A列: 商品コード ／ D列: コミックNo</td></tr>
+                    <tr><td style="padding: 2px 8px;">単品シート</td><td style="padding: 2px 8px;">A列: 商品コード ／ E列: コミックNo</td></tr>
+                </table>
+                <div style="margin-top: 6px; color: #666;">※ ヤフー出品シートをそのままアップロードできます。Step④のヤフーマッピングにも自動連携されます。</div>
+            </div>
+            """, unsafe_allow_html=True)
             excel_file = st.file_uploader("出品シートExcel", type=['xlsx', 'xls'], key="step1_excel")
             if excel_file:
                 try:
@@ -2104,6 +2090,16 @@ if mode == "🔄 画像ワークフロー":
 
                 except Exception as e:
                     st.error(f"Excel読み込みエラー: {e}")
+        else:
+            # テキスト入力
+            text_input = st.text_area(
+                "コミックNo（改行区切り）",
+                height=150,
+                placeholder="123456\n234567\n19763_003"
+            )
+            if text_input:
+                comic_numbers = [line.strip() for line in text_input.split('\n') if line.strip()]
+                st.info(f"入力: {len(comic_numbers)}件")
 
         col1, col2 = st.columns([1, 1])
         with col1:
