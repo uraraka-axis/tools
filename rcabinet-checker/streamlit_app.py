@@ -2916,7 +2916,9 @@ if mode == "🔄 画像ワークフロー":
 
                 if st.button("📦 楽天用ZIP生成", type="primary", key="rakuten_manual_zip"):
                     import zipfile
+                    import openpyxl
                     zip_buffer = BytesIO()
+                    mapping_rows = []
                     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
                         for q in queue:
                             main_folder = q.get('main_folder', '')
@@ -2930,6 +2932,32 @@ if mode == "🔄 画像ワークフロー":
                             else:
                                 zip_path = f"{sub_folder}/{file_name}"
                             zf.writestr(zip_path, q['file_bytes'])
+                            mapping_rows.append({
+                                'コミックNo': q['comic_no'],
+                                'メインフォルダ': main_folder,
+                                'サブフォルダ': sub_folder if sub_folder != main_folder else '',
+                                'ファイル名': file_name,
+                                'ZIPパス': zip_path
+                            })
+
+                        # マッピング一覧Excelを生成してZIP直下に配置
+                        wb = openpyxl.Workbook()
+                        ws = wb.active
+                        ws.title = "振り分け一覧"
+                        headers = ['コミックNo', 'メインフォルダ', 'サブフォルダ', 'ファイル名', 'ZIPパス']
+                        ws.append(headers)
+                        for row in mapping_rows:
+                            ws.append([row[h] for h in headers])
+                        # 列幅調整
+                        for col_idx, header in enumerate(headers, 1):
+                            max_len = len(header)
+                            for row in mapping_rows:
+                                val = str(row[header])
+                                max_len = max(max_len, len(val))
+                            ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = min(max_len + 2, 40)
+                        xlsx_buffer = BytesIO()
+                        wb.save(xlsx_buffer)
+                        zf.writestr("振り分け一覧.xlsx", xlsx_buffer.getvalue())
 
                     st.session_state.workflow_data['rakuten_manual_zip'] = zip_buffer.getvalue()
                     st.rerun()
