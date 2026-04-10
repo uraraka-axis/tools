@@ -2032,16 +2032,12 @@ if mode == "🔄 画像ワークフロー":
         comic_numbers = []
 
         if input_method == "出品シートExcel":
-            st.markdown("""
-            <div style="background-color: #f0f2f6; padding: 12px 16px; border-radius: 8px; margin-bottom: 12px; font-size: 13px;">
-                <b>📋 必要なシートと列</b><br>
-                <table style="margin-top: 6px; border-collapse: collapse; width: 100%;">
-                    <tr><td style="padding: 2px 8px;">セット品シート</td><td style="padding: 2px 8px;">A列: 商品コード ／ D列: コミックNo</td></tr>
-                    <tr><td style="padding: 2px 8px;">単品シート</td><td style="padding: 2px 8px;">A列: 商品コード ／ E列: コミックNo</td></tr>
-                </table>
-                <div style="margin-top: 6px; color: #666;">※ ヤフー出品シートをそのままアップロードできます。Step④のヤフーマッピングにも自動連携されます。</div>
-            </div>
-            """, unsafe_allow_html=True)
+            st.info(
+                "**必要なシートと列**\n\n"
+                "- セット品シート → A列: 商品コード ／ D列: コミックNo\n"
+                "- 単品シート → A列: 商品コード ／ E列: コミックNo\n\n"
+                "ヤフー出品シートをそのままアップロードできます。Step④のヤフーマッピングにも自動連携されます。"
+            )
             excel_file = st.file_uploader("出品シートExcel", type=['xlsx', 'xls'], key="step1_excel")
             if excel_file:
                 try:
