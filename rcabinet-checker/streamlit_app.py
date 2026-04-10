@@ -2063,7 +2063,7 @@ if mode == "🔄 画像ワークフロー":
                             for i in range(len(df)):
                                 try:
                                     cno = str(df.iloc[i, col_idx]).strip().replace('.0', '')
-                                    if cno and cno != 'nan':
+                                    if cno and cno != 'nan' and cno.isdigit():
                                         set_comics.append(cno)
                                 except:
                                     continue
@@ -2073,7 +2073,7 @@ if mode == "🔄 画像ワークフロー":
                             for i in range(len(df)):
                                 try:
                                     cno = str(df.iloc[i, col_idx]).strip().replace('.0', '')
-                                    if cno and cno != 'nan':
+                                    if cno and cno != 'nan' and cno.isdigit():
                                         tanpin_comics.append(cno)
                                 except:
                                     continue
@@ -2782,7 +2782,7 @@ if mode == "🔄 画像ワークフロー":
                             try:
                                 code = str(excel_set_df.iloc[i, 0]).strip()
                                 cno = str(excel_set_df.iloc[i, 3]).strip().replace('.0', '')
-                                if code != 'nan' and cno != 'nan' and code and cno:
+                                if code != 'nan' and cno != 'nan' and code and cno and cno.isdigit():
                                     matched = any(str(img['comic_no']) == cno for img in images)
                                     set_mappings.append({'商品コード': code, 'コミックNo': cno, '対象画像': '✅' if matched else '❌'})
                             except:
@@ -2794,7 +2794,7 @@ if mode == "🔄 画像ワークフロー":
                                 try:
                                     code = str(excel_tanpin_df.iloc[i, 0]).strip()
                                     cno = str(excel_tanpin_df.iloc[i, 4]).strip().replace('.0', '')
-                                    if code != 'nan' and cno != 'nan' and code and cno:
+                                    if code != 'nan' and cno != 'nan' and code and cno and cno.isdigit():
                                         matched = any(str(img['comic_no']) == cno for img in images)
                                         tanpin_mappings.append({'商品コード': code, 'コミックNo': cno, '対象画像': '✅' if matched else '❌'})
                                 except:
