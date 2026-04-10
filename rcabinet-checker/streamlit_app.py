@@ -1397,16 +1397,21 @@ def prepare_rakuten_queue(images: list, hierarchy_df, folders: list) -> dict:
         publisher = img.get('publisher', '')
         series = img.get('series', '')
 
-        for h in hierarchy_list:
-            if genre == h['genre'] and publisher == h['publisher']:
-                if series and h['series'] and series == h['series']:
-                    matched_folder = h['sub_folder'] or h['main_folder']
-                    matched_main_folder = h['main_folder']
-                    break
-                elif not h['series']:
-                    matched_folder = h['sub_folder'] or h['main_folder']
-                    matched_main_folder = h['main_folder']
-                    break
+        # 画像データに既にmain_folder/sub_folderが付与済みの場合はそちらを優先
+        if img.get('main_folder') and img.get('sub_folder'):
+            matched_main_folder = img['main_folder']
+            matched_folder = img['sub_folder'] or img['main_folder']
+        else:
+            for h in hierarchy_list:
+                if genre == h['genre'] and publisher == h['publisher']:
+                    if series and h['series'] and series == h['series']:
+                        matched_folder = h['sub_folder'] or h['main_folder']
+                        matched_main_folder = h['main_folder']
+                        break
+                    elif not h['series']:
+                        matched_folder = h['sub_folder'] or h['main_folder']
+                        matched_main_folder = h['main_folder']
+                        break
 
         if matched_folder and matched_folder in folder_map:
             matched_folder_id = folder_map[matched_folder]
@@ -2914,13 +2919,16 @@ if mode == "🔄 画像ワークフロー":
                     zip_buffer = BytesIO()
                     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
                         for q in queue:
-                            main_folder = q.get('main_folder', 'その他')
+                            main_folder = q.get('main_folder', '')
                             sub_folder = q.get('folder_name', '')
                             file_name = q['file_name']
-                            if sub_folder:
+                            # sub_folderとmain_folderが同じ場合はサブフォルダなし
+                            if sub_folder and sub_folder != main_folder:
                                 zip_path = f"{main_folder}/{sub_folder}/{file_name}"
-                            else:
+                            elif main_folder:
                                 zip_path = f"{main_folder}/{file_name}"
+                            else:
+                                zip_path = f"{sub_folder}/{file_name}"
                             zf.writestr(zip_path, q['file_bytes'])
 
                     st.session_state.workflow_data['rakuten_manual_zip'] = zip_buffer.getvalue()
