@@ -2025,7 +2025,7 @@ if mode == "🔄 画像ワークフロー":
         # 入力方法の選択
         input_method = st.radio(
             "入力方法",
-            ["テキスト入力", "CSVアップロード"],
+            ["テキスト入力", "CSVアップロード", "出品シートExcel"],
             horizontal=True
         )
 
@@ -2040,7 +2040,7 @@ if mode == "🔄 画像ワークフロー":
             if text_input:
                 comic_numbers = [line.strip() for line in text_input.split('\n') if line.strip()]
                 st.info(f"入力: {len(comic_numbers)}件")
-        else:
+        elif input_method == "CSVアップロード":
             uploaded = st.file_uploader("CSVファイル", type=['csv'])
             if uploaded:
                 try:
@@ -2053,6 +2053,57 @@ if mode == "🔄 画像ワークフロー":
                 if col:
                     comic_numbers = [normalize_jan_code(v) for v in df[col].dropna().tolist() if normalize_jan_code(v)]
                     st.info(f"読み込み: {len(comic_numbers)}件")
+        else:
+            # 出品シートExcel
+            st.caption("セット品シート: A列=商品コード, D列=コミックNo / 単品シート: A列=商品コード, E列=コミックNo")
+            excel_file = st.file_uploader("出品シートExcel", type=['xlsx', 'xls'], key="step1_excel")
+            if excel_file:
+                try:
+                    xls = pd.ExcelFile(excel_file)
+                    sheet_names = xls.sheet_names
+                    st.caption(f"シート: {', '.join(sheet_names)}")
+
+                    col_sh1, col_sh2 = st.columns(2)
+                    with col_sh1:
+                        set_sheet = st.selectbox("セット品シート", sheet_names, key="step1_set_sheet")
+                    with col_sh2:
+                        tanpin_idx = min(1, len(sheet_names) - 1)
+                        tanpin_sheet = st.selectbox("単品シート", sheet_names, index=tanpin_idx, key="step1_tanpin_sheet")
+
+                    excel_set_df = pd.read_excel(excel_file, sheet_name=set_sheet, header=None)
+                    excel_file.seek(0)
+                    excel_tanpin_df = pd.read_excel(excel_file, sheet_name=tanpin_sheet, header=None)
+
+                    # コミックNo抽出（セット: D列, 単品: E列）
+                    set_comics = []
+                    for i in range(len(excel_set_df)):
+                        try:
+                            cno = str(excel_set_df.iloc[i, 3]).strip().replace('.0', '')
+                            if cno and cno != 'nan':
+                                set_comics.append(cno)
+                        except:
+                            continue
+
+                    tanpin_comics = []
+                    for i in range(len(excel_tanpin_df)):
+                        try:
+                            cno = str(excel_tanpin_df.iloc[i, 4]).strip().replace('.0', '')
+                            if cno and cno != 'nan':
+                                tanpin_comics.append(cno)
+                        except:
+                            continue
+
+                    comic_numbers = list(set(set_comics + tanpin_comics))
+                    st.info(f"抽出: {len(comic_numbers)}件（セット: {len(set_comics)}件, 単品: {len(tanpin_comics)}件）")
+
+                    # ヤフーマッピング用にセッションに保存
+                    excel_file.seek(0)
+                    st.session_state.workflow_data['yahoo_excel_bytes'] = excel_file.read()
+                    st.session_state.workflow_data['yahoo_set_sheet'] = set_sheet
+                    st.session_state.workflow_data['yahoo_tanpin_sheet'] = tanpin_sheet
+
+                except Exception as e:
+                    st.error(f"Excel読み込みエラー: {e}")
 
         col1, col2 = st.columns([1, 1])
         with col1:
@@ -2667,46 +2718,64 @@ if mode == "🔄 画像ワークフロー":
             # ============================================
             with tab_yahoo:
                 st.markdown("### データフォーマットExcel")
-                st.caption("セット品シート: A列=商品コード, D列=コミックNo / 単品シート: A列=商品コード, E列=コミックNo")
-
-                yahoo_excel = st.file_uploader("Excelファイル", type=['xlsx', 'xls'], key="yahoo_excel")
 
                 excel_set_df = None
                 excel_tanpin_df = None
 
-                if yahoo_excel:
+                # Step ①で出品シートExcelが読み込み済みか確認
+                yahoo_from_step1 = st.session_state.workflow_data.get('yahoo_excel_bytes')
+
+                if yahoo_from_step1:
+                    st.success("Step ①で出品シートExcelを読み込み済み")
                     try:
-                        xls = pd.ExcelFile(yahoo_excel)
-                        sheet_names = xls.sheet_names
-                        st.caption(f"シート: {', '.join(sheet_names)}")
+                        set_sheet = st.session_state.workflow_data['yahoo_set_sheet']
+                        tanpin_sheet = st.session_state.workflow_data['yahoo_tanpin_sheet']
+                        excel_set_df = pd.read_excel(BytesIO(yahoo_from_step1), sheet_name=set_sheet, header=None)
+                        excel_tanpin_df = pd.read_excel(BytesIO(yahoo_from_step1), sheet_name=tanpin_sheet, header=None)
+                        st.caption(f"セット品シート: {set_sheet} / 単品シート: {tanpin_sheet}")
+                    except Exception as e:
+                        st.error(f"Excel読み込みエラー: {e}")
+                        yahoo_from_step1 = None
 
-                        # シート選択
-                        col_sh1, col_sh2 = st.columns(2)
-                        with col_sh1:
-                            set_sheet = st.selectbox("セット品シート", sheet_names, key="yahoo_set_sheet")
-                        with col_sh2:
-                            tanpin_idx = min(1, len(sheet_names) - 1)
-                            tanpin_sheet = st.selectbox("単品シート", sheet_names, index=tanpin_idx, key="yahoo_tanpin_sheet")
+                if not yahoo_from_step1:
+                    st.caption("セット品シート: A列=商品コード, D列=コミックNo / 単品シート: A列=商品コード, E列=コミックNo")
+                    yahoo_excel = st.file_uploader("Excelファイル", type=['xlsx', 'xls'], key="yahoo_excel")
 
-                        excel_set_df = pd.read_excel(yahoo_excel, sheet_name=set_sheet, header=None)
-                        yahoo_excel.seek(0)
-                        excel_tanpin_df = pd.read_excel(yahoo_excel, sheet_name=tanpin_sheet, header=None)
+                    if yahoo_excel:
+                        try:
+                            xls = pd.ExcelFile(yahoo_excel)
+                            sheet_names = xls.sheet_names
+                            st.caption(f"シート: {', '.join(sheet_names)}")
 
-                        # プレビュー
-                        with st.expander("マッピングプレビュー", expanded=True):
-                            # セット品マッピング
-                            set_mappings = []
-                            for i in range(len(excel_set_df)):
-                                try:
-                                    code = str(excel_set_df.iloc[i, 0]).strip()
-                                    cno = str(excel_set_df.iloc[i, 3]).strip().replace('.0', '')
-                                    if code != 'nan' and cno != 'nan' and code and cno:
-                                        matched = any(str(img['comic_no']) == cno for img in images)
-                                        set_mappings.append({'商品コード': code, 'コミックNo': cno, '対象画像': '✅' if matched else '❌'})
-                                except:
-                                    continue
+                            col_sh1, col_sh2 = st.columns(2)
+                            with col_sh1:
+                                set_sheet = st.selectbox("セット品シート", sheet_names, key="yahoo_set_sheet")
+                            with col_sh2:
+                                tanpin_idx = min(1, len(sheet_names) - 1)
+                                tanpin_sheet = st.selectbox("単品シート", sheet_names, index=tanpin_idx, key="yahoo_tanpin_sheet")
 
-                            tanpin_mappings = []
+                            excel_set_df = pd.read_excel(yahoo_excel, sheet_name=set_sheet, header=None)
+                            yahoo_excel.seek(0)
+                            excel_tanpin_df = pd.read_excel(yahoo_excel, sheet_name=tanpin_sheet, header=None)
+                        except Exception as e:
+                            st.error(f"Excel読み込みエラー: {e}")
+
+                # プレビュー（どちらの読み込み方法でも共通）
+                if excel_set_df is not None:
+                    with st.expander("マッピングプレビュー", expanded=True):
+                        set_mappings = []
+                        for i in range(len(excel_set_df)):
+                            try:
+                                code = str(excel_set_df.iloc[i, 0]).strip()
+                                cno = str(excel_set_df.iloc[i, 3]).strip().replace('.0', '')
+                                if code != 'nan' and cno != 'nan' and code and cno:
+                                    matched = any(str(img['comic_no']) == cno for img in images)
+                                    set_mappings.append({'商品コード': code, 'コミックNo': cno, '対象画像': '✅' if matched else '❌'})
+                            except:
+                                continue
+
+                        tanpin_mappings = []
+                        if excel_tanpin_df is not None:
                             for i in range(len(excel_tanpin_df)):
                                 try:
                                     code = str(excel_tanpin_df.iloc[i, 0]).strip()
@@ -2717,19 +2786,16 @@ if mode == "🔄 画像ワークフロー":
                                 except:
                                     continue
 
-                            if set_mappings:
-                                st.markdown(f"**セット品: {len(set_mappings)}件**")
-                                st.dataframe(pd.DataFrame(set_mappings), use_container_width=True, height=150)
-                            if tanpin_mappings:
-                                st.markdown(f"**単品: {len(tanpin_mappings)}件**")
-                                st.dataframe(pd.DataFrame(tanpin_mappings), use_container_width=True, height=150)
-
-                    except Exception as e:
-                        st.error(f"Excel読み込みエラー: {e}")
+                        if set_mappings:
+                            st.markdown(f"**セット品: {len(set_mappings)}件**")
+                            st.dataframe(pd.DataFrame(set_mappings), use_container_width=True, height=150)
+                        if tanpin_mappings:
+                            st.markdown(f"**単品: {len(tanpin_mappings)}件**")
+                            st.dataframe(pd.DataFrame(tanpin_mappings), use_container_width=True, height=150)
 
                 # ZIP生成ボタン
                 st.divider()
-                can_generate = yahoo_excel is not None and excel_set_df is not None
+                can_generate = excel_set_df is not None
                 if st.button("📦 ZIP生成", type="primary", disabled=not can_generate, key="yahoo_zip_btn"):
                     additional_dir = _os.path.join(_os.path.dirname(__file__), "images")
                     result = prepare_yahoo_zips(images, excel_set_df, excel_tanpin_df, additional_dir)
