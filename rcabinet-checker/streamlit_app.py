@@ -2944,15 +2944,18 @@ if mode == "🔄 画像ワークフロー":
                         wb = openpyxl.Workbook()
                         ws = wb.active
                         ws.title = "振り分け一覧"
-                        headers = ['コミックNo', 'メインフォルダ', 'サブフォルダ', 'ファイル名', 'ZIPパス']
+                        font = openpyxl.styles.Font(name='Meiryo UI')
+                        headers = ['No', 'コミックNo', 'メインフォルダ', 'サブフォルダ', 'ファイル名', 'ZIPパス']
                         ws.append(headers)
-                        for row in mapping_rows:
-                            ws.append([row[h] for h in headers])
-                        # 列幅調整
+                        for idx, row in enumerate(mapping_rows, 1):
+                            ws.append([idx, row['コミックNo'], row['メインフォルダ'], row['サブフォルダ'], row['ファイル名'], row['ZIPパス']])
+                        # フォント適用・列幅調整
                         for col_idx, header in enumerate(headers, 1):
                             max_len = len(header)
-                            for row in mapping_rows:
-                                val = str(row[header])
+                            for r in range(1, ws.max_row + 1):
+                                cell = ws.cell(row=r, column=col_idx)
+                                cell.font = font
+                                val = str(cell.value or '')
                                 max_len = max(max_len, len(val))
                             ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = min(max_len + 2, 40)
                         xlsx_buffer = BytesIO()
