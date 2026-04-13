@@ -1494,7 +1494,7 @@ def create_folder(folder_name, directory_name=None, upper_folder_id=None):
     """R-Cabinetにフォルダを1件作成（cabinet.folder.insert）"""
     url = f"{BASE_URL}/cabinet/folder/insert"
     headers = get_auth_header()
-    headers["Content-Type"] = "text/xml; charset=utf-8"
+    headers["Content-Type"] = "text/xml;charset=UTF-8"
 
     # XMLリクエストボディを構築
     folder_elements = f"<folderName>{folder_name}</folderName>"
@@ -1516,7 +1516,7 @@ def create_folder(folder_name, directory_name=None, upper_folder_id=None):
         return {"success": False, "error": f"接続エラー: {str(e)}"}
 
     if response.status_code != 200:
-        return {"success": False, "error": f"HTTP {response.status_code}: {response.text[:200]}"}
+        return {"success": False, "error": f"HTTP {response.status_code}: {response.text[:500]}"}
 
     try:
         root = ET.fromstring(response.text)
