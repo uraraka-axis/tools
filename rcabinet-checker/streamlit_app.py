@@ -1490,6 +1490,48 @@ def get_all_folders():
     return all_folders, None
 
 
+def create_folder(folder_name, directory_name=None, upper_folder_id=None):
+    """R-Cabinetにフォルダを1件作成（cabinet.folder.insert）"""
+    url = f"{BASE_URL}/cabinet/folder/insert"
+    headers = get_auth_header()
+    headers["Content-Type"] = "text/xml; charset=utf-8"
+
+    # XMLリクエストボディを構築
+    folder_elements = f"<folderName>{folder_name}</folderName>"
+    if directory_name:
+        folder_elements += f"<directoryName>{directory_name}</directoryName>"
+    if upper_folder_id:
+        folder_elements += f"<upperFolderId>{upper_folder_id}</upperFolderId>"
+
+    xml_body = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<request><folderInsertRequest><folder>"
+        f"{folder_elements}"
+        "</folder></folderInsertRequest></request>"
+    )
+
+    try:
+        response = requests.post(url, headers=headers, data=xml_body.encode('utf-8'), timeout=30)
+    except requests.exceptions.RequestException as e:
+        return {"success": False, "error": f"接続エラー: {str(e)}"}
+
+    if response.status_code != 200:
+        return {"success": False, "error": f"HTTP {response.status_code}: {response.text[:200]}"}
+
+    try:
+        root = ET.fromstring(response.text)
+    except ET.ParseError as e:
+        return {"success": False, "error": f"XMLパースエラー: {str(e)}"}
+
+    system_status = root.findtext('.//systemStatus', '')
+    if system_status != 'OK':
+        message = root.findtext('.//message', 'Unknown error')
+        return {"success": False, "error": f"APIエラー: {message}"}
+
+    folder_id = root.findtext('.//FolderId', '')
+    return {"success": True, "folder_id": folder_id}
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def get_folder_files(folder_id: int, max_retries: int = 3):
     """指定フォルダ内の画像一覧を取得（リトライ機能付き）"""
@@ -1673,7 +1715,7 @@ with st.sidebar:
 
     mode = st.radio(
         "機能を選択",
-        ["🔄 画像ワークフロー", "📂 画像一覧取得", "🔍 画像存在チェック", "🖼️ 新規画像取得"],
+        ["🔄 画像ワークフロー", "📂 画像一覧取得", "🔍 画像存在チェック", "🖼️ 新規画像取得", "📁 フォルダ一括作成"],
         label_visibility="collapsed"
     )
 
@@ -4177,3 +4219,153 @@ elif mode == "🖼️ 新規画像取得":
                 if st.button("🗑️ クリア"):
                     st.session_state.image_download_result = None
                     st.rerun()
+
+# ============================================================
+# フォルダ一括作成
+# ============================================================
+elif mode == "📁 フォルダ一括作成":
+    st.header("📁 フォルダ一括作成")
+    st.markdown("R-Cabinetに複数のフォルダをまとめて作成します。")
+
+    # 既存フォルダ一覧を取得（上位フォルダID参照用）
+    with st.spinner("既存フォルダ一覧を取得中..."):
+        existing_folders, folder_list_error = get_all_folders()
+
+    if folder_list_error:
+        st.error(f"フォルダ一覧の取得に失敗: {folder_list_error}")
+    elif existing_folders:
+        # フォルダID参照テーブルを表示
+        with st.expander("📂 既存フォルダ一覧（上位フォルダID参照用）"):
+            ref_data = [{"フォルダID": f['FolderId'], "フォルダ名": f['FolderName'], "パス": f['FolderPath']} for f in existing_folders]
+            st.dataframe(pd.DataFrame(ref_data), use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # CSV入力
+    st.subheader("CSV入力")
+    st.caption("カンマ区切りで「フォルダ名, ディレクトリ名, 上位フォルダID」を入力")
+    st.markdown("""
+| 列 | 項目 | 必須 | 説明 |
+|---|---|---|---|
+| 1列目 | **フォルダ名** | ○ | 最大50バイト |
+| 2列目 | ディレクトリ名 | | a-z, 0-9, -, _ のみ。最大20文字。省略時は自動採番 |
+| 3列目 | 上位フォルダID | | サブフォルダとして作成する場合に指定。0は指定不可 |
+""")
+
+    csv_input = st.text_area(
+        "CSV入力",
+        height=250,
+        placeholder="例:\nワンピース,onepiece,12345\nドラゴンボール,dragonball,12345\nNARUTO,,12345\n鬼滅の刃,kimetsu",
+        label_visibility="collapsed"
+    )
+
+    # CSVファイルアップロード
+    uploaded_csv = st.file_uploader("またはCSVファイルをアップロード", type=['csv'])
+
+    # 入力ソースの決定
+    raw_lines = []
+    if uploaded_csv:
+        try:
+            content = uploaded_csv.read().decode('utf-8')
+        except UnicodeDecodeError:
+            uploaded_csv.seek(0)
+            content = uploaded_csv.read().decode('cp932')
+        raw_lines = content.strip().splitlines()
+    elif csv_input:
+        raw_lines = csv_input.strip().splitlines()
+
+    # パース
+    folder_entries = []
+    import re as _re
+    for line in raw_lines:
+        if not line.strip():
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        name = parts[0] if len(parts) > 0 else ""
+        directory = parts[1] if len(parts) > 1 and parts[1] else None
+        upper_id = parts[2] if len(parts) > 2 and parts[2] else None
+        if name:
+            folder_entries.append({"name": name, "directory": directory, "upper_folder_id": upper_id})
+
+    # プレビュー表示
+    if folder_entries:
+        st.divider()
+        st.subheader(f"作成予定: {len(folder_entries)} フォルダ")
+
+        preview_data = []
+        for i, entry in enumerate(folder_entries, 1):
+            preview_data.append({
+                "No": i,
+                "フォルダ名": entry["name"],
+                "ディレクトリ名": entry["directory"] or "（自動採番）",
+                "上位フォルダID": entry["upper_folder_id"] or "（なし＝ルート）"
+            })
+
+        st.dataframe(
+            pd.DataFrame(preview_data),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        # バリデーション
+        errors = []
+        for i, entry in enumerate(folder_entries, 1):
+            if len(entry["name"].encode('utf-8')) > 50:
+                errors.append(f"No.{i}「{entry['name']}」: フォルダ名が50バイトを超えています")
+            if entry["directory"]:
+                if len(entry["directory"]) > 20:
+                    errors.append(f"No.{i}「{entry['directory']}」: ディレクトリ名が20文字を超えています")
+                elif not _re.fullmatch(r'[a-z0-9_-]+', entry["directory"]):
+                    errors.append(f"No.{i}「{entry['directory']}」: ディレクトリ名に使用不可の文字（a-z, 0-9, -, _ のみ）")
+            if entry["upper_folder_id"]:
+                if entry["upper_folder_id"] == "0":
+                    errors.append(f"No.{i}: 上位フォルダIDに0（基本フォルダ）は指定できません")
+                elif not entry["upper_folder_id"].isdigit():
+                    errors.append(f"No.{i}「{entry['upper_folder_id']}」: 上位フォルダIDは数値で指定してください")
+
+        if errors:
+            for err in errors:
+                st.error(err)
+        else:
+            st.divider()
+            if st.button("🚀 一括作成を実行", type="primary"):
+                results = []
+                progress = st.progress(0, text="フォルダ作成中...")
+                total = len(folder_entries)
+
+                for i, entry in enumerate(folder_entries):
+                    progress.progress((i + 1) / total, text=f"作成中... ({i + 1}/{total}) {entry['name']}")
+                    result = create_folder(
+                        folder_name=entry["name"],
+                        directory_name=entry["directory"],
+                        upper_folder_id=entry["upper_folder_id"]
+                    )
+                    results.append({
+                        "フォルダ名": entry["name"],
+                        "ディレクトリ名": entry["directory"] or "（自動）",
+                        "上位フォルダID": entry["upper_folder_id"] or "（ルート）",
+                        "結果": "✅ 成功" if result["success"] else "❌ 失敗",
+                        "フォルダID": result.get("folder_id", ""),
+                        "エラー": result.get("error", "")
+                    })
+                    if i < total - 1:
+                        time.sleep(0.5)  # API負荷軽減
+
+                progress.empty()
+
+                # 結果表示
+                success_count = sum(1 for r in results if r["結果"] == "✅ 成功")
+                fail_count = total - success_count
+
+                if fail_count == 0:
+                    st.success(f"全 {total} フォルダの作成が完了しました！")
+                elif success_count == 0:
+                    st.error(f"全 {total} フォルダの作成に失敗しました")
+                else:
+                    st.warning(f"成功: {success_count} / 失敗: {fail_count}")
+
+                st.dataframe(
+                    pd.DataFrame(results),
+                    use_container_width=True,
+                    hide_index=True
+                )
