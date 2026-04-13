@@ -4225,37 +4225,39 @@ elif mode == "🖼️ 新規画像取得":
 # ============================================================
 elif mode == "📁 フォルダ一括作成":
     st.header("📁 フォルダ一括作成")
-    st.markdown("R-Cabinetに複数のフォルダをまとめて作成します。")
-
-    # 既存フォルダ一覧を取得（上位フォルダID参照用）
-    with st.spinner("既存フォルダ一覧を取得中..."):
-        existing_folders, folder_list_error = get_all_folders()
-
-    if folder_list_error:
-        st.error(f"フォルダ一覧の取得に失敗: {folder_list_error}")
-    elif existing_folders:
-        # フォルダID参照テーブルを表示
-        with st.expander("📂 既存フォルダ一覧（上位フォルダID参照用）"):
-            ref_data = [{"フォルダID": f['FolderId'], "フォルダ名": f['FolderName'], "パス": f['FolderPath']} for f in existing_folders]
-            st.dataframe(pd.DataFrame(ref_data), use_container_width=True, hide_index=True)
+    st.markdown("R-Cabinetに複数のフォルダをまとめて作成します。パス形式で階層構造を指定でき、上位フォルダのIDは自動で解決されます。")
 
     st.divider()
 
-    # CSV入力
+    # CSV入力説明
     st.subheader("CSV入力")
-    st.caption("カンマ区切りで「フォルダ名, ディレクトリ名, 上位フォルダID」を入力")
+    st.caption("カンマ区切りで「フォルダパス, ディレクトリ名」を入力")
     st.markdown("""
 | 列 | 項目 | 必須 | 説明 |
 |---|---|---|---|
-| 1列目 | **フォルダ名** | ○ | 最大50バイト |
+| 1列目 | **フォルダパス** | ○ | `/`区切りで階層を表現。最下層がフォルダ名（最大50バイト） |
 | 2列目 | ディレクトリ名 | | a-z, 0-9, -, _ のみ。最大20文字。省略時は自動採番 |
-| 3列目 | 上位フォルダID | | サブフォルダとして作成する場合に指定。0は指定不可 |
+
+- 上位フォルダは**パスから自動判定**されます（IDの手動指定は不要）
+- 上位フォルダが同じCSV内にあれば、作成後のIDを自動で引き継ぎます
+- 上位フォルダがR-Cabinetに既存の場合も自動で検出します
 """)
+
+    # テンプレートCSVダウンロード
+    template_csv = "フォルダパス,ディレクトリ名\nコミック,comic\nコミック/セット,set\nコミック/セット/セット1,set1\nコミック/セット/セット2,set2\nコミック/セット/セット3,set3\nコミック/単品,tanpin\nコミック/単品/単品1,tanpin1\nコミック/単品/単品2,tanpin2\nコミック/単品/単品3,tanpin3\nコミック/予約,yoyaku\nコミック/予約/予約1,yoyaku1\nコミック/予約/予約2,yoyaku2\nコミック/予約/予約3,yoyaku3"
+    st.download_button(
+        label="📥 テンプレートCSVをダウンロード",
+        data=template_csv.encode('utf-8-sig'),
+        file_name="folder_template.csv",
+        mime="text/csv"
+    )
+
+    st.markdown("")
 
     csv_input = st.text_area(
         "CSV入力",
         height=250,
-        placeholder="例:\nワンピース,onepiece,12345\nドラゴンボール,dragonball,12345\nNARUTO,,12345\n鬼滅の刃,kimetsu",
+        placeholder="例:\nコミック,comic\nコミック/セット,set\nコミック/セット/セット1,set1\nコミック/セット/セット2,set2\nコミック/単品,tanpin\nコミック/単品/単品1,tanpin1",
         label_visibility="collapsed"
     )
 
@@ -4274,18 +4276,30 @@ elif mode == "📁 フォルダ一括作成":
     elif csv_input:
         raw_lines = csv_input.strip().splitlines()
 
+    # ヘッダー行をスキップ
+    if raw_lines and ("フォルダパス" in raw_lines[0] or "フォルダ名" in raw_lines[0]):
+        raw_lines = raw_lines[1:]
+
     # パース
-    folder_entries = []
     import re as _re
+    folder_entries = []
     for line in raw_lines:
         if not line.strip():
             continue
         parts = [p.strip() for p in line.split(",")]
-        name = parts[0] if len(parts) > 0 else ""
+        path = parts[0] if len(parts) > 0 else ""
         directory = parts[1] if len(parts) > 1 and parts[1] else None
-        upper_id = parts[2] if len(parts) > 2 and parts[2] else None
-        if name:
-            folder_entries.append({"name": name, "directory": directory, "upper_folder_id": upper_id})
+        if path:
+            # パスから階層を分解
+            path_parts = [p.strip() for p in path.split("/") if p.strip()]
+            folder_name = path_parts[-1]  # 最下層がフォルダ名
+            parent_path = "/".join(path_parts[:-1]) if len(path_parts) > 1 else None
+            folder_entries.append({
+                "path": "/".join(path_parts),
+                "name": folder_name,
+                "directory": directory,
+                "parent_path": parent_path
+            })
 
     # プレビュー表示
     if folder_entries:
@@ -4294,11 +4308,15 @@ elif mode == "📁 フォルダ一括作成":
 
         preview_data = []
         for i, entry in enumerate(folder_entries, 1):
+            # 階層の深さに応じてインデント
+            depth = entry["path"].count("/")
+            indent = "　" * depth
             preview_data.append({
                 "No": i,
-                "フォルダ名": entry["name"],
+                "フォルダ構造": f"{indent}{entry['name']}",
+                "パス": entry["path"],
                 "ディレクトリ名": entry["directory"] or "（自動採番）",
-                "上位フォルダID": entry["upper_folder_id"] or "（なし＝ルート）"
+                "上位フォルダ": entry["parent_path"] or "（ルート）"
             })
 
         st.dataframe(
@@ -4309,6 +4327,7 @@ elif mode == "📁 フォルダ一括作成":
 
         # バリデーション
         errors = []
+        path_set = {e["path"] for e in folder_entries}
         for i, entry in enumerate(folder_entries, 1):
             if len(entry["name"].encode('utf-8')) > 50:
                 errors.append(f"No.{i}「{entry['name']}」: フォルダ名が50バイトを超えています")
@@ -4317,11 +4336,8 @@ elif mode == "📁 フォルダ一括作成":
                     errors.append(f"No.{i}「{entry['directory']}」: ディレクトリ名が20文字を超えています")
                 elif not _re.fullmatch(r'[a-z0-9_-]+', entry["directory"]):
                     errors.append(f"No.{i}「{entry['directory']}」: ディレクトリ名に使用不可の文字（a-z, 0-9, -, _ のみ）")
-            if entry["upper_folder_id"]:
-                if entry["upper_folder_id"] == "0":
-                    errors.append(f"No.{i}: 上位フォルダIDに0（基本フォルダ）は指定できません")
-                elif not entry["upper_folder_id"].isdigit():
-                    errors.append(f"No.{i}「{entry['upper_folder_id']}」: 上位フォルダIDは数値で指定してください")
+            if entry["parent_path"] and entry["parent_path"] not in path_set:
+                errors.append(f"No.{i}「{entry['path']}」: 上位フォルダ「{entry['parent_path']}」がCSV内に見つかりません")
 
         if errors:
             for err in errors:
@@ -4329,21 +4345,59 @@ elif mode == "📁 フォルダ一括作成":
         else:
             st.divider()
             if st.button("🚀 一括作成を実行", type="primary"):
+                # 既存フォルダ一覧を取得（既存フォルダのID解決用）
+                existing_folders, folder_list_error = get_all_folders()
+                existing_name_to_id = {}
+                if existing_folders:
+                    for f in existing_folders:
+                        existing_name_to_id[f['FolderName']] = f['FolderId']
+
+                # パス→フォルダIDのマッピング（作成済みフォルダのID記録用）
+                path_to_id = {}
+
                 results = []
                 progress = st.progress(0, text="フォルダ作成中...")
                 total = len(folder_entries)
 
                 for i, entry in enumerate(folder_entries):
                     progress.progress((i + 1) / total, text=f"作成中... ({i + 1}/{total}) {entry['name']}")
+
+                    # 上位フォルダIDを解決
+                    upper_folder_id = None
+                    if entry["parent_path"]:
+                        if entry["parent_path"] in path_to_id:
+                            # 同じCSV内で先に作成済み
+                            upper_folder_id = path_to_id[entry["parent_path"]]
+                        else:
+                            # 既存フォルダから検索（フォルダ名で一致）
+                            parent_name = entry["parent_path"].split("/")[-1]
+                            if parent_name in existing_name_to_id:
+                                upper_folder_id = existing_name_to_id[parent_name]
+
+                        if not upper_folder_id:
+                            results.append({
+                                "フォルダ構造": entry["path"],
+                                "フォルダ名": entry["name"],
+                                "ディレクトリ名": entry["directory"] or "（自動）",
+                                "結果": "❌ スキップ",
+                                "フォルダID": "",
+                                "エラー": f"上位フォルダ「{entry['parent_path']}」のIDが見つかりません"
+                            })
+                            continue
+
                     result = create_folder(
                         folder_name=entry["name"],
                         directory_name=entry["directory"],
-                        upper_folder_id=entry["upper_folder_id"]
+                        upper_folder_id=upper_folder_id
                     )
+
+                    if result["success"]:
+                        path_to_id[entry["path"]] = result["folder_id"]
+
                     results.append({
+                        "フォルダ構造": entry["path"],
                         "フォルダ名": entry["name"],
                         "ディレクトリ名": entry["directory"] or "（自動）",
-                        "上位フォルダID": entry["upper_folder_id"] or "（ルート）",
                         "結果": "✅ 成功" if result["success"] else "❌ 失敗",
                         "フォルダID": result.get("folder_id", ""),
                         "エラー": result.get("error", "")
