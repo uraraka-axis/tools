@@ -4377,6 +4377,14 @@ elif mode == "📁 フォルダ一括作成":
             hide_index=True
         )
 
+        # 既存フォルダ一覧を取得（バリデーション用）
+        with st.spinner("既存フォルダを確認中..."):
+            existing_folders, folder_list_error = get_all_folders()
+        existing_name_set = set()
+        if existing_folders:
+            for f in existing_folders:
+                existing_name_set.add(f['FolderName'])
+
         # バリデーション
         errors = []
         path_set = {e["path"] for e in folder_entries}
@@ -4389,7 +4397,10 @@ elif mode == "📁 フォルダ一括作成":
                 elif not _re.fullmatch(r'[a-z0-9_-]+', entry["directory"]):
                     errors.append(f"No.{i}「{entry['directory']}」: ディレクトリ名に使用不可の文字（a-z, 0-9, -, _ のみ）")
             if entry["parent_path"] and entry["parent_path"] not in path_set:
-                errors.append(f"No.{i}「{entry['path']}」: 上位フォルダ「{entry['parent_path']}」がCSV内に見つかりません")
+                # 既存フォルダからも検索（フォルダ名で一致）
+                parent_name = entry["parent_path"].split("/")[-1]
+                if parent_name not in existing_name_set:
+                    errors.append(f"No.{i}「{entry['path']}」: 上位フォルダ「{entry['parent_path']}」が見つかりません")
 
         if errors:
             for err in errors:
