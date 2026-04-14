@@ -4550,11 +4550,13 @@ elif mode == "📤 画像アップロード":
                                 name_part = name_part[:-1]
                             api_file_name = f"{name_part}.{ext}" if ext else name_part
 
-                        # filePath（URLのファイル名）: 20バイト制限、拡張子不要
-                        file_path_name = f.name.rsplit('.', 1)[0] if '.' in f.name else f.name
+                        # filePath（URLのファイル名）: 20バイト制限、拡張子含む
+                        file_path_name = f.name
                         if len(file_path_name.encode('utf-8')) > 20:
-                            while len(file_path_name.encode('utf-8')) > 20 and file_path_name:
-                                file_path_name = file_path_name[:-1]
+                            name_stem, name_ext = f.name.rsplit('.', 1) if '.' in f.name else (f.name, '')
+                            while len(f"{name_stem}.{name_ext}".encode('utf-8')) > 20 and name_stem:
+                                name_stem = name_stem[:-1]
+                            file_path_name = f"{name_stem}.{name_ext}" if name_ext else name_stem
 
                         f.seek(0)
                         result = upload_image(
