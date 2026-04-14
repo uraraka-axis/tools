@@ -4613,67 +4613,165 @@ elif mode == "📋 CSV画像コピー":
     st.markdown("## 📋 CSV画像コピー")
     st.markdown("CSVで指定した既存画像を、指定フォルダにコピーします。")
 
-    # CSVテンプレートダウンロード
-    template_csv = "フォルダ,カテゴリ1,カテゴリ2,カテゴリ3,ファイル名,URL\n商品画像文庫,コミック,セット,セット1,10000,https://image.rakuten.co.jp/haru-uraraka/cabinet/shohinbunko/10000.jpg\n"
-    st.download_button(
-        label="📥 CSVテンプレートをダウンロード",
-        data=template_csv.encode("utf-8-sig"),
-        file_name="image_copy_template.csv",
-        mime="text/csv",
-    )
+    # Excelテンプレートダウンロード（フォルダ一覧シート付き）
+    if st.button("📥 テンプレートをダウンロード（フォルダ一覧付き）"):
+        with st.spinner("フォルダ一覧を取得中..."):
+            tmpl_folders, tmpl_error = get_all_folders()
 
-    # CSVアップロード
-    csv_file = st.file_uploader("CSVファイルを選択", type=["csv"], key="csv_image_copy")
+        if tmpl_error:
+            st.error(f"フォルダ一覧の取得に失敗しました: {tmpl_error}")
+        else:
+            styles = get_openpyxl_styles()
+            Font = styles['Font']
+            PatternFill = styles['PatternFill']
+            Alignment = styles['Alignment']
+            from openpyxl import Workbook
 
-    if csv_file:
-        try:
-            csv_file.seek(0)
-            df = pd.read_csv(csv_file, encoding="utf-8-sig", dtype=str).fillna("")
-        except Exception:
-            csv_file.seek(0)
-            df = pd.read_csv(csv_file, encoding="cp932", dtype=str).fillna("")
+            wb = Workbook()
 
-        required_cols = ["カテゴリ1", "カテゴリ2", "カテゴリ3", "ファイル名", "URL"]
+            # シート1: テンプレート
+            ws1 = wb.active
+            ws1.title = "コピー指示"
+            headers1 = ["フォルダ", "カテゴリ1", "カテゴリ2", "カテゴリ3", "ファイル名", "URL", "フォルダID"]
+            header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+            header_font = Font(name="Meiryo UI", bold=True, color="FFFFFF", size=10)
+            cell_font = Font(name="Meiryo UI", size=10)
+
+            for col_idx, header in enumerate(headers1, 1):
+                cell = ws1.cell(row=1, column=col_idx, value=header)
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal="center")
+
+            # サンプル行
+            sample = ["商品画像文庫", "コミック", "セット", "セット1", "10000",
+                       "https://image.rakuten.co.jp/haru-uraraka/cabinet/shohinbunko/10000.jpg", "13054250"]
+            for col_idx, val in enumerate(sample, 1):
+                cell = ws1.cell(row=2, column=col_idx, value=val)
+                cell.font = cell_font
+
+            # 列幅調整
+            ws1.column_dimensions['A'].width = 18
+            ws1.column_dimensions['B'].width = 14
+            ws1.column_dimensions['C'].width = 14
+            ws1.column_dimensions['D'].width = 14
+            ws1.column_dimensions['E'].width = 16
+            ws1.column_dimensions['F'].width = 60
+            ws1.column_dimensions['G'].width = 14
+
+            # シート2: フォルダ一覧
+            ws2 = wb.create_sheet(title="フォルダ一覧")
+            headers2 = ["フォルダID", "フォルダ名", "ディレクトリパス", "ファイル数"]
+            for col_idx, header in enumerate(headers2, 1):
+                cell = ws2.cell(row=1, column=col_idx, value=header)
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal="center")
+
+            for row_idx, f in enumerate(tmpl_folders, 2):
+                ws2.cell(row=row_idx, column=1, value=f["FolderId"]).font = cell_font
+                ws2.cell(row=row_idx, column=2, value=f["FolderName"]).font = cell_font
+                ws2.cell(row=row_idx, column=3, value=f["FolderPath"]).font = cell_font
+                ws2.cell(row=row_idx, column=4, value=f["FileCount"]).font = cell_font
+
+            ws2.column_dimensions['A'].width = 14
+            ws2.column_dimensions['B'].width = 30
+            ws2.column_dimensions['C'].width = 40
+            ws2.column_dimensions['D'].width = 12
+
+            excel_buffer = BytesIO()
+            wb.save(excel_buffer)
+            excel_buffer.seek(0)
+
+            st.download_button(
+                label="📥 ダウンロード",
+                data=excel_buffer.getvalue(),
+                file_name="image_copy_template.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_template_xlsx",
+            )
+
+    st.divider()
+
+    # ファイルアップロード（CSV/Excel対応）
+    upload_file = st.file_uploader("CSV / Excelファイルを選択", type=["csv", "xlsx"], key="csv_image_copy")
+
+    if upload_file:
+        # ファイル読み込み
+        if upload_file.name.endswith(".xlsx"):
+            upload_file.seek(0)
+            df = pd.read_excel(upload_file, sheet_name=0, dtype=str).fillna("")
+        else:
+            try:
+                upload_file.seek(0)
+                df = pd.read_csv(upload_file, encoding="utf-8-sig", dtype=str).fillna("")
+            except Exception:
+                upload_file.seek(0)
+                df = pd.read_csv(upload_file, encoding="cp932", dtype=str).fillna("")
+
+        required_cols = ["ファイル名", "URL"]
         missing_cols = [c for c in required_cols if c not in df.columns]
+        has_folder_id = "フォルダID" in df.columns
+        has_categories = all(c in df.columns for c in ["カテゴリ1", "カテゴリ2", "カテゴリ3"])
+
         if missing_cols:
             st.error(f"必須列が不足しています: {', '.join(missing_cols)}")
+        elif not has_folder_id and not has_categories:
+            st.error("「フォルダID」列 または 「カテゴリ1〜3」列が必要です")
         elif len(df) == 0:
-            st.warning("CSVにデータがありません。")
+            st.warning("データがありません。")
         else:
             st.info(f"📎 {len(df)} 件のデータを読み込みました")
 
-            # フォルダ一覧を取得してパス解決
+            # フォルダ一覧を取得（名前マッチング用）
             with st.spinner("フォルダ一覧を取得中..."):
                 folders, folder_error = get_all_folders()
 
             if folder_error:
                 st.error(f"フォルダ一覧の取得に失敗しました: {folder_error}")
             else:
-                # FolderPathからフォルダを逆引きできるようにする
-                # FolderPath例: "comic/comic-set/comic-set-set1"
-                # FolderNameで階層マッチする
                 folder_name_to_id = {}
+                folder_id_set = set()
                 for f in folders:
                     folder_name_to_id[f["FolderName"]] = f["FolderId"]
+                    folder_id_set.add(str(f["FolderId"]))
 
-                # カテゴリパスからフォルダIDを解決
+                # フォルダIDを解決
                 preview_data = []
                 for idx, row in df.iterrows():
-                    cat_path = "/".join([
-                        row["カテゴリ1"],
-                        row["カテゴリ2"],
-                        row["カテゴリ3"],
-                    ]).strip("/")
+                    cat_path = ""
+                    if has_categories:
+                        cat_path = "/".join([
+                            row.get("カテゴリ1", ""),
+                            row.get("カテゴリ2", ""),
+                            row.get("カテゴリ3", ""),
+                        ]).strip("/")
 
-                    # カテゴリ3（最下層フォルダ名）でフォルダIDを検索
-                    target_folder_name = row["カテゴリ3"].strip()
-                    if not target_folder_name:
-                        target_folder_name = row["カテゴリ2"].strip()
-                    if not target_folder_name:
-                        target_folder_name = row["カテゴリ1"].strip()
-
-                    folder_id = folder_name_to_id.get(target_folder_name, "")
-                    status = "✅ OK" if folder_id else "❌ フォルダ未検出"
+                    # フォルダID解決: フォルダID列を優先、なければ名前マッチング
+                    folder_id = ""
+                    target_folder_name = ""
+                    if has_folder_id and row.get("フォルダID", "").strip():
+                        fid = row["フォルダID"].strip()
+                        if fid in folder_id_set:
+                            folder_id = fid
+                            status = "✅ OK"
+                            # フォルダ名を逆引き
+                            for f in folders:
+                                if str(f["FolderId"]) == fid:
+                                    target_folder_name = f["FolderName"]
+                                    break
+                        else:
+                            status = "❌ フォルダID不正"
+                    elif has_categories:
+                        target_folder_name = row.get("カテゴリ3", "").strip()
+                        if not target_folder_name:
+                            target_folder_name = row.get("カテゴリ2", "").strip()
+                        if not target_folder_name:
+                            target_folder_name = row.get("カテゴリ1", "").strip()
+                        folder_id = folder_name_to_id.get(target_folder_name, "")
+                        status = "✅ OK" if folder_id else "❌ フォルダ未検出"
+                    else:
+                        status = "❌ フォルダ指定なし"
 
                     # URL検証
                     url = row["URL"].strip()
