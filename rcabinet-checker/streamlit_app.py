@@ -4810,14 +4810,30 @@ elif mode == "📋 CSV画像コピー":
 
                 st.dataframe(display_df, use_container_width=True, hide_index=True)
 
+                # 実行範囲（バッチ処理）
+                st.divider()
+                st.markdown("### 実行設定")
+                if ok_count > 500:
+                    st.info("⏱ Streamlit Cloudのタイムアウト対策のため、500件ずつの実行を推奨します")
+                col_start, col_end = st.columns(2)
+                with col_start:
+                    batch_start = st.number_input("開始（No）", min_value=1, max_value=ok_count, value=1, step=1, key="batch_start")
+                with col_end:
+                    batch_end_default = min(500, ok_count)
+                    batch_end = st.number_input("終了（No）", min_value=1, max_value=ok_count, value=batch_end_default, step=1, key="batch_end")
+
+                batch_size = batch_end - batch_start + 1
+                st.markdown(f"**実行対象: {batch_start}〜{batch_end} 件目（{batch_size} 件）**")
+
                 # 上書きオプション
                 overwrite = st.checkbox("同名ファイルが存在する場合は上書きする", value=False, key="csv_copy_overwrite")
 
                 # 実行ボタン
-                if ok_count > 0 and st.button("📋 コピー実行", type="primary"):
+                if ok_count > 0 and st.button(f"📋 コピー実行（{batch_start}〜{batch_end}件目）", type="primary"):
                     progress = st.progress(0, text="コピー中...")
                     results = []
-                    target_rows = [d for d in preview_data if d["チェック"] == "✅ OK"]
+                    all_ok_rows = [d for d in preview_data if d["チェック"] == "✅ OK"]
+                    target_rows = all_ok_rows[batch_start - 1:batch_end]
                     total = len(target_rows)
 
                     for i, row_data in enumerate(target_rows):
