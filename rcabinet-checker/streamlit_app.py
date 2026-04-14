@@ -4542,20 +4542,26 @@ elif mode == "📤 画像アップロード":
                     for i, f in enumerate(valid_files):
                         progress.progress((i + 1) / total, text=f"アップロード中... ({i + 1}/{total}) {f.name}")
 
-                        # ファイル名をAPIの制限（50バイト）に合わせる
+                        # fileName（画像名）: 50バイト制限
                         api_file_name = f.name
                         if len(api_file_name.encode('utf-8')) > 50:
-                            # 拡張子を保持しつつ切り詰め
                             name_part, ext = api_file_name.rsplit('.', 1) if '.' in api_file_name else (api_file_name, '')
                             while len(f"{name_part}.{ext}".encode('utf-8')) > 50 and name_part:
                                 name_part = name_part[:-1]
                             api_file_name = f"{name_part}.{ext}" if ext else name_part
+
+                        # filePath（URLのファイル名）: 20バイト制限、拡張子不要
+                        file_path_name = f.name.rsplit('.', 1)[0] if '.' in f.name else f.name
+                        if len(file_path_name.encode('utf-8')) > 20:
+                            while len(file_path_name.encode('utf-8')) > 20 and file_path_name:
+                                file_path_name = file_path_name[:-1]
 
                         f.seek(0)
                         result = upload_image(
                             file_data=f.read(),
                             file_name=api_file_name,
                             folder_id=selected_folder["FolderId"],
+                            file_path_name=file_path_name,
                             overwrite=overwrite,
                         )
 
