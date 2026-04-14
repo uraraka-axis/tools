@@ -1767,7 +1767,7 @@ with st.sidebar:
 
     mode = st.radio(
         "機能を選択",
-        ["🔄 画像ワークフロー", "📂 画像一覧取得", "🔍 画像存在チェック", "🖼️ 新規画像取得", "📁 フォルダ一括作成", "📤 画像アップロード"],
+        ["🔄 画像ワークフロー", "📂 画像一覧取得", "🔍 画像存在チェック", "🖼️ 新規画像取得", "📁 フォルダ一括作成", "📤 画像アップロード", "📋 CSV画像コピー"],
         label_visibility="collapsed"
     )
 
@@ -4586,6 +4586,203 @@ elif mode == "📤 画像アップロード":
                         st.success(f"全 {total} ファイルのアップロードが完了しました！")
                     elif success_count == 0:
                         st.error(f"全 {total} ファイルのアップロードに失敗しました")
+                    else:
+                        st.warning(f"成功: {success_count} / 失敗: {fail_count}")
+
+                    st.dataframe(
+                        pd.DataFrame(results),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+# ============================
+# 📋 CSV画像コピー
+# ============================
+elif mode == "📋 CSV画像コピー":
+    st.markdown("## 📋 CSV画像コピー")
+    st.markdown("CSVで指定した既存画像を、指定フォルダにコピーします。")
+
+    # CSVテンプレートダウンロード
+    template_csv = "フォルダ,カテゴリ1,カテゴリ2,カテゴリ3,ファイル名,URL\n商品画像文庫,コミック,セット,セット1,10000,https://image.rakuten.co.jp/haru-uraraka/cabinet/shohinbunko/10000.jpg\n"
+    st.download_button(
+        label="📥 CSVテンプレートをダウンロード",
+        data=template_csv.encode("utf-8-sig"),
+        file_name="image_copy_template.csv",
+        mime="text/csv",
+    )
+
+    # CSVアップロード
+    csv_file = st.file_uploader("CSVファイルを選択", type=["csv"], key="csv_image_copy")
+
+    if csv_file:
+        try:
+            csv_file.seek(0)
+            df = pd.read_csv(csv_file, encoding="utf-8-sig", dtype=str).fillna("")
+        except Exception:
+            csv_file.seek(0)
+            df = pd.read_csv(csv_file, encoding="cp932", dtype=str).fillna("")
+
+        required_cols = ["カテゴリ1", "カテゴリ2", "カテゴリ3", "ファイル名", "URL"]
+        missing_cols = [c for c in required_cols if c not in df.columns]
+        if missing_cols:
+            st.error(f"必須列が不足しています: {', '.join(missing_cols)}")
+        elif len(df) == 0:
+            st.warning("CSVにデータがありません。")
+        else:
+            st.info(f"📎 {len(df)} 件のデータを読み込みました")
+
+            # フォルダ一覧を取得してパス解決
+            with st.spinner("フォルダ一覧を取得中..."):
+                folders, folder_error = get_all_folders()
+
+            if folder_error:
+                st.error(f"フォルダ一覧の取得に失敗しました: {folder_error}")
+            else:
+                # FolderPathからフォルダを逆引きできるようにする
+                # FolderPath例: "comic/comic-set/comic-set-set1"
+                # FolderNameで階層マッチする
+                folder_name_to_id = {}
+                for f in folders:
+                    folder_name_to_id[f["FolderName"]] = f["FolderId"]
+
+                # カテゴリパスからフォルダIDを解決
+                preview_data = []
+                for idx, row in df.iterrows():
+                    cat_path = "/".join([
+                        row["カテゴリ1"],
+                        row["カテゴリ2"],
+                        row["カテゴリ3"],
+                    ]).strip("/")
+
+                    # カテゴリ3（最下層フォルダ名）でフォルダIDを検索
+                    target_folder_name = row["カテゴリ3"].strip()
+                    if not target_folder_name:
+                        target_folder_name = row["カテゴリ2"].strip()
+                    if not target_folder_name:
+                        target_folder_name = row["カテゴリ1"].strip()
+
+                    folder_id = folder_name_to_id.get(target_folder_name, "")
+                    status = "✅ OK" if folder_id else "❌ フォルダ未検出"
+
+                    # URL検証
+                    url = row["URL"].strip()
+                    if not url:
+                        status = "❌ URL未入力"
+                    elif not url.startswith("http"):
+                        status = "❌ URL不正"
+
+                    file_name = row["ファイル名"].strip()
+                    if not file_name:
+                        status = "❌ ファイル名未入力"
+
+                    preview_data.append({
+                        "No": idx + 1,
+                        "コピー先": f"{target_folder_name}（ID: {folder_id}）" if folder_id else target_folder_name,
+                        "カテゴリパス": cat_path,
+                        "ファイル名": file_name,
+                        "URL": url,
+                        "チェック": status,
+                        "_folder_id": folder_id,
+                        "_url": url,
+                        "_file_name": file_name,
+                    })
+
+                # プレビュー表示
+                preview_df = pd.DataFrame(preview_data)
+                display_df = preview_df[["No", "コピー先", "カテゴリパス", "ファイル名", "URL", "チェック"]]
+
+                ok_count = sum(1 for d in preview_data if d["チェック"] == "✅ OK")
+                ng_count = len(preview_data) - ok_count
+
+                if ng_count > 0:
+                    st.warning(f"実行可能: {ok_count} 件 / エラー: {ng_count} 件（エラー行はスキップされます）")
+                else:
+                    st.success(f"全 {ok_count} 件 実行可能です")
+
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+                # 上書きオプション
+                overwrite = st.checkbox("同名ファイルが存在する場合は上書きする", value=False, key="csv_copy_overwrite")
+
+                # 実行ボタン
+                if ok_count > 0 and st.button("📋 コピー実行", type="primary"):
+                    progress = st.progress(0, text="コピー中...")
+                    results = []
+                    target_rows = [d for d in preview_data if d["チェック"] == "✅ OK"]
+                    total = len(target_rows)
+
+                    for i, row_data in enumerate(target_rows):
+                        progress.progress((i + 1) / total, text=f"コピー中... ({i + 1}/{total}) {row_data['_file_name']}")
+
+                        # 画像をダウンロード
+                        try:
+                            img_response = requests.get(row_data["_url"], timeout=30)
+                            if img_response.status_code != 200:
+                                results.append({
+                                    "No": row_data["No"],
+                                    "ファイル名": row_data["_file_name"],
+                                    "コピー先": row_data["コピー先"],
+                                    "結果": "❌ 失敗",
+                                    "エラー": f"画像ダウンロード失敗: HTTP {img_response.status_code}",
+                                })
+                                continue
+                            file_data = img_response.content
+                        except requests.exceptions.RequestException as e:
+                            results.append({
+                                "No": row_data["No"],
+                                "ファイル名": row_data["_file_name"],
+                                "コピー先": row_data["コピー先"],
+                                "結果": "❌ 失敗",
+                                "エラー": f"画像ダウンロード失敗: {str(e)}",
+                            })
+                            continue
+
+                        # ファイル名の拡張子を元URLから取得
+                        url_path = row_data["_url"].rsplit("/", 1)[-1]
+                        ext = url_path.rsplit(".", 1)[-1] if "." in url_path else "jpg"
+
+                        # fileName（画像名）: 拡張子なし
+                        api_file_name = row_data["_file_name"]
+
+                        # filePath（URLのファイル名）: 拡張子付き、20バイト制限
+                        file_path_name = f"{row_data['_file_name']}.{ext}"
+                        if len(file_path_name.encode("utf-8")) > 20:
+                            stem = row_data["_file_name"]
+                            while len(f"{stem}.{ext}".encode("utf-8")) > 20 and stem:
+                                stem = stem[:-1]
+                            file_path_name = f"{stem}.{ext}"
+
+                        # アップロード
+                        result = upload_image(
+                            file_data=file_data,
+                            file_name=api_file_name,
+                            folder_id=row_data["_folder_id"],
+                            file_path_name=file_path_name,
+                            overwrite=overwrite,
+                        )
+
+                        results.append({
+                            "No": row_data["No"],
+                            "ファイル名": row_data["_file_name"],
+                            "コピー先": row_data["コピー先"],
+                            "結果": "✅ 成功" if result["success"] else "❌ 失敗",
+                            "エラー": result.get("error", ""),
+                        })
+
+                        # API負荷軽減（3 req/sec制限）
+                        if i < total - 1:
+                            time.sleep(0.35)
+
+                    progress.empty()
+
+                    # 結果表示
+                    success_count = sum(1 for r in results if r["結果"] == "✅ 成功")
+                    fail_count = total - success_count
+
+                    if fail_count == 0:
+                        st.success(f"全 {total} 件のコピーが完了しました！")
+                    elif success_count == 0:
+                        st.error(f"全 {total} 件のコピーに失敗しました")
                     else:
                         st.warning(f"成功: {success_count} / 失敗: {fail_count}")
 
