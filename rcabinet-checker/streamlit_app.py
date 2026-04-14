@@ -1539,26 +1539,28 @@ def upload_image(file_data, file_name, folder_id, file_path_name=None, overwrite
     # Content-Typeはrequestsが自動設定（multipart/form-data + boundary）
 
     # XMLパラメータ部分を構築
-    xml_elements = f"<fileName>{file_name}</fileName>"
-    xml_elements += f"<folderId>{folder_id}</folderId>"
+    file_elements = f"<fileName>{file_name}</fileName>"
+    file_elements += f"<folderId>{folder_id}</folderId>"
     if file_path_name:
-        xml_elements += f"<filePath>{file_path_name}</filePath>"
+        file_elements += f"<filePath>{file_path_name}</filePath>"
     if overwrite:
-        xml_elements += "<overWrite>true</overWrite>"
+        file_elements += "<overWrite>true</overWrite>"
 
     xml_body = (
         '<?xml version="1.0" encoding="UTF-8"?>'
-        "<request><cabinetFileInsertRequest>"
-        f"{xml_elements}"
-        "</cabinetFileInsertRequest></request>"
+        "<request><fileInsertRequest><file>"
+        f"{file_elements}"
+        "</file></fileInsertRequest></request>"
     )
 
     try:
         response = requests.post(
             url,
             headers=headers,
-            data={"xml": xml_body},
-            files={"file": (file_name, file_data, "application/octet-stream")},
+            files=[
+                ("xml", (None, xml_body.encode("utf-8"), "text/xml;charset=UTF-8")),
+                ("file", (file_name, file_data, "application/octet-stream")),
+            ],
             timeout=60,
         )
     except requests.exceptions.RequestException as e:
