@@ -4621,7 +4621,7 @@ elif mode == "📋 CSV画像コピー":
         if tmpl_error:
             st.error(f"フォルダ一覧の取得に失敗しました: {tmpl_error}")
         else:
-            styles = get_openpyxl_styles()
+            styles, _ = get_openpyxl_styles()
             Font = styles['Font']
             PatternFill = styles['PatternFill']
             Alignment = styles['Alignment']
