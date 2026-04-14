@@ -1557,10 +1557,8 @@ def upload_image(file_data, file_name, folder_id, file_path_name=None, overwrite
         response = requests.post(
             url,
             headers=headers,
-            files={
-                "xml": ("xml", xml_body.encode("utf-8"), "text/xml;charset=UTF-8"),
-                "file": (file_name, file_data, "application/octet-stream"),
-            },
+            data={"xml": xml_body},
+            files={"file": (file_name, file_data, "application/octet-stream")},
             timeout=60,
         )
     except requests.exceptions.RequestException as e:
