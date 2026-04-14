@@ -4542,13 +4542,11 @@ elif mode == "📤 画像アップロード":
                     for i, f in enumerate(valid_files):
                         progress.progress((i + 1) / total, text=f"アップロード中... ({i + 1}/{total}) {f.name}")
 
-                        # fileName（画像名）: 50バイト制限
-                        api_file_name = f.name
+                        # fileName（画像名）: 拡張子なし、50バイト制限
+                        api_file_name = f.name.rsplit('.', 1)[0] if '.' in f.name else f.name
                         if len(api_file_name.encode('utf-8')) > 50:
-                            name_part, ext = api_file_name.rsplit('.', 1) if '.' in api_file_name else (api_file_name, '')
-                            while len(f"{name_part}.{ext}".encode('utf-8')) > 50 and name_part:
-                                name_part = name_part[:-1]
-                            api_file_name = f"{name_part}.{ext}" if ext else name_part
+                            while len(api_file_name.encode('utf-8')) > 50 and api_file_name:
+                                api_file_name = api_file_name[:-1]
 
                         # filePath（URLのファイル名）: 20バイト制限、拡張子含む
                         file_path_name = f.name
