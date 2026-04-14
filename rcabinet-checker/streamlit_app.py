@@ -1532,6 +1532,58 @@ def create_folder(folder_name, directory_name=None, upper_folder_id=None):
     return {"success": True, "folder_id": folder_id}
 
 
+def upload_image(file_data, file_name, folder_id, file_path_name=None, overwrite=False):
+    """R-Cabinetに画像を1枚アップロード（cabinet.file.insert）"""
+    url = f"{BASE_URL}/cabinet/file/insert"
+    headers = get_auth_header()
+    # Content-Typeはrequestsが自動設定（multipart/form-data + boundary）
+
+    # XMLパラメータ部分を構築
+    xml_elements = f"<fileName>{file_name}</fileName>"
+    xml_elements += f"<folderId>{folder_id}</folderId>"
+    if file_path_name:
+        xml_elements += f"<filePath>{file_path_name}</filePath>"
+    if overwrite:
+        xml_elements += "<overWrite>true</overWrite>"
+
+    xml_body = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<request><cabinetFileInsertRequest>"
+        f"{xml_elements}"
+        "</cabinetFileInsertRequest></request>"
+    )
+
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            files={
+                "xml": ("xml", xml_body.encode("utf-8"), "text/xml;charset=UTF-8"),
+                "file": (file_name, file_data, "application/octet-stream"),
+            },
+            timeout=60,
+        )
+    except requests.exceptions.RequestException as e:
+        return {"success": False, "error": f"接続エラー: {str(e)}"}
+
+    if response.status_code != 200:
+        return {"success": False, "error": f"HTTP {response.status_code}: {response.text[:500]}"}
+
+    try:
+        root = ET.fromstring(response.text)
+    except ET.ParseError as e:
+        return {"success": False, "error": f"XMLパースエラー: {str(e)}"}
+
+    system_status = root.findtext('.//systemStatus', '')
+    if system_status != 'OK':
+        message = root.findtext('.//message', 'Unknown error')
+        return {"success": False, "error": f"APIエラー: {message}"}
+
+    file_url = root.findtext('.//FileUrl', '')
+    file_id = root.findtext('.//FileId', '')
+    return {"success": True, "file_url": file_url, "file_id": file_id}
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def get_folder_files(folder_id: int, max_retries: int = 3):
     """指定フォルダ内の画像一覧を取得（リトライ機能付き）"""
@@ -1715,7 +1767,7 @@ with st.sidebar:
 
     mode = st.radio(
         "機能を選択",
-        ["🔄 画像ワークフロー", "📂 画像一覧取得", "🔍 画像存在チェック", "🖼️ 新規画像取得", "📁 フォルダ一括作成"],
+        ["🔄 画像ワークフロー", "📂 画像一覧取得", "🔍 画像存在チェック", "🖼️ 新規画像取得", "📁 フォルダ一括作成", "📤 画像アップロード"],
         label_visibility="collapsed"
     )
 
@@ -4423,3 +4475,116 @@ elif mode == "📁 フォルダ一括作成":
                     use_container_width=True,
                     hide_index=True
                 )
+
+# ============================
+# 📤 画像アップロード
+# ============================
+elif mode == "📤 画像アップロード":
+    st.markdown("## 📤 画像アップロード")
+    st.markdown("R-Cabinetのフォルダに画像をアップロードします。")
+
+    # フォルダ一覧を取得
+    with st.spinner("フォルダ一覧を取得中..."):
+        folders, folder_error = get_all_folders()
+
+    if folder_error:
+        st.error(f"フォルダ一覧の取得に失敗しました: {folder_error}")
+    elif not folders:
+        st.warning("フォルダが見つかりません。先にフォルダを作成してください。")
+    else:
+        # フォルダ選択
+        folder_options = {f"{f['FolderName']}（ID: {f['FolderId']}）": f for f in folders}
+        selected_label = st.selectbox(
+            "アップロード先フォルダ",
+            options=list(folder_options.keys()),
+            help="画像をアップロードするフォルダを選択してください"
+        )
+        selected_folder = folder_options[selected_label]
+
+        # 画像ファイル選択
+        uploaded_files = st.file_uploader(
+            "画像ファイルを選択",
+            type=["jpg", "jpeg", "png", "gif", "tiff", "bmp"],
+            accept_multiple_files=True,
+            help="対応形式: JPEG, PNG, GIF, TIFF, BMP（1ファイル2MBまで、最大3840x3840px）"
+        )
+
+        if uploaded_files:
+            # バリデーション
+            valid_files = []
+            for f in uploaded_files:
+                if f.size > 2 * 1024 * 1024:
+                    st.warning(f"⚠️ {f.name}: ファイルサイズが2MBを超えています（{f.size / 1024 / 1024:.1f}MB）")
+                else:
+                    valid_files.append(f)
+
+            if valid_files:
+                st.info(f"📎 {len(valid_files)} ファイル選択済み")
+
+                # プレビュー
+                cols = st.columns(min(len(valid_files), 4))
+                for i, f in enumerate(valid_files[:4]):
+                    with cols[i]:
+                        st.image(f, caption=f.name, width=150)
+                        st.caption(f"{f.size / 1024:.0f} KB")
+                if len(valid_files) > 4:
+                    st.caption(f"他 {len(valid_files) - 4} ファイル...")
+
+                # 上書きオプション
+                overwrite = st.checkbox("同名ファイルが存在する場合は上書きする", value=False)
+
+                # アップロード実行
+                if st.button("📤 アップロード実行", type="primary"):
+                    progress = st.progress(0, text="アップロード中...")
+                    results = []
+                    total = len(valid_files)
+
+                    for i, f in enumerate(valid_files):
+                        progress.progress((i + 1) / total, text=f"アップロード中... ({i + 1}/{total}) {f.name}")
+
+                        # ファイル名をAPIの制限（50バイト）に合わせる
+                        api_file_name = f.name
+                        if len(api_file_name.encode('utf-8')) > 50:
+                            # 拡張子を保持しつつ切り詰め
+                            name_part, ext = api_file_name.rsplit('.', 1) if '.' in api_file_name else (api_file_name, '')
+                            while len(f"{name_part}.{ext}".encode('utf-8')) > 50 and name_part:
+                                name_part = name_part[:-1]
+                            api_file_name = f"{name_part}.{ext}" if ext else name_part
+
+                        f.seek(0)
+                        result = upload_image(
+                            file_data=f.read(),
+                            file_name=api_file_name,
+                            folder_id=selected_folder["FolderId"],
+                            overwrite=overwrite,
+                        )
+
+                        results.append({
+                            "ファイル名": f.name,
+                            "結果": "✅ 成功" if result["success"] else "❌ 失敗",
+                            "URL": result.get("file_url", ""),
+                            "エラー": result.get("error", ""),
+                        })
+
+                        # API負荷軽減（3 req/sec制限）
+                        if i < total - 1:
+                            time.sleep(0.35)
+
+                    progress.empty()
+
+                    # 結果表示
+                    success_count = sum(1 for r in results if r["結果"] == "✅ 成功")
+                    fail_count = total - success_count
+
+                    if fail_count == 0:
+                        st.success(f"全 {total} ファイルのアップロードが完了しました！")
+                    elif success_count == 0:
+                        st.error(f"全 {total} ファイルのアップロードに失敗しました")
+                    else:
+                        st.warning(f"成功: {success_count} / 失敗: {fail_count}")
+
+                    st.dataframe(
+                        pd.DataFrame(results),
+                        use_container_width=True,
+                        hide_index=True
+                    )
