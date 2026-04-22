@@ -2266,6 +2266,12 @@ if mode == "🔄 画像ワークフロー":
             st.caption(
                 "🔍 存在チェック対象フォルダ: **セット** / **単品** / **予約** のみ（他フォルダ・サブフォルダは対象外）"
             )
+            text_type = st.radio(
+                "種別を選択",
+                ["セット品", "単品", "予約"],
+                horizontal=True,
+                key="step1_text_type",
+            )
             text_input = st.text_area(
                 "コミックNo（改行区切り）",
                 height=150,
@@ -2274,9 +2280,11 @@ if mode == "🔄 画像ワークフロー":
             if text_input:
                 comic_numbers = [line.strip() for line in text_input.split('\n') if line.strip()]
                 comic_numbers = list(dict.fromkeys(comic_numbers))
-                st.info(f"入力: {len(comic_numbers)}件（対象3フォルダ全体で検索）")
-                # テキスト入力は種別不明のため None（全対象フォルダを検索）
-                st.session_state.workflow_data['typed_comics'] = None
+                st.info(f"入力: {len(comic_numbers)}件 / 種別: **{text_type}**（{text_type}フォルダ配下のみ検索）")
+                # 選択された種別にのみ紐付けて typed_comics を構築
+                typed_comics_text = {"セット品": [], "単品": [], "予約": []}
+                typed_comics_text[text_type] = comic_numbers
+                st.session_state.workflow_data['typed_comics'] = typed_comics_text
 
         col1, col2 = st.columns([1, 1])
         with col1:
