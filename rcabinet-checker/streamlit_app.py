@@ -497,36 +497,26 @@ def load_images_from_db() -> tuple[list, str]:
             # file_urlをJSONとして解析（新形式: {フォルダ名: URL} の辞書）
             try:
                 url_data = json.loads(file_url_raw)
-                if isinstance(url_data, dict) and url_data:
-                    # 新形式: フォルダ別に行を展開（各フォルダが正確なURLを持つ）
-                    for folder in folder_names_str.split(", "):
-                        folder = folder.strip()
-                        if folder:
-                            url = url_data.get(folder, next(iter(url_data.values()), ""))
-                            images.append({
-                                "FolderName": folder,
-                                "FolderPath": path_map.get(folder, ""),
-                                "FileName": file_name,
-                                "FileUrl": url,
-                                "FileSize": file_size,
-                                "TimeStamp": file_timestamp
-                            })
-                else:
-                    images.append({
-                        "FolderName": folder_names_str,
-                        "FolderPath": path_map.get(folder_names_str, ""),
-                        "FileName": file_name,
-                        "FileUrl": file_url_raw,
-                        "FileSize": file_size,
-                        "TimeStamp": file_timestamp
-                    })
+                if not isinstance(url_data, dict):
+                    url_data = {}
             except (json.JSONDecodeError, TypeError):
-                # 旧形式: URLが文字列のまま（DB移行前のデータ）
+                url_data = {}
+
+            # folder_names は必ず分割して展開（file_urlの形式に依存しない）
+            folder_list = [f.strip() for f in folder_names_str.split(", ") if f.strip()]
+            if not folder_list:
+                folder_list = [folder_names_str] if folder_names_str else [""]
+
+            for folder in folder_list:
+                if url_data:
+                    url = url_data.get(folder, next(iter(url_data.values()), ""))
+                else:
+                    url = file_url_raw
                 images.append({
-                    "FolderName": folder_names_str,
-                    "FolderPath": path_map.get(folder_names_str, ""),
+                    "FolderName": folder,
+                    "FolderPath": path_map.get(folder, ""),
                     "FileName": file_name,
-                    "FileUrl": file_url_raw,
+                    "FileUrl": url,
                     "FileSize": file_size,
                     "TimeStamp": file_timestamp
                 })
