@@ -2330,7 +2330,10 @@ if mode == "🔄 画像ワークフロー":
             if exists_items:
                 rec_count = len(exists_items) - len(exists_items_no_rec)
                 if exists_items_no_rec:
-                    expander_label = f"📦 存在あり画像をダウンロード（{len(exists_items_no_rec)}件、REC {rec_count}件除外）"
+                    if rec_count > 0:
+                        expander_label = f"📦 存在あり画像をダウンロード（{len(exists_items_no_rec)}件、REC {rec_count}件除外）"
+                    else:
+                        expander_label = f"📦 存在あり画像をダウンロード（{len(exists_items_no_rec)}件）"
                 else:
                     expander_label = f"📦 存在あり画像（{len(exists_items)}件すべてRECフォルダ）"
                 with st.expander(expander_label):
