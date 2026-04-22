@@ -123,6 +123,19 @@ CHECK_TARGET_FOLDERS = {
 GITHUB_COMIC_LIST_PATH = "comic-lister/data/comic_list.csv"
 GITHUB_FOLDER_HIERARCHY_PATH = "comic-lister/data/folder_hierarchy.xlsx"
 
+# 楽天RMS画像フォルダ管理シート: path prefix → シート名
+FOLDER_MANAGEMENT_SHEETS = [
+    ("/comic/comic-set",     "コミック・セット"),
+    ("/comic/comic-tanpin",  "コミック・単品"),
+    ("/comic/comic-yoyaku",  "コミック・予約"),
+    ("/dvdblu",              "DVD・ブルーレイ"),
+    ("/toy",                 "おもちゃ"),
+    ("/calenda",             "カレンダー"),
+    ("/st",                  "文房具"),
+    ("/bk",                  "本、雑誌"),
+    ("/kagu",                "家具"),
+]
+
 # Gemini API設定（セルフヒーリング用）
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
@@ -591,6 +604,92 @@ def load_images_from_db_by_folder(folder_name: str) -> list:
         return images
     except Exception:
         return []
+
+
+def build_folder_management_xlsx(folders: list, files: list) -> bytes:
+    """楽天RMS画像フォルダ管理シート形式のExcelを生成"""
+    import openpyxl
+    styles, utils = get_openpyxl_styles()
+    Font = styles['Font']
+    Alignment = styles['Alignment']
+    PatternFill = styles['PatternFill']
+    get_column_letter = utils['get_column_letter']
+
+    path_to_name = {
+        (f.get('FolderPath') or ''): (f.get('FolderName') or '')
+        for f in folders if f.get('FolderPath')
+    }
+
+    def classify_sheet(folder_path: str):
+        if not folder_path:
+            return None
+        for prefix, sheet in FOLDER_MANAGEMENT_SHEETS:
+            if folder_path == prefix or folder_path.startswith(prefix + '/'):
+                return sheet
+        return None
+
+    def split_path(folder_path: str):
+        parts = [p for p in folder_path.strip('/').split('/') if p]
+        d1 = '/' + parts[0] if len(parts) >= 1 else None
+        d2 = '/' + '/'.join(parts[:2]) if len(parts) >= 2 else None
+        d3 = '/' + '/'.join(parts[:3]) if len(parts) >= 3 else None
+        return d1, d2, d3
+
+    wb = openpyxl.Workbook()
+
+    # シート1: フォルダ一覧
+    ws = wb.active
+    ws.title = "フォルダ一覧"
+    ws.append(["No.", "フォルダ名", "ディレクトリパス", "フォルダID"])
+    for i, f in enumerate(folders, start=1):
+        ws.append([i, f.get('FolderName', ''), f.get('FolderPath', ''), f.get('FolderId', '')])
+
+    # カテゴリ別シート（空でも作成）
+    sheet_rows = {sheet: [] for _, sheet in FOLDER_MANAGEMENT_SHEETS}
+    for f in files:
+        sheet_name = classify_sheet(f.get('FolderPath', ''))
+        if not sheet_name:
+            continue
+        d1, d2, d3 = split_path(f.get('FolderPath', ''))
+        c1 = path_to_name.get(d1) if d1 else None
+        c2 = path_to_name.get(d2) if d2 else None
+        c3 = path_to_name.get(d3) if d3 else None
+        sheet_rows[sheet_name].append([
+            f.get('FileName', ''), c1, c2, c3, d1, d2, d3
+        ])
+
+    for _, sheet_name in FOLDER_MANAGEMENT_SHEETS:
+        ws = wb.create_sheet(sheet_name)
+        ws.append(["No.", "ファイル名", "カテゴリ１", "カテゴリ２", "カテゴリ３",
+                   "ディレクトリ１", "ディレクトリ２", "ディレクトリ３"])
+        for i, row in enumerate(sheet_rows[sheet_name], start=1):
+            ws.append([i] + row)
+
+    # スタイル（Meiryo UI、ヘッダ太字・塗り、列幅オート）
+    header_fill = PatternFill(start_color="FFE7E6E6", end_color="FFE7E6E6", fill_type="solid")
+    for ws in wb.worksheets:
+        for cell in ws[1]:
+            cell.font = Font(name="Meiryo UI", size=10, bold=True)
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.font = Font(name="Meiryo UI", size=10)
+        # 列幅オート
+        for col_idx in range(1, ws.max_column + 1):
+            max_len = 0
+            for cell in ws[get_column_letter(col_idx)]:
+                v = cell.value
+                if v is None:
+                    continue
+                length = sum(2 if ord(ch) > 255 else 1 for ch in str(v))
+                if length > max_len:
+                    max_len = length
+            ws.column_dimensions[get_column_letter(col_idx)].width = min(max(max_len + 2, 10), 60)
+
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 def check_password():
@@ -3379,6 +3478,81 @@ elif mode == "📂 画像一覧取得":
             "🔄 最新一覧を取得",
             type="primary",
             help="APIから最新データを取得してDBに同期（フォルダ一覧も更新）"
+        )
+
+    st.divider()
+
+    # Excel一括ダウンロード（楽天RMS画像フォルダ管理シート形式）
+    st.markdown("#### 📥 楽天RMS画像フォルダ管理シート（Excel）")
+    st.caption("フォルダ一覧＋カテゴリ別シートで画像を一覧化したExcelをダウンロードします。")
+    xlsx_col1, xlsx_col2 = st.columns(2)
+    with xlsx_col1:
+        xlsx_latest_btn = st.button(
+            "🔄 最新をAPIから取得してダウンロード",
+            help="R-Cabinet APIから最新のフォルダ構成・画像一覧を取得してExcel生成（時間がかかります）",
+            key="xlsx_latest_btn",
+        )
+    with xlsx_col2:
+        xlsx_db_btn = st.button(
+            "📋 前回実行時の状態をダウンロード",
+            help="DBに保存済みのデータ（前回同期時点のスナップショット）からExcel生成",
+            key="xlsx_db_btn",
+        )
+
+    if xlsx_latest_btn:
+        with st.spinner("フォルダ一覧を取得中..."):
+            latest_folders, f_err = get_all_folders()
+        if f_err or not latest_folders:
+            st.error(f"フォルダ取得エラー: {f_err or 'データなし'}")
+        else:
+            all_files_for_xlsx = []
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            for i, folder in enumerate(latest_folders):
+                status_text.text(f"取得中: {folder['FolderName']} ({i + 1}/{len(latest_folders)})")
+                progress_bar.progress((i + 1) / len(latest_folders))
+                files, _ = get_folder_files(int(folder['FolderId']))
+                if files:
+                    for fl in files:
+                        fl['FolderName'] = folder['FolderName']
+                        fl['FolderPath'] = folder.get('FolderPath', '')
+                    all_files_for_xlsx.extend(files)
+                time.sleep(0.3)
+            progress_bar.empty()
+            status_text.empty()
+            with st.spinner("Excel生成中..."):
+                xlsx_bytes = build_folder_management_xlsx(latest_folders, all_files_for_xlsx)
+            st.session_state.xlsx_latest_bytes = xlsx_bytes
+            st.session_state.xlsx_latest_count = len(all_files_for_xlsx)
+            st.success(f"✅ 最新版Excel生成完了（{len(latest_folders)}フォルダ / {len(all_files_for_xlsx)}ファイル）")
+
+    if xlsx_db_btn:
+        with st.spinner("DBから読込中..."):
+            db_images, _msg = load_images_from_db()
+        if not db_images:
+            st.warning("DBにデータがありません。「最新一覧を取得」を先に実行してください。")
+        else:
+            with st.spinner("Excel生成中..."):
+                xlsx_bytes = build_folder_management_xlsx(folders, db_images)
+            st.session_state.xlsx_db_bytes = xlsx_bytes
+            st.session_state.xlsx_db_count = len(db_images)
+            st.success(f"✅ 前回データExcel生成完了（{len(folders)}フォルダ / {len(db_images)}ファイル）")
+
+    if st.session_state.get("xlsx_latest_bytes"):
+        st.download_button(
+            label=f"⬇️ 最新版をダウンロード（{st.session_state.xlsx_latest_count}件）",
+            data=st.session_state.xlsx_latest_bytes,
+            file_name=f"楽天RMS画像フォルダ管理シート_最新_{datetime.now(JST).strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="xlsx_latest_dl",
+        )
+    if st.session_state.get("xlsx_db_bytes"):
+        st.download_button(
+            label=f"⬇️ 前回データをダウンロード（{st.session_state.xlsx_db_count}件）",
+            data=st.session_state.xlsx_db_bytes,
+            file_name=f"楽天RMS画像フォルダ管理シート_前回_{datetime.now(JST).strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="xlsx_db_dl",
         )
 
     st.divider()
