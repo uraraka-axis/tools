@@ -3456,20 +3456,6 @@ elif mode == "📂 画像一覧取得":
         last_updated = st.session_state.get("last_sync_time") or "-"
         st.metric("最終更新", last_updated)
 
-    # 操作ボタン（2つ）
-    btn_col1, btn_col2, _ = st.columns([1.5, 1.5, 1])
-    with btn_col1:
-        show_db_btn = st.button(
-            "📋 前回取得データを表示",
-            help="前回APIから取得してDBに保存したデータを表示（高速）"
-        )
-    with btn_col2:
-        fetch_api_btn = st.button(
-            "🔄 最新一覧を取得",
-            type="primary",
-            help="APIから最新データを取得してDBに同期（フォルダ一覧も更新）"
-        )
-
     st.divider()
 
     # Excel一括ダウンロード（楽天RMS画像フォルダ管理シート形式）
@@ -3520,7 +3506,7 @@ elif mode == "📂 画像一覧取得":
         with st.spinner("DBから読込中..."):
             db_images, _msg = load_images_from_db()
         if not db_images:
-            st.warning("DBにデータがありません。「最新一覧を取得」を先に実行してください。")
+            st.warning("DBにデータがありません。日次同期が完了してから再実行してください。")
         else:
             with st.spinner("Excel生成中..."):
                 xlsx_bytes = build_folder_management_xlsx(folders, db_images)
@@ -3544,186 +3530,6 @@ elif mode == "📂 画像一覧取得":
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="xlsx_db_dl",
         )
-
-    st.divider()
-
-    # フォルダ選択（絞り込み）
-    folder_options = {"📁 すべて（全フォルダ）": None}
-    folder_options.update({f"{f['FolderName']} ({f['FileCount']}件)": f for f in folders})
-
-    selected_folder_name = st.selectbox(
-        "フォルダで絞り込み",
-        list(folder_options.keys()),
-    )
-
-    # ボタン押下時の処理
-    if show_db_btn:
-        st.session_state.images_loaded = False
-        st.session_state.images_data = None
-
-        if selected_folder_name == "📁 すべて（全フォルダ）":
-            # 全フォルダ: DBから読み込み（高速）
-            st.session_state.data_source = "db"
-            loaded_images, msg = load_images_from_db()
-            if loaded_images:
-                st.session_state.images_data = loaded_images
-                st.session_state.images_loaded = True
-                st.session_state.error_folders = []
-                st.success(f"📂 DBから{msg}")
-            else:
-                st.warning("DBにデータがありません")
-        else:
-            # 個別フォルダ: APIから直接取得（高速）
-            st.session_state.data_source = "api"
-            selected_folder = folder_options[selected_folder_name]
-            folder_id = int(selected_folder['FolderId'])
-            folder_name = selected_folder['FolderName']
-
-            with st.spinner(f"「{folder_name}」を取得中..."):
-                files, error = get_folder_files(folder_id)
-
-            if error:
-                st.error(error)
-            elif files:
-                for f in files:
-                    f['FolderName'] = folder_name
-                st.session_state.images_data = files
-                st.session_state.images_loaded = True
-                st.session_state.error_folders = []
-                st.success(f"📂 APIから{len(files)}件を取得しました")
-            else:
-                st.warning("画像がありません")
-
-    if fetch_api_btn:
-        # APIから取得してDB同期
-        st.session_state.data_source = "api"
-        st.session_state.images_loaded = False
-        st.session_state.images_data = None
-
-        # フォルダ一覧も最新化
-        with st.spinner("フォルダ一覧を更新中..."):
-            new_folders, folder_error = get_all_folders()
-        if not folder_error and new_folders:
-            st.session_state.folders_data = new_folders
-            folders = new_folders
-            total_files = sum(f['FileCount'] for f in folders)
-
-        if selected_folder_name == "📁 すべて（全フォルダ）":
-            # 全フォルダの画像を取得
-            all_files = []
-            error_folders = []
-            expected_total = sum(f['FileCount'] for f in folders)
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-
-            for i, folder in enumerate(folders):
-                status_text.text(f"取得中: {folder['FolderName']} ({i + 1}/{len(folders)}) - {folder['FileCount']}件")
-                progress_bar.progress((i + 1) / len(folders))
-
-                files, err = get_folder_files(int(folder['FolderId']))
-                time.sleep(0.5)
-
-                if err:
-                    error_folders.append({
-                        'FolderName': folder['FolderName'],
-                        'FolderId': folder['FolderId'],
-                        'FileCount': folder['FileCount'],
-                        'Error': err
-                    })
-                if files:
-                    for f in files:
-                        f['FolderName'] = folder['FolderName']
-                    all_files.extend(files)
-
-            progress_bar.empty()
-            status_text.empty()
-
-            # DB同期
-            with st.spinner("DBに同期中..."):
-                sync_result = sync_images_to_db(all_files)
-
-            if sync_result.get("success"):
-                st.success(f"🔄 API取得完了・DB同期済み（新規: {sync_result['new']} / 更新: {sync_result['updated']} / 重複: {sync_result['duplicate']}）")
-                if sync_result['duplicate'] > 0:
-                    st.warning(f"⚠️ {sync_result['duplicate']}件のファイルが複数フォルダに存在")
-                st.session_state.last_sync_time = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
-            else:
-                st.error(f"DB同期エラー: {sync_result.get('error')}")
-
-            st.session_state.images_data = all_files
-            st.session_state.error_folders = error_folders
-            st.session_state.expected_total = expected_total
-            st.session_state.images_loaded = True
-        else:
-            # 個別フォルダの場合
-            selected_folder = folder_options[selected_folder_name]
-            folder_id = int(selected_folder['FolderId'])
-
-            with st.spinner(f"「{selected_folder['FolderName']}」の画像を取得中..."):
-                files, error = get_folder_files(folder_id)
-
-            if error:
-                st.error(error)
-            elif files:
-                for f in files:
-                    f['FolderName'] = selected_folder['FolderName']
-
-                # DB同期
-                with st.spinner("DBに同期中..."):
-                    sync_result = sync_images_to_db(files)
-
-                if sync_result.get("success"):
-                    st.success(f"🔄 取得完了（{len(files)}件）・DB同期済み")
-                    st.session_state.last_sync_time = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
-
-                st.session_state.images_data = files
-                st.session_state.error_folders = []
-                st.session_state.images_loaded = True
-
-    # 画像一覧表示
-    if st.session_state.images_loaded and st.session_state.images_data:
-        all_files = st.session_state.images_data
-        error_folders = st.session_state.get('error_folders', [])
-
-        if all_files:
-            # サマリー表示
-            st.success(f"📷 {len(all_files)} 件の画像")
-
-            # エラーフォルダがあれば表示
-            if error_folders:
-                with st.expander(f"⚠️ エラーが発生したフォルダ ({len(error_folders)}件)", expanded=False):
-                    for ef in error_folders:
-                        st.write(f"- **{ef['FolderName']}** ({ef['FileCount']}件): {ef['Error']}")
-
-            # 検索フィルター
-            search_term = st.text_input("🔍 ファイル名で絞り込み", placeholder="検索キーワード")
-
-            display_files = all_files
-            if search_term:
-                display_files = [f for f in all_files if search_term.lower() in f['FileName'].lower()]
-                st.info(f"絞り込み結果: {len(display_files)} 件")
-
-            # データフレーム表示
-            df = pd.DataFrame(display_files)
-            df = df[['FolderName', 'FileName', 'FileUrl', 'FileSize', 'TimeStamp']]
-            df.columns = ['フォルダ', 'ファイル名', 'URL', 'サイズ(KB)', '更新日時']
-
-            st.dataframe(df, use_container_width=True, height=500)
-
-            # Excelダウンロード
-            excel_buffer = BytesIO()
-            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                df.to_excel(writer, index=False, sheet_name='Sheet1')
-                style_excel(writer.sheets['Sheet1'], num_columns=5, url_column=3)
-            excel_buffer.seek(0)
-            st.download_button(
-                label="📥 Excelでダウンロード",
-                data=excel_buffer,
-                file_name="rcabinet_images.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        else:
-            st.warning("画像がありません。")
 
 
 elif mode == "🔍 画像存在チェック":
@@ -3799,7 +3605,7 @@ elif mode == "🔍 画像存在チェック":
             status_text.empty()
 
             if results is None:
-                st.error("DBにデータがありません。先に「📂 画像一覧取得」で「最新一覧を取得」を実行してください。")
+                st.error("DBにデータがありません。日次同期が完了してから再実行してください。")
             else:
                 # 結果をsession_stateに保存
                 st.session_state.check_results = results
