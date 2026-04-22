@@ -110,7 +110,16 @@ GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN", "")
 GITHUB_REPO = "uraraka-axis/tools"
 GITHUB_MISSING_CSV_PATH = "comic-lister/data/missing_comics.csv"
 GITHUB_MISSING_TANPIN_PATH = "comic-lister/data/missing_tanpin.csv"  # 単品用
+GITHUB_MISSING_YOYAKU_PATH = "comic-lister/data/missing_yoyaku.csv"  # 予約用
 GITHUB_IS_LIST_PATH = "comic-lister/data/is_list.csv"
+
+# 画像存在チェック対象フォルダ（種別 → R-Cabinetのフォルダパス prefix）
+# folder_path が指定prefixで始まるフォルダをすべて対象とする（サブフォルダ含む）
+CHECK_TARGET_FOLDERS = {
+    "セット品": "/comic/comic-set",      # セット配下（セット1, セット2 等含む）
+    "単品": "/comic/comic-tanpin",        # 単品配下
+    "予約": "/comic/comic-yoyaku",        # 予約配下
+}
 GITHUB_COMIC_LIST_PATH = "comic-lister/data/comic_list.csv"
 GITHUB_FOLDER_HIERARCHY_PATH = "comic-lister/data/folder_hierarchy.xlsx"
 
@@ -464,6 +473,14 @@ def load_images_from_db() -> tuple[list, str]:
             file_name = row.get("file_name", "")
             file_size = row.get("file_size", 0)
             file_timestamp = row.get("file_timestamp", "")
+            # folder_path をパース（新形式: {フォルダ名: パス} の辞書 / 未設定の場合は None）
+            folder_path_raw = row.get("folder_path", "")
+            try:
+                path_map = json.loads(folder_path_raw) if folder_path_raw else {}
+                if not isinstance(path_map, dict):
+                    path_map = {}
+            except (json.JSONDecodeError, TypeError):
+                path_map = {}
             # file_urlをJSONとして解析（新形式: {フォルダ名: URL} の辞書）
             try:
                 url_data = json.loads(file_url_raw)
@@ -475,6 +492,7 @@ def load_images_from_db() -> tuple[list, str]:
                             url = url_data.get(folder, next(iter(url_data.values()), ""))
                             images.append({
                                 "FolderName": folder,
+                                "FolderPath": path_map.get(folder, ""),
                                 "FileName": file_name,
                                 "FileUrl": url,
                                 "FileSize": file_size,
@@ -483,6 +501,7 @@ def load_images_from_db() -> tuple[list, str]:
                 else:
                     images.append({
                         "FolderName": folder_names_str,
+                        "FolderPath": path_map.get(folder_names_str, ""),
                         "FileName": file_name,
                         "FileUrl": file_url_raw,
                         "FileSize": file_size,
@@ -492,6 +511,7 @@ def load_images_from_db() -> tuple[list, str]:
                 # 旧形式: URLが文字列のまま（DB移行前のデータ）
                 images.append({
                     "FolderName": folder_names_str,
+                    "FolderPath": path_map.get(folder_names_str, ""),
                     "FileName": file_name,
                     "FileUrl": file_url_raw,
                     "FileSize": file_size,
@@ -1680,10 +1700,19 @@ def is_exact_match(file_name: str, comic_no: str) -> bool:
     return name_without_ext == comic_no
 
 
-def check_comic_images(comic_numbers: list, progress_bar=None, status_text=None):
-    """コミックNoリストの画像存在チェック（DB参照版 - 高速）"""
+def check_comic_images(comic_numbers: list, progress_bar=None, status_text=None, typed_comics: dict = None):
+    """コミックNoリストの画像存在チェック（DB参照版 - 高速）
+
+    検索対象は CHECK_TARGET_FOLDERS の各パスprefix配下のみ
+    （例: /comic/comic-set 配下なら、セット本体・セット1・セット2などすべて含む）。
+    全く別のフォルダ（例: /other）は対象外。
+
+    Args:
+        comic_numbers: フラットなコミックNoリスト（typed_comics 未指定時に使用）。
+        typed_comics: {種別ラベル: [コミックNo, ...]} - 指定時は種別ごとに対応パスで検索。
+                      種別ラベルは CHECK_TARGET_FOLDERS のキー（"セット品" / "単品" / "予約"）。
+    """
     results = []
-    total = len(comic_numbers)
 
     # DBから全画像データを取得（1回だけ）
     if status_text:
@@ -1694,55 +1723,92 @@ def check_comic_images(comic_numbers: list, progress_bar=None, status_text=None)
     all_images, _ = load_images_from_db()
 
     if not all_images:
-        # DBにデータがない場合はエラー
         return None
 
     if progress_bar:
         progress_bar.progress(0.3)
 
-    # ファイル名（拡張子除く）→ 画像情報の辞書を作成
     if status_text:
         status_text.text("検索インデックスを作成中...")
 
-    image_dict = {}
+    # 種別別インデックス: {type_label: {comic_no(ext除く): [img, ...]}}
+    # folder_path のprefixで種別を判定し、対象外画像は一切インデックス化しない
+    def classify(folder_path: str) -> str | None:
+        """folder_pathから種別ラベルを判定。対象外なら None。"""
+        if not folder_path:
+            return None
+        for label, prefix in CHECK_TARGET_FOLDERS.items():
+            # 完全一致 or prefix配下（サブフォルダ: /comic/comic-set/sub1）
+            if folder_path == prefix or folder_path.startswith(prefix + '/'):
+                return label
+        return None
+
+    index_by_type: dict = {label: {} for label in CHECK_TARGET_FOLDERS.keys()}
     for img in all_images:
+        folder_path = (img.get('FolderPath') or '').strip()
+        type_label = classify(folder_path)
+        if not type_label:
+            continue
         file_name = img.get('FileName', '')
         name_without_ext = file_name.rsplit('.', 1)[0] if '.' in file_name else file_name
-        if name_without_ext not in image_dict:
-            image_dict[name_without_ext] = []
-        image_dict[name_without_ext].append(img)
+        index_by_type[type_label].setdefault(name_without_ext, []).append(img)
 
     if progress_bar:
         progress_bar.progress(0.5)
 
-    # 各コミックNoをチェック（メモリ内検索なので高速）
     if status_text:
         status_text.text("チェック中...")
 
-    for i, comic_no in enumerate(comic_numbers):
-        comic_no_str = str(comic_no).strip()
+    # 検索タスクを「(種別, コミックNo)」の形に正規化
+    tasks = []
+    if typed_comics:
+        for type_label, comics in typed_comics.items():
+            if type_label not in index_by_type:
+                continue
+            for cno in comics:
+                tasks.append((type_label, cno))
+    else:
+        # 種別指定なし: 全対象種別を横断検索
+        for cno in comic_numbers:
+            tasks.append((None, cno))
 
-        if comic_no_str in image_dict:
-            # 存在する場合
-            for img in image_dict[comic_no_str]:
+    total = len(tasks) or 1
+
+    for i, (type_label, comic_no) in enumerate(tasks):
+        comic_no_str = str(comic_no).strip()
+        matched_imgs = []
+
+        if type_label:
+            # 指定種別のみを検索
+            type_index = index_by_type.get(type_label, {})
+            if comic_no_str in type_index:
+                matched_imgs = type_index[comic_no_str]
+        else:
+            # 全対象種別を横断検索
+            for label in index_by_type:
+                if comic_no_str in index_by_type[label]:
+                    matched_imgs.extend(index_by_type[label][comic_no_str])
+
+        if matched_imgs:
+            for img in matched_imgs:
                 results.append({
                     'コミックNo': comic_no,
+                    '種別': type_label or '-',
                     '存在': '✅ あり',
                     'ファイル名': img.get('FileName', ''),
                     'フォルダ': img.get('FolderName', ''),
                     'URL': img.get('FileUrl', ''),
                 })
         else:
-            # 存在しない場合
             results.append({
                 'コミックNo': comic_no,
+                '種別': type_label or '-',
                 '存在': '❌ なし',
                 'ファイル名': '-',
                 'フォルダ': '-',
                 'URL': '-',
             })
 
-        # 進捗更新（100件ごと）
         if progress_bar and (i + 1) % 100 == 0:
             progress_bar.progress(0.5 + 0.5 * (i + 1) / total)
 
@@ -2125,24 +2191,29 @@ if mode == "🔄 画像ワークフロー":
 
         comic_numbers = []
 
+        # 種別ごとのコミックNoリスト（ファイル間で集約、重複は後で除去）
+        typed_comics_raw = {"セット品": [], "単品": [], "予約": []}
+
         if input_method == "出品シートExcel":
             st.info(
                 "**出品シートExcelをアップロード（複数可）**\n\n"
                 "- セット品 → A列: 商品コード ／ D列: コミックNo\n"
-                "- 単品 → A列: 商品コード ／ E列: コミックNo\n\n"
-                "各ファイルの **Sheet1** が読み込まれます。Step④のヤフーマッピングにも自動連携されます。"
+                "- 単品 → A列: 商品コード ／ E列: コミックNo\n"
+                "- 予約 → A列: 商品コード ／ D列: コミックNo\n\n"
+                "各ファイルの **Sheet1** が読み込まれます。Step④のヤフーマッピングにも自動連携されます。\n\n"
+                "🔍 存在チェック対象フォルダ: **セット** / **単品** / **予約** のみ（他フォルダ・サブフォルダは対象外）"
             )
             excel_files = st.file_uploader("出品シートExcel", type=['xlsx', 'xls'], key="step1_excel", accept_multiple_files=True)
 
             if excel_files:
-                set_comics = []
-                tanpin_comics = []
                 yahoo_files_data = []  # ヤフー連携用
+                # ラベル → yahoo type の変換
+                yahoo_type_map = {"セット品": "set", "単品": "tanpin", "予約": "yoyaku"}
 
                 for idx, excel_file in enumerate(excel_files):
                     file_type = st.radio(
                         f"📄 {excel_file.name}",
-                        ["セット品", "単品"],
+                        ["セット品", "単品", "予約"],
                         horizontal=True,
                         key=f"step1_ftype_{idx}"
                     )
@@ -2152,40 +2223,49 @@ if mode == "🔄 画像ワークフロー":
                         excel_file.seek(0)
                         file_bytes = excel_file.read()
 
-                        if file_type == "セット品":
-                            col_idx = 3  # D列
-                            for i in range(len(df)):
-                                try:
-                                    cno = str(df.iloc[i, col_idx]).strip().replace('.0', '')
-                                    if cno and cno != 'nan' and cno.replace('_', '').isdigit():
-                                        set_comics.append(cno)
-                                except:
-                                    continue
-                            yahoo_files_data.append({'bytes': file_bytes, 'type': 'set'})
-                        else:
-                            col_idx = 4  # E列
-                            for i in range(len(df)):
-                                try:
-                                    cno = str(df.iloc[i, col_idx]).strip().replace('.0', '')
-                                    if cno and cno != 'nan' and cno.replace('_', '').isdigit():
-                                        tanpin_comics.append(cno)
-                                except:
-                                    continue
-                            yahoo_files_data.append({'bytes': file_bytes, 'type': 'tanpin'})
+                        # 単品のみE列、それ以外（セット品・予約）はD列
+                        col_idx = 4 if file_type == "単品" else 3
+                        for i in range(len(df)):
+                            try:
+                                cno = str(df.iloc[i, col_idx]).strip().replace('.0', '')
+                                if cno and cno != 'nan' and cno.replace('_', '').isdigit():
+                                    typed_comics_raw[file_type].append(cno)
+                            except:
+                                continue
+                        yahoo_files_data.append({'bytes': file_bytes, 'type': yahoo_type_map[file_type]})
 
                         st.caption(f"→ {len(df)}行 / コミックNo抽出済み")
 
                     except Exception as e:
                         st.error(f"{excel_file.name} 読み込みエラー: {e}")
 
-                comic_numbers = list(set(set_comics + tanpin_comics))
-                if comic_numbers:
-                    st.info(f"合計: {len(comic_numbers)}件（セット: {len(set_comics)}件, 単品: {len(tanpin_comics)}件）")
+                # 種別ごとにユニーク化（順序保持）
+                typed_comics_unique = {
+                    t: list(dict.fromkeys(v)) for t, v in typed_comics_raw.items()
+                }
+                total_unique = sum(len(v) for v in typed_comics_unique.values())
 
-                # ヤフーマッピング用にセッションに保存
+                if total_unique:
+                    st.info(
+                        f"合計: {total_unique}件 "
+                        f"（セット: {len(typed_comics_unique['セット品'])}件, "
+                        f"単品: {len(typed_comics_unique['単品'])}件, "
+                        f"予約: {len(typed_comics_unique['予約'])}件）"
+                    )
+                    # 元行数と差があれば注意表示
+                    raw_total = sum(len(v) for v in typed_comics_raw.values())
+                    if raw_total != total_unique:
+                        st.caption(f"※ 元の抽出行数 {raw_total}件 から重複 {raw_total - total_unique}件 を除去")
+
+                # 後続処理に渡す
+                comic_numbers = [c for v in typed_comics_unique.values() for c in v]
+                st.session_state.workflow_data['typed_comics'] = typed_comics_unique
                 st.session_state.workflow_data['yahoo_excel_files'] = yahoo_files_data
         else:
             # テキスト入力
+            st.caption(
+                "🔍 存在チェック対象フォルダ: **セット** / **単品** / **予約** のみ（他フォルダ・サブフォルダは対象外）"
+            )
             text_input = st.text_area(
                 "コミックNo（改行区切り）",
                 height=150,
@@ -2193,7 +2273,10 @@ if mode == "🔄 画像ワークフロー":
             )
             if text_input:
                 comic_numbers = [line.strip() for line in text_input.split('\n') if line.strip()]
-                st.info(f"入力: {len(comic_numbers)}件")
+                comic_numbers = list(dict.fromkeys(comic_numbers))
+                st.info(f"入力: {len(comic_numbers)}件（対象3フォルダ全体で検索）")
+                # テキスト入力は種別不明のため None（全対象フォルダを検索）
+                st.session_state.workflow_data['typed_comics'] = None
 
         col1, col2 = st.columns([1, 1])
         with col1:
@@ -2201,7 +2284,13 @@ if mode == "🔄 画像ワークフロー":
                 progress = st.progress(0)
                 status = st.empty()
 
-                results = check_comic_images(comic_numbers, progress, status)
+                typed_comics_for_check = st.session_state.workflow_data.get('typed_comics')
+                results = check_comic_images(
+                    comic_numbers,
+                    progress,
+                    status,
+                    typed_comics=typed_comics_for_check,
+                )
 
                 progress.empty()
                 status.empty()
@@ -2336,9 +2425,10 @@ if mode == "🔄 画像ワークフロー":
                 col1, col2 = st.columns([1, 1])
                 with col1:
                     if st.button("📤 GitHubにアップロード", type="secondary"):
-                        # セット品と単品を分離
-                        set_comics = [r['コミックNo'] for r in missing if '_' not in str(r['コミックNo'])]
-                        tanpin_comics = [r['コミックNo'] for r in missing if '_' in str(r['コミックNo'])]
+                        # 種別（セット品/単品/予約）ごとに分離
+                        set_comics = [r['コミックNo'] for r in missing if r.get('種別') == 'セット品']
+                        tanpin_comics = [r['コミックNo'] for r in missing if r.get('種別') == '単品']
+                        yoyaku_comics = [r['コミックNo'] for r in missing if r.get('種別') == '予約']
 
                         today = datetime.now(JST).strftime('%Y-%m-%d %H:%M')
                         upload_results = []
@@ -2354,6 +2444,12 @@ if mode == "🔄 画像ワークフロー":
                             result = upload_to_github(content, GITHUB_MISSING_TANPIN_PATH, f"Update missing_tanpin.csv ({len(tanpin_comics)}件) - {today}")
                             if result.get("success"):
                                 upload_results.append(f"単品: {len(tanpin_comics)}件 ✅")
+
+                        if yoyaku_comics:
+                            content = '\n'.join([str(c) for c in yoyaku_comics])
+                            result = upload_to_github(content, GITHUB_MISSING_YOYAKU_PATH, f"Update missing_yoyaku.csv ({len(yoyaku_comics)}件) - {today}")
+                            if result.get("success"):
+                                upload_results.append(f"予約: {len(yoyaku_comics)}件 ✅")
 
                         if upload_results:
                             st.success(", ".join(upload_results))
@@ -2399,8 +2495,9 @@ if mode == "🔄 画像ワークフロー":
                 check_results = st.session_state.workflow_data.get('check_results', [])
                 missing = [r for r in check_results if r.get('存在') == '❌ なし']
                 if missing:
-                    set_comics = [r['コミックNo'] for r in missing if '_' not in str(r['コミックNo'])]
-                    tanpin_comics = [r['コミックNo'] for r in missing if '_' in str(r['コミックNo'])]
+                    set_comics = [r['コミックNo'] for r in missing if r.get('種別') == 'セット品']
+                    tanpin_comics = [r['コミックNo'] for r in missing if r.get('種別') == '単品']
+                    yoyaku_comics = [r['コミックNo'] for r in missing if r.get('種別') == '予約']
                     today = datetime.now(JST).strftime('%Y-%m-%d %H:%M')
                     status_area.info("📤 不足リストをGitHubにアップロード中...")
                     if set_comics:
@@ -2409,6 +2506,9 @@ if mode == "🔄 画像ワークフロー":
                     if tanpin_comics:
                         content = '\n'.join([str(c) for c in tanpin_comics])
                         upload_to_github(content, GITHUB_MISSING_TANPIN_PATH, f"Update missing_tanpin.csv ({len(tanpin_comics)}件) - {today}")
+                    if yoyaku_comics:
+                        content = '\n'.join([str(c) for c in yoyaku_comics])
+                        upload_to_github(content, GITHUB_MISSING_YOYAKU_PATH, f"Update missing_yoyaku.csv ({len(yoyaku_comics)}件) - {today}")
                     st.session_state.workflow_data['missing_uploaded'] = True
 
             # 2. GitHub Actionsを起動
