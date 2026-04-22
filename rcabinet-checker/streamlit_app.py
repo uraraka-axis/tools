@@ -5,7 +5,7 @@ R-Cabinet 管理ツール
 """
 
 # バージョン（デプロイ確認用）
-APP_VERSION = "3.0.0"
+APP_VERSION = "5.0.0"
 
 import streamlit as st
 import requests
@@ -14,6 +14,7 @@ import xml.etree.ElementTree as ET
 import pandas as pd
 import time
 import json
+import re
 from io import BytesIO
 from datetime import datetime, timezone, timedelta
 
@@ -648,11 +649,24 @@ def build_folder_management_xlsx(folders: list, files: list) -> bytes:
             f.get('FileName', ''), c1, c2, c3, d1, d2, d3
         ])
 
+    def natural_key(value):
+        """'セット10' > 'セット2' になるよう、数字部分を抽出した自然ソートキー"""
+        s = value or ""
+        m = re.search(r'(\d+)', s)
+        num = int(m.group(1)) if m else 0
+        prefix = re.sub(r'\d+', '', s)
+        return (prefix, num)
+
+    def sort_key(row):
+        # row = [file_name, c1, c2, c3, d1, d2, d3]
+        return (natural_key(row[1]), natural_key(row[2]), natural_key(row[3]), row[0] or "")
+
     for _, sheet_name in FOLDER_MANAGEMENT_SHEETS:
         ws = wb.create_sheet(sheet_name)
         ws.append(["No.", "ファイル名", "カテゴリ１", "カテゴリ２", "カテゴリ３",
                    "ディレクトリ１", "ディレクトリ２", "ディレクトリ３"])
-        for i, row in enumerate(sheet_rows[sheet_name], start=1):
+        sorted_rows = sorted(sheet_rows[sheet_name], key=sort_key)
+        for i, row in enumerate(sorted_rows, start=1):
             ws.append([i] + row)
 
     # スタイル（Meiryo UI、ヘッダ太字・塗り、列幅オート）
@@ -1922,7 +1936,7 @@ with st.sidebar:
 
     mode = st.radio(
         "機能を選択",
-        ["🔄 画像ワークフロー", "📂 画像一覧取得", "🔍 画像存在チェック", "🖼️ 新規画像取得", "📁 フォルダ一括作成", "📤 画像アップロード", "📋 CSV画像コピー"],
+        ["🎨 クリエイティブスタジオ", "🛰️ R-Cabi構成把握", "🏗️ R-Cabiフォルダ制作", "☁️ コピー：Local⇒R-Cabi", "💾 コピー：R-Cabi⇒Local", "🔁 コピー：R-Cabi⇒R-Cabi"],
         label_visibility="collapsed"
     )
 
@@ -2214,10 +2228,10 @@ def render_workflow_step_nav(current_step: int, completed_steps: list):
 
 
 # メインコンテンツ
-if mode == "🔄 画像ワークフロー":
+if mode == "🎨 クリエイティブスタジオ":
     st.markdown(WORKFLOW_CSS, unsafe_allow_html=True)
 
-    st.title("🔄 画像ワークフロー")
+    st.title("🎨 クリエイティブスタジオ")
     st.markdown("不足画像の特定から楽天・ヤフーへのアップロードまで、一気通貫で処理します。")
 
     # セッション状態の初期化
@@ -2241,7 +2255,7 @@ if mode == "🔄 画像ワークフロー":
             "② JAN取得": 2,
             "③ 画像取得": 3,
             "④ アップロード準備": 4,
-            "⑤ API連携": 5
+            "⑤ アップロード": 5
         }
         selected = st.selectbox(
             "移動先",
@@ -3258,7 +3272,7 @@ if mode == "🔄 画像ワークフロー":
                     st.rerun()
 
     # ============================================================
-    # Step 5: API連携
+    # Step 5: アップロード
     # ============================================================
     elif current_step == 5:
         st.markdown("""
@@ -3266,8 +3280,8 @@ if mode == "🔄 画像ワークフロー":
             <div class="step-card-header">
                 <div class="step-card-icon">🚀</div>
                 <div>
-                    <p class="step-card-title">Step ⑤ API連携</p>
-                    <p class="step-card-desc">楽天・ヤフーにAPIで画像をアップロードします</p>
+                    <p class="step-card-title">Step ⑤ アップロード</p>
+                    <p class="step-card-desc">楽天・ヤフーに画像をアップロードします（手動 / API）</p>
                 </div>
             </div>
         </div>
@@ -3398,9 +3412,9 @@ if mode == "🔄 画像ワークフロー":
                 st.rerun()
 
 
-elif mode == "📂 画像一覧取得":
-    st.title("📂 画像一覧取得")
-    st.markdown("R-Cabinetのフォルダを選択して、画像を一覧表示します。")
+elif mode == "🛰️ R-Cabi構成把握":
+    st.title("🛰️ R-Cabi構成把握")
+    st.markdown("R-Cabinetの構成を一覧化します。")
 
     # セッション状態の初期化
     if "folders_loaded" not in st.session_state:
@@ -3443,25 +3457,7 @@ elif mode == "📂 画像一覧取得":
         st.success(f"📁 {len(folders)} フォルダ")
         st.info(f"📷 {total_files} 画像（全体）")
 
-    # DB統計情報を表示（常に表示）
-    db_stats = get_db_stats()
-    stat_cols = st.columns(4)
-    with stat_cols[0]:
-        st.metric("DB登録数", db_stats.get("total", 0))
-    with stat_cols[1]:
-        st.metric("重複ファイル", db_stats.get("duplicates", 0))
-    with stat_cols[2]:
-        st.metric("API総数", total_files)
-    with stat_cols[3]:
-        last_updated = st.session_state.get("last_sync_time") or "-"
-        st.metric("最終更新", last_updated)
-
-    st.divider()
-
-    # Excel一括ダウンロード（楽天RMS画像フォルダ管理シート形式）
-    st.markdown("#### 📥 楽天RMS画像フォルダ管理シート（Excel）")
-    st.caption("フォルダ一覧＋カテゴリ別シートで画像を一覧化したExcelをダウンロードします。")
-    xlsx_col1, xlsx_col2 = st.columns(2)
+    xlsx_col1, xlsx_col2, xlsx_col3 = st.columns([3, 3, 4])
     with xlsx_col1:
         xlsx_latest_btn = st.button(
             "🔄 最新をAPIから取得してダウンロード",
@@ -3532,832 +3528,11 @@ elif mode == "📂 画像一覧取得":
         )
 
 
-elif mode == "🔍 画像存在チェック":
-    st.title("🔍 画像存在チェック")
-    st.markdown("コミックNoを入力して、R-Cabinetに画像が存在するか確認します。")
-
-    # セッション状態の初期化
-    if "check_results" not in st.session_state:
-        st.session_state.check_results = None
-
-    st.divider()
-
-    # 入力方法の選択
-    input_method = st.radio(
-        "入力方法を選択",
-        ["テキスト入力", "CSVアップロード"],
-        horizontal=True
-    )
-
-    comic_numbers = []
-
-    if input_method == "テキスト入力":
-        st.markdown("### コミックNo入力")
-        st.markdown("1行に1つのコミックNoを入力してください。")
-
-        text_input = st.text_area(
-            "コミックNo（改行区切り）",
-            height=200,
-            placeholder="123456\n234567\n345678"
-        )
-
-        if text_input:
-            comic_numbers = [line.strip() for line in text_input.split('\n') if line.strip()]
-            st.info(f"入力されたコミックNo: {len(comic_numbers)}件")
-
-    else:
-        st.markdown("### CSVファイルアップロード")
-        st.markdown("コミックNo列を含むCSVファイルをアップロードしてください。")
-
-        uploaded_file = st.file_uploader("CSVファイルを選択", type=['csv'])
-
-        if uploaded_file:
-            try:
-                df = pd.read_csv(uploaded_file, encoding='utf-8')
-            except:
-                df = pd.read_csv(uploaded_file, encoding='cp932')
-
-            st.markdown("#### プレビュー")
-            st.dataframe(df.head(10), use_container_width=True)
-
-            columns = df.columns.tolist()
-            selected_column = st.selectbox("コミックNo列を選択", columns, index=0)
-
-            if selected_column:
-                comic_numbers = df[selected_column].dropna().astype(str).tolist()
-                st.info(f"読み込んだコミックNo: {len(comic_numbers)}件")
-
-    st.divider()
-
-    # チェック実行ボタン（常に表示）
-    check_button = st.button("🔍 チェック実行", type="primary")
-
-    if check_button:
-        if not comic_numbers:
-            st.warning("コミックNoを入力またはCSVをアップロードしてください。")
-        else:
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-
-            results = check_comic_images(comic_numbers, progress_bar, status_text)
-
-            progress_bar.empty()
-            status_text.empty()
-
-            if results is None:
-                st.error("DBにデータがありません。日次同期が完了してから再実行してください。")
-            else:
-                # 結果をsession_stateに保存
-                st.session_state.check_results = results
-
-    # 結果表示（session_stateから）
-    if st.session_state.check_results:
-        results = st.session_state.check_results
-        df_results = pd.DataFrame(results)
-
-        st.markdown("### チェック結果")
-
-        exists_count = len([r for r in results if r['存在'] == '✅ あり'])
-        not_exists_count = len([r for r in results if r['存在'] == '❌ なし'])
-
-        col1, col2, col3 = st.columns(3)
-        col1.metric("総数", len(results))
-        col2.metric("存在あり", exists_count)
-        col3.metric("存在なし", not_exists_count)
-
-        # --- 存在あり画像のダウンロード ---
-        if exists_count > 0:
-            exists_items = [r for r in results if r['存在'] == '✅ あり']
-            exists_items_no_rec = [r for r in exists_items if 'REC' not in (r.get('フォルダ', '') or '').upper()]
-            with st.expander(f"📦 存在あり画像をダウンロード（{len(exists_items_no_rec)}件、REC除外）"):
-                if 'rcab_dl_result' not in st.session_state:
-                    st.session_state.rcab_dl_result = None
-
-                if st.button("🖼️ R-Cabinetから画像を取得", type="primary", key="rcab_dl_btn"):
-                    _zipfile = get_zipfile()
-                    progress = st.progress(0)
-                    status = st.empty()
-                    session = requests.Session()
-
-                    downloaded = []
-                    failed = []
-                    for i, item in enumerate(exists_items_no_rec):
-                        comic_no = str(item['コミックNo'])
-                        url = item.get('URL', '')
-                        folder = item.get('フォルダ', '')
-                        file_name = item.get('ファイル名', '') or f"{comic_no}.jpg"
-                        if '.' not in file_name:
-                            file_name = f"{file_name}.jpg"
-
-                        status.text(f"ダウンロード中: {comic_no} ({i+1}/{len(exists_items_no_rec)})")
-                        progress.progress((i + 1) / len(exists_items_no_rec))
-
-                        if not url or url == '-':
-                            failed.append(comic_no)
-                            continue
-                        try:
-                            resp = session.get(url, timeout=15)
-                            if resp.status_code == 200 and len(resp.content) > 100:
-                                downloaded.append({
-                                    'comic_no': comic_no,
-                                    'file_name': file_name,
-                                    'folder': folder,
-                                    'data': resp.content,
-                                })
-                            else:
-                                failed.append(comic_no)
-                        except Exception:
-                            failed.append(comic_no)
-
-                    progress.empty()
-                    status.empty()
-                    st.session_state.rcab_dl_result = {'downloaded': downloaded, 'failed': failed}
-                    st.rerun()
-
-                if st.session_state.rcab_dl_result:
-                    dl_result = st.session_state.rcab_dl_result
-                    downloaded = dl_result['downloaded']
-                    failed = dl_result['failed']
-
-                    st.success(f"取得完了: {len(downloaded)}件成功" + (f", {len(failed)}件失敗" if failed else ""))
-
-                    if downloaded:
-                        _zipfile = get_zipfile()
-                        dl_cols = st.columns(2)
-
-                        # フラット（直下）
-                        with dl_cols[0]:
-                            buf_flat = BytesIO()
-                            with _zipfile.ZipFile(buf_flat, 'w', _zipfile.ZIP_DEFLATED) as zf:
-                                for img in downloaded:
-                                    zf.writestr(img['file_name'], img['data'])
-                            buf_flat.seek(0)
-                            st.download_button(
-                                label=f"📦 フラットZIP（{len(downloaded)}件）",
-                                data=buf_flat,
-                                file_name="rcabinet_images_flat.zip",
-                                mime="application/zip",
-                                key="rcab_dl_flat"
-                            )
-                            st.caption("全画像を直下に配置")
-
-                        # フォルダ構成保持
-                        with dl_cols[1]:
-                            buf_folder = BytesIO()
-                            with _zipfile.ZipFile(buf_folder, 'w', _zipfile.ZIP_DEFLATED) as zf:
-                                for img in downloaded:
-                                    folder = img['folder'] if img['folder'] and img['folder'] != '-' else 'その他'
-                                    zf.writestr(f"{folder}/{img['file_name']}", img['data'])
-                            buf_folder.seek(0)
-                            st.download_button(
-                                label=f"📂 フォルダ付きZIP（{len(downloaded)}件）",
-                                data=buf_folder,
-                                file_name="rcabinet_images_by_folder.zip",
-                                mime="application/zip",
-                                key="rcab_dl_folder"
-                            )
-                            st.caption("R-Cabinetのフォルダ構成を保持")
-
-        st.divider()
-
-        filter_option = st.radio(
-            "表示フィルター",
-            ["すべて", "存在あり", "存在なし"],
-            horizontal=True
-        )
-
-        if filter_option == "存在あり":
-            df_display = df_results[df_results['存在'] == '✅ あり']
-        elif filter_option == "存在なし":
-            df_display = df_results[df_results['存在'] == '❌ なし']
-        else:
-            df_display = df_results
-
-        st.dataframe(df_display, use_container_width=True, height=400)
-
-        # ダウンロードボタン（1行目：左寄せ）
-        dl_col1, dl_col2, _ = st.columns([1, 1.5, 2])
-
-        with dl_col1:
-            # Comic Search検索用CSVダウンロード（存在なしのコミックNoのみ）
-            not_exists_comics = [r['コミックNo'] for r in results if r['存在'] == '❌ なし']
-            if not_exists_comics:
-                # list_コミックナンバー.csv形式で作成
-                is_csv_data = []
-                for comic_no in not_exists_comics:
-                    is_csv_data.append({
-                        'ジャンル': '',
-                        'タイトル': '',
-                        '出版社': '',
-                        '著者': '',
-                        '完結': '',
-                        '巻数': '',
-                        'ＩＳＢＮ': '',
-                        '棚番': '',
-                        'コメント': '',
-                        'コミ№': comic_no,
-                        '冊数': '1'
-                    })
-                df_is_csv = pd.DataFrame(is_csv_data)
-                csv_buffer = BytesIO()
-                df_is_csv.to_csv(csv_buffer, index=False, encoding='cp932')
-                csv_buffer.seek(0)
-                st.download_button(
-                    label="📥 Comic Search検索用CSV",
-                    data=csv_buffer,
-                    file_name="list_コミックナンバー.csv",
-                    mime="text/csv"
-                )
-            else:
-                st.button("📥 Comic Search検索用CSV", disabled=True, help="存在なしのコミックNoがありません")
-
-        with dl_col2:
-            # Excelダウンロード（スタイル付き）
-            excel_buffer = BytesIO()
-            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                df_results.to_excel(writer, index=False, sheet_name='Sheet1')
-                style_excel(writer.sheets['Sheet1'], num_columns=5, url_column=5)
-            excel_buffer.seek(0)
-            st.download_button(
-                label="📥 結果ファイルをExcelでダウンロード",
-                data=excel_buffer,
-                file_name="rcabinet_check_result.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-
-        # 2行目：GitHubアップロード、結果クリア
-        # セット品と単品を分離
-        set_comics = [c for c in not_exists_comics if '_' not in str(c)]  # セット品（_なし）
-        tanpin_comics = [c for c in not_exists_comics if '_' in str(c)]   # 単品（_あり）
-
-        # 単品からベースのコミックNoを抽出（重複排除）
-        tanpin_base_comics = list(set([str(c).split('_')[0] for c in tanpin_comics]))
-        # セット品と単品ベースをマージ（重複排除）
-        all_base_comics = list(set(set_comics + tanpin_base_comics))
-
-        btn_col3, btn_col4, _ = st.columns([1.5, 1, 2])
-
-        with btn_col3:
-            # GitHubにアップロードボタン（セット品・単品を分けてアップロード）
-            if set_comics or tanpin_comics:
-                upload_label = "📤 GitHubにアップロード"
-                upload_help = f"セット品: {len(set_comics)}件, 単品: {len(tanpin_comics)}件"
-                if tanpin_base_comics:
-                    # 単品のベースも追加される旨を表示
-                    new_bases = [b for b in tanpin_base_comics if b not in set_comics]
-                    if new_bases:
-                        upload_help += f" (単品ベース追加: {len(new_bases)}件)"
-                if st.button(upload_label, help=upload_help):
-                    today = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
-                    upload_results = []
-
-                    # セット品＋単品ベースをアップロード（missing_comics.csv）
-                    if all_base_comics:
-                        csv_lines = []
-                        for comic_no in all_base_comics:
-                            row = [''] * 9 + [str(comic_no), '1']
-                            csv_lines.append(','.join(row))
-                        csv_content = '\n'.join(csv_lines)
-
-                        with st.spinner(f"コミックリスター用をアップロード中... ({len(all_base_comics)}件)"):
-                            result = upload_to_github(
-                                csv_content,
-                                GITHUB_MISSING_CSV_PATH,
-                                f"Update missing_comics.csv ({len(all_base_comics)}件) - {today}"
-                            )
-                        if result.get("success"):
-                            upload_results.append(f"コミックリスター用: {len(all_base_comics)}件 ✅")
-                        else:
-                            upload_results.append(f"コミックリスター用: 失敗 ❌ {result.get('error')}")
-
-                    # 単品をアップロード（missing_tanpin.csv）
-                    if tanpin_comics:
-                        # 単品CSV形式: コミックNo_巻数
-                        tanpin_content = '\n'.join([str(c) for c in tanpin_comics])
-
-                        with st.spinner(f"単品をアップロード中... ({len(tanpin_comics)}件)"):
-                            result = upload_to_github(
-                                tanpin_content,
-                                GITHUB_MISSING_TANPIN_PATH,
-                                f"Update missing_tanpin.csv ({len(tanpin_comics)}件) - {today}"
-                            )
-                        if result.get("success"):
-                            upload_results.append(f"単品: {len(tanpin_comics)}件 ✅")
-                        else:
-                            upload_results.append(f"単品: 失敗 ❌ {result.get('error')}")
-
-                    # 結果表示
-                    if upload_results:
-                        st.success("アップロード完了: " + ", ".join(upload_results))
-            else:
-                st.button("📤 GitHubにアップロード", disabled=True, help="存在なしのコミックNoがありません")
-
-        with btn_col4:
-            # 結果クリアボタン
-            if st.button("🗑️ 結果をクリア"):
-                st.session_state.check_results = None
-                st.rerun()
-
-
-elif mode == "🖼️ 新規画像取得":
-    st.title("🖼️ 新規画像取得")
-    st.markdown("IS検索結果からJANコードで画像を取得し、ZIPでダウンロードします。")
-
-    st.divider()
-
-    # セッション状態の初期化
-    if "github_is_list" not in st.session_state:
-        st.session_state.github_is_list = None
-    if "github_comic_list" not in st.session_state:
-        st.session_state.github_comic_list = None
-    if "github_folder_hierarchy" not in st.session_state:
-        st.session_state.github_folder_hierarchy = None
-    if "image_download_result" not in st.session_state:
-        st.session_state.image_download_result = None
-
-    st.markdown("### ステップ1: 必要なファイルをそろえよう")
-    st.markdown("GitHub Actionsで生成されたファイルを取得します。")
-
-    # まだセッションに読み込まれていないファイルがあれば自動ダウンロード
-    need_is_list = not st.session_state.github_is_list
-    need_comic_list = not st.session_state.github_comic_list
-    need_hierarchy = not st.session_state.github_folder_hierarchy
-
-    if need_is_list or need_comic_list or need_hierarchy:
-        with st.spinner("GitHubからファイルを自動取得中..."):
-            downloaded_any = False
-            auto_errors = []
-
-            if need_is_list:
-                result = download_from_github(GITHUB_IS_LIST_PATH)
-                if result.get("success"):
-                    st.session_state.github_is_list = result["content"]
-                    downloaded_any = True
-                else:
-                    auto_errors.append(f"is_list.csv: {result.get('error', '不明')}")
-
-            if need_comic_list:
-                result = download_from_github(GITHUB_COMIC_LIST_PATH)
-                if result.get("success"):
-                    st.session_state.github_comic_list = result["content"]
-                    downloaded_any = True
-                else:
-                    auto_errors.append(f"comic_list.csv: {result.get('error', '不明')}")
-
-            if need_hierarchy:
-                result = download_from_github(GITHUB_FOLDER_HIERARCHY_PATH)
-                if result.get("success"):
-                    st.session_state.github_folder_hierarchy = result["content"]
-                    downloaded_any = True
-                else:
-                    auto_errors.append(f"フォルダ階層リスト: {result.get('error', '不明')}")
-
-            if auto_errors:
-                st.warning(f"自動取得エラー: {', '.join(auto_errors)}")
-
-        if downloaded_any:
-            st.rerun()
-
-    # GitHubファイル情報を取得（表示用）
-    is_info = get_github_file_info(GITHUB_IS_LIST_PATH)
-    cl_info = get_github_file_info(GITHUB_COMIC_LIST_PATH)
-    fh_info = get_github_file_info(GITHUB_FOLDER_HIERARCHY_PATH)
-
-    # GitHubファイル情報を表示
-    col_info1, col_info2, col_info3 = st.columns(3)
-    with col_info1:
-        if is_info.get("exists"):
-            st.success(f"is_list.csv\n更新: {is_info.get('last_updated', '不明')}")
-        else:
-            st.warning("is_list.csv\n未生成")
-    with col_info2:
-        if cl_info.get("exists"):
-            st.success(f"comic_list.csv\n更新: {cl_info.get('last_updated', '不明')}")
-        else:
-            st.warning("comic_list.csv\n未生成")
-    with col_info3:
-        if fh_info.get("exists"):
-            st.success(f"フォルダ階層リスト\n更新: {fh_info.get('last_updated', '不明')}")
-        else:
-            st.warning("フォルダ階層リスト\n未配置")
-
-    # フォルダ階層リストのアップロード機能
-    hierarchy_upload = st.file_uploader(
-        "フォルダ階層リストをアップロード（更新）",
-        type=['xlsx'],
-        key="hierarchy_quick_upload",
-        help="フォルダ階層リスト.xlsxをドラッグ&ドロップしてGitHubにアップロード"
-    )
-    if hierarchy_upload:
-        if st.button("📤 フォルダ階層リストを更新", type="secondary"):
-            hierarchy_upload.seek(0)
-            content = hierarchy_upload.read()
-            result = upload_binary_to_github(
-                content,
-                GITHUB_FOLDER_HIERARCHY_PATH,
-                f"Update folder_hierarchy.xlsx - {datetime.now(JST).strftime('%Y-%m-%d %H:%M')}"
-            )
-            if result.get("success"):
-                st.success("フォルダ階層リストを更新しました")
-                st.session_state.github_folder_hierarchy = content
-                st.rerun()
-            else:
-                st.error(f"アップロード失敗: {result.get('error')}")
-
-    # CSV生成・取得セクション
-    st.markdown("#### CSVファイル操作")
-
-    # 最新の実行履歴を表示（日本時間に変換）
-    runs = get_workflow_runs("weekly-comic-lister.yml", limit=1)
-    if runs:
-        latest = runs[0]
-        status_icon = "🟢" if latest["conclusion"] == "success" else "🔴" if latest["conclusion"] == "failure" else "🟡"
-        # 日本時間に変換（+9時間）
-        from datetime import timedelta
-        try:
-            dt_utc = datetime.strptime(latest['created_at'], "%Y-%m-%d %H:%M")
-            dt_jst = dt_utc + timedelta(hours=9)
-            jst_str = dt_jst.strftime("%Y-%m-%d %H:%M")
-        except:
-            jst_str = latest['created_at']
-        status_text = "完了" if latest["conclusion"] == "success" else "失敗" if latest["conclusion"] == "failure" else "処理中..."
-        st.caption(f"前回生成: {jst_str} {status_icon} {status_text}")
-
-    # ボタンを横並びに配置（左を目立つ色に）
-    btn_col1, btn_col2, _ = st.columns([3, 2, 3])
-
-    with btn_col1:
-        run_actions = st.button("📊 is_list / comic_list 生成", type="primary", help="不足コミックのCSVファイルを自動生成します", use_container_width=True)
-
-    with btn_col2:
-        fetch_files = st.button("📥 ダウンロード", type="secondary", help="生成済みのファイルをダウンロードします", use_container_width=True)
-
-    # GitHub Actions 実行処理
-    if run_actions:
-        with st.spinner("CSVファイル生成を開始中..."):
-            result = trigger_github_actions("weekly-comic-lister.yml")
-        if result.get("success"):
-            st.success("CSVファイルの生成を開始しました（完了まで2〜3分お待ちください）")
-        else:
-            st.error(f"生成開始に失敗しました: {result.get('error')}")
-
-    # GitHubから一括取得処理
-    if fetch_files:
-        with st.spinner("GitHubからファイルを取得中..."):
-            errors = []
-
-            # is_list.csv
-            result = download_from_github(GITHUB_IS_LIST_PATH)
-            if result.get("success"):
-                st.session_state.github_is_list = result["content"]
-            else:
-                errors.append(f"is_list.csv: {result.get('error')}")
-
-            # comic_list.csv
-            result = download_from_github(GITHUB_COMIC_LIST_PATH)
-            if result.get("success"):
-                st.session_state.github_comic_list = result["content"]
-            else:
-                errors.append(f"comic_list.csv: {result.get('error')}")
-
-            # folder_hierarchy.xlsx
-            result = download_from_github(GITHUB_FOLDER_HIERARCHY_PATH)
-            if result.get("success"):
-                st.session_state.github_folder_hierarchy = result["content"]
-            else:
-                errors.append(f"フォルダ階層リスト: {result.get('error')}")
-
-        if errors:
-            for err in errors:
-                st.warning(err)
-        else:
-            st.success("全ファイルの取得が完了しました")
-        st.rerun()
-
-    # 取得済みファイルの表示
-    status_cols = st.columns(3)
-    with status_cols[0]:
-        if st.session_state.github_is_list:
-            st.info("✅ is_list.csv 取得済み")
-    with status_cols[1]:
-        if st.session_state.github_comic_list:
-            st.info("✅ comic_list.csv 取得済み")
-    with status_cols[2]:
-        if st.session_state.github_folder_hierarchy:
-            st.info("✅ フォルダ階層リスト 取得済み")
-
-    st.divider()
-
-    # 使用するファイルを決定（GitHubから取得したもの）
-    use_is_list = BytesIO(st.session_state.github_is_list) if st.session_state.github_is_list else None
-    use_comic_list = BytesIO(st.session_state.github_comic_list) if st.session_state.github_comic_list else None
-    use_hierarchy = BytesIO(st.session_state.github_folder_hierarchy) if st.session_state.github_folder_hierarchy else None
-
-    # ファイルのプレビュー
-    if use_is_list:
-        st.markdown("### is_list.csv プレビュー")
-        try:
-            use_is_list.seek(0)
-            # UTF-8を先に試し、失敗したらcp932
-            try:
-                df_is_preview = pd.read_csv(use_is_list, encoding='utf-8', header=None)
-            except:
-                use_is_list.seek(0)
-                df_is_preview = pd.read_csv(use_is_list, encoding='cp932', header=None)
-            st.dataframe(df_is_preview.head(10), use_container_width=True, height=200)
-            st.info(f"読み込み件数: {len(df_is_preview)}行")
-        except Exception as e:
-            st.error(f"CSVの読み込みエラー: {e}")
-
-    st.divider()
-
-    st.markdown("### 画像取得")
-
-    # 全ファイルが利用可能かチェック
-    all_files_ready = use_is_list and use_comic_list and use_hierarchy
-
-    if not all_files_ready:
-        missing = []
-        if not use_is_list:
-            missing.append("is_list.csv")
-        if not use_comic_list:
-            missing.append("comic_list.csv")
-        if not use_hierarchy:
-            missing.append("フォルダ階層リスト.xlsx")
-        st.info(f"以下のファイルが必要です: {', '.join(missing)}\n\n「GitHubから一括取得」ボタンを押すか、手動でアップロードしてください。")
-    else:
-        # 画像取得ボタン
-        if st.button("🖼️ 画像取得開始", type="primary"):
-            try:
-                # ファイル読み込み（UTF-8を先に試し、失敗したらcp932）
-                use_is_list.seek(0)
-                use_comic_list.seek(0)
-                use_hierarchy.seek(0)
-
-                with st.spinner("ファイルを読み込み中..."):
-                    # is_list.csv
-                    try:
-                        df_is = pd.read_csv(use_is_list, encoding='utf-8', header=None)
-                    except:
-                        use_is_list.seek(0)
-                        df_is = pd.read_csv(use_is_list, encoding='cp932', header=None)
-
-                    # comic_list.csv
-                    try:
-                        df_cl = pd.read_csv(use_comic_list, encoding='utf-8', header=None)
-                    except:
-                        use_comic_list.seek(0)
-                        df_cl = pd.read_csv(use_comic_list, encoding='cp932', header=None)
-
-                    df_hierarchy = pd.read_excel(use_hierarchy, sheet_name="フォルダ階層リスト", header=None)
-
-                st.success(f"ファイル読み込み完了: IS={len(df_is)}行, CL={len(df_cl)}行, 階層={len(df_hierarchy)}行")
-
-                # データ統合
-                with st.spinner("データを統合中..."):
-                    merged_df = merge_csv_data(df_is.copy(), df_cl)
-                    result_data = extract_first_volumes(merged_df)
-                    result_data = add_folder_hierarchy_info(result_data, df_hierarchy)
-
-                # JANコードの状態を確認
-                jan_count = sum(1 for d in result_data if d.get('first_jan') and normalize_jan_code(d.get('first_jan', '')))
-                no_jan_count = len(result_data) - jan_count
-                st.success(f"データ統合完了: {len(result_data)}件（JANあり: {jan_count}件, JANなし: {no_jan_count}件）")
-
-                # JANコードがない場合は詳細を表示
-                if no_jan_count > 0:
-                    no_jan_items = [d for d in result_data if not normalize_jan_code(d.get('first_jan', ''))]
-                    with st.expander(f"⚠️ JANコードなし: {no_jan_count}件（詳細）"):
-                        for item in no_jan_items[:10]:  # 最大10件表示
-                            st.write(f"- {item.get('comic_no', '?')}: {item.get('title', '?')} (first_jan='{item.get('first_jan', '')}')")
-
-                # 画像ダウンロード
-                st.markdown("### 画像ダウンロード中...")
-
-                # Gemini AI状態を表示
-                if GEMINI_API_KEY:
-                    st.info("🤖 Gemini AI セルフヒーリング: 有効（APIキー設定済み）")
-                else:
-                    st.warning("🤖 Gemini AI セルフヒーリング: 無効（GEMINI_API_KEY未設定）")
-
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-
-                session = requests.Session()
-                downloaded_images = []
-                stats = {'total': len(result_data), 'success': 0, 'bookoff': 0, 'amazon': 0, 'rakuten': 0, 'gemini_ai': 0, 'failed': 0}
-
-                random = get_random()
-                for i, data in enumerate(result_data):
-                    jan_code = normalize_jan_code(data['first_jan'])
-                    comic_no = data['comic_no']
-
-                    progress_bar.progress((i + 1) / len(result_data))
-                    status_text.text(f"処理中: {comic_no} ({i + 1}/{len(result_data)}) JAN: {jan_code or '(なし)'}")
-
-                    if not jan_code:
-                        stats['failed'] += 1
-                        stats['failed_no_jan'] = stats.get('failed_no_jan', 0) + 1
-                        continue
-
-                    # 1. ブックオフで検索
-                    image_url = get_bookoff_image(jan_code, session)
-                    source = 'bookoff'
-
-                    # 2. Amazonで検索
-                    if not image_url:
-                        time.sleep(random.uniform(0.5, 1.0))
-                        image_url = get_amazon_image(jan_code, session)
-                        source = 'amazon'
-
-                    # 3. 楽天ブックスで検索（フォールバック）
-                    if not image_url:
-                        time.sleep(random.uniform(0.3, 0.6))
-                        image_url = get_rakuten_image(jan_code, session)
-                        source = 'rakuten'
-
-                    # 4. Gemini AIでセルフヒーリング（全て失敗した場合）
-                    # デバッグ: AI修復条件を記録
-                    ai_condition = f"image_url={bool(image_url)}, GEMINI_API_KEY={bool(GEMINI_API_KEY)}"
-                    if not image_url and GEMINI_API_KEY:
-                        time.sleep(random.uniform(0.5, 1.0))
-                        status_text.text(f"処理中: {comic_no} ({i + 1}/{len(result_data)}) - AI解析中...")
-                        stats['gemini_tried'] = stats.get('gemini_tried', 0) + 1
-                        # Amazonを再試行（AIでHTML解析）
-                        ai_result = get_image_with_gemini_ai(jan_code, session, "amazon")
-                        if ai_result:
-                            image_url = ai_result
-                            source = 'gemini_ai'
-                    elif not image_url and not GEMINI_API_KEY:
-                        # GEMINI_API_KEYがないためスキップ
-                        stats['ai_skipped_no_key'] = stats.get('ai_skipped_no_key', 0) + 1
-
-                    if image_url:
-                        image_data = download_image(image_url, session)
-                        if image_data:
-                            downloaded_images.append({
-                                'filename': f"{comic_no}.jpg",
-                                'data': image_data,
-                                'comic_no': comic_no,
-                                'jan': jan_code,
-                                'title': data['title']
-                            })
-                            stats['success'] += 1
-                            stats[source] += 1
-                        else:
-                            stats['failed'] += 1
-                            stats['failed_download'] = stats.get('failed_download', 0) + 1
-                            # デバッグ: ダウンロード失敗のURLを記録
-                            stats['debug_failed_urls'] = stats.get('debug_failed_urls', [])
-                            stats['debug_failed_urls'].append({'comic_no': comic_no, 'url': image_url[:100]})
-                    else:
-                        stats['failed'] += 1
-                        stats['failed_not_found'] = stats.get('failed_not_found', 0) + 1
-
-                    time.sleep(0.3)
-
-                progress_bar.empty()
-                status_text.empty()
-
-                # 結果をsession_stateに保存
-                st.session_state.image_download_result = {
-                    'stats': stats,
-                    'downloaded_images': downloaded_images,
-                    'result_data': result_data
-                }
-                st.rerun()
-
-            except Exception as e:
-                st.error(f"エラーが発生しました: {e}")
-                import traceback
-                st.code(traceback.format_exc())
-
-    # 結果表示（session_stateから）
-    if st.session_state.image_download_result:
-        result = st.session_state.image_download_result
-        stats = result['stats']
-        downloaded_images = result['downloaded_images']
-        result_data = result['result_data']
-
-        # 結果サマリー
-        st.markdown("### 結果")
-        col1, col2, col3, col4, col5, col6 = st.columns(6)
-        col1.metric("総数", stats['total'])
-        col2.metric("成功", stats['success'])
-        col3.metric("ブックオフ", stats['bookoff'])
-        col4.metric("Amazon", stats['amazon'])
-        col5.metric("楽天", stats.get('rakuten', 0))
-        col6.metric("AI修復", stats.get('gemini_ai', 0))
-
-        # Gemini AI試行回数を表示
-        gemini_tried = stats.get('gemini_tried', 0)
-        failed_no_jan = stats.get('failed_no_jan', 0)
-        failed_not_found = stats.get('failed_not_found', 0)
-        failed_download = stats.get('failed_download', 0)
-
-        if stats['failed'] > 0:
-            # 失敗の詳細
-            failed_details = []
-            if failed_no_jan > 0:
-                failed_details.append(f"JANコードなし: {failed_no_jan}件")
-            if failed_not_found > 0:
-                failed_details.append(f"画像見つからず: {failed_not_found}件")
-            if failed_download > 0:
-                failed_details.append(f"ダウンロード失敗: {failed_download}件")
-
-            # 詳細がない場合は古い結果の可能性
-            if not failed_details:
-                failed_details.append("詳細不明（古い結果？→クリアして再実行してください）")
-
-            st.warning(f"取得できなかった画像: {stats['failed']}件 ({', '.join(failed_details)})")
-
-            # AI修復の状態
-            ai_skipped_no_key = stats.get('ai_skipped_no_key', 0)
-            if GEMINI_API_KEY:
-                if gemini_tried > 0:
-                    st.info(f"🤖 Gemini AI試行: {gemini_tried}回 → 成功: {stats.get('gemini_ai', 0)}回")
-                elif failed_no_jan == stats['failed']:
-                    st.info("🤖 AI修復: JANコードがないためスキップ（AI修復にもJANコードが必要です）")
-                elif ai_skipped_no_key > 0:
-                    st.warning(f"🤖 AI修復: APIキーが実行時に空だった（{ai_skipped_no_key}件スキップ）")
-                elif failed_not_found > 0:
-                    st.warning("🤖 AI修復が試行されませんでした（要調査：画像が見つからないのにAIが発動していない）")
-            else:
-                st.warning("🤖 Gemini APIキーが未設定のため、AI修復はスキップされました")
-
-            # デバッグ情報
-            with st.expander("🔧 デバッグ情報（詳細）"):
-                st.write(f"**stats全体:** {stats}")
-                st.write(f"**GEMINI_API_KEY設定:** {'あり' if GEMINI_API_KEY else 'なし'}")
-                if stats.get('debug_failed_urls'):
-                    st.write("**ダウンロード失敗URL:**")
-                    for item in stats['debug_failed_urls'][:5]:
-                        st.write(f"  - {item['comic_no']}: {item['url']}")
-
-        # ZIPダウンロード
-        if downloaded_images:
-            st.divider()
-            st.markdown("### ダウンロード")
-
-            # ZIP作成
-            zipfile = get_zipfile()
-            zip_buffer = BytesIO()
-            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for img in downloaded_images:
-                    zf.writestr(img['filename'], img['data'])
-            zip_buffer.seek(0)
-
-            # 振り分けマップExcel作成
-            excel_data = []
-            for i, data in enumerate(result_data, 1):
-                excel_data.append({
-                    '連番': i,
-                    'コミックNo': data['comic_no'],
-                    '1巻JAN': data['first_jan'],
-                    'タイトル': data['title'],
-                    'ジャンル': data['genre'],
-                    '出版社': data['publisher'],
-                    '著者': data['author'],
-                    'シリーズ': data['series'],
-                    'メインフォルダ': data.get('main_folder', ''),
-                    'サブフォルダ': data.get('sub_folder', '')
-                })
-
-            df_excel = pd.DataFrame(excel_data)
-            excel_buffer = BytesIO()
-            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                df_excel.to_excel(writer, index=False, sheet_name='振り分けマップ')
-                style_excel(writer.sheets['振り分けマップ'], num_columns=10)
-            excel_buffer.seek(0)
-
-            # ダウンロードボタンを横並びに
-            dl_col1, dl_col2, dl_col3 = st.columns([2, 2, 1])
-            with dl_col1:
-                st.download_button(
-                    label=f"📥 画像ZIP ({len(downloaded_images)}件)",
-                    data=zip_buffer,
-                    file_name="comic_images.zip",
-                    mime="application/zip",
-                    key="zip_download"
-                )
-            with dl_col2:
-                st.download_button(
-                    label="📥 振り分けマップExcel",
-                    data=excel_buffer,
-                    file_name="振り分けマップ.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="excel_download"
-                )
-            with dl_col3:
-                if st.button("🗑️ クリア"):
-                    st.session_state.image_download_result = None
-                    st.rerun()
-
 # ============================================================
 # フォルダ一括作成
 # ============================================================
-elif mode == "📁 フォルダ一括作成":
-    st.header("📁 フォルダ一括作成")
+elif mode == "🏗️ R-Cabiフォルダ制作":
+    st.header("🏗️ R-Cabiフォルダ制作")
     st.markdown("R-Cabinetに複数のフォルダをまとめて作成します。パス形式で階層構造を指定でき、上位フォルダのIDは自動で解決されます。")
 
     st.divider()
@@ -4569,129 +3744,10 @@ elif mode == "📁 フォルダ一括作成":
                 )
 
 # ============================
-# 📤 画像アップロード
+# 🔁 コピー：R-Cabi⇒R-Cabi
 # ============================
-elif mode == "📤 画像アップロード":
-    st.markdown("## 📤 画像アップロード")
-    st.markdown("R-Cabinetのフォルダに画像をアップロードします。")
-
-    # フォルダ一覧を取得
-    with st.spinner("フォルダ一覧を取得中..."):
-        folders, folder_error = get_all_folders()
-
-    if folder_error:
-        st.error(f"フォルダ一覧の取得に失敗しました: {folder_error}")
-    elif not folders:
-        st.warning("フォルダが見つかりません。先にフォルダを作成してください。")
-    else:
-        # フォルダ選択
-        folder_options = {f"{f['FolderName']}（ID: {f['FolderId']}）": f for f in folders}
-        selected_label = st.selectbox(
-            "アップロード先フォルダ",
-            options=list(folder_options.keys()),
-            help="画像をアップロードするフォルダを選択してください"
-        )
-        selected_folder = folder_options[selected_label]
-
-        # 画像ファイル選択
-        uploaded_files = st.file_uploader(
-            "画像ファイルを選択",
-            type=["jpg", "jpeg", "png", "gif", "tiff", "bmp"],
-            accept_multiple_files=True,
-            help="対応形式: JPEG, PNG, GIF, TIFF, BMP（1ファイル2MBまで、最大3840x3840px）"
-        )
-
-        if uploaded_files:
-            # バリデーション
-            valid_files = []
-            for f in uploaded_files:
-                if f.size > 2 * 1024 * 1024:
-                    st.warning(f"⚠️ {f.name}: ファイルサイズが2MBを超えています（{f.size / 1024 / 1024:.1f}MB）")
-                else:
-                    valid_files.append(f)
-
-            if valid_files:
-                st.info(f"📎 {len(valid_files)} ファイル選択済み")
-
-                # プレビュー
-                cols = st.columns(min(len(valid_files), 4))
-                for i, f in enumerate(valid_files[:4]):
-                    with cols[i]:
-                        st.image(f, caption=f.name, width=150)
-                        st.caption(f"{f.size / 1024:.0f} KB")
-                if len(valid_files) > 4:
-                    st.caption(f"他 {len(valid_files) - 4} ファイル...")
-
-                # 上書きオプション
-                overwrite = st.checkbox("同名ファイルが存在する場合は上書きする", value=False)
-
-                # アップロード実行
-                if st.button("📤 アップロード実行", type="primary"):
-                    progress = st.progress(0, text="アップロード中...")
-                    results = []
-                    total = len(valid_files)
-
-                    for i, f in enumerate(valid_files):
-                        progress.progress((i + 1) / total, text=f"アップロード中... ({i + 1}/{total}) {f.name}")
-
-                        # fileName（画像名）: 拡張子なし、50バイト制限
-                        api_file_name = f.name.rsplit('.', 1)[0] if '.' in f.name else f.name
-                        if len(api_file_name.encode('utf-8')) > 50:
-                            while len(api_file_name.encode('utf-8')) > 50 and api_file_name:
-                                api_file_name = api_file_name[:-1]
-
-                        # filePath（URLのファイル名）: 20バイト制限、拡張子含む
-                        file_path_name = f.name
-                        if len(file_path_name.encode('utf-8')) > 20:
-                            name_stem, name_ext = f.name.rsplit('.', 1) if '.' in f.name else (f.name, '')
-                            while len(f"{name_stem}.{name_ext}".encode('utf-8')) > 20 and name_stem:
-                                name_stem = name_stem[:-1]
-                            file_path_name = f"{name_stem}.{name_ext}" if name_ext else name_stem
-
-                        f.seek(0)
-                        result = upload_image(
-                            file_data=f.read(),
-                            file_name=api_file_name,
-                            folder_id=selected_folder["FolderId"],
-                            file_path_name=file_path_name,
-                            overwrite=overwrite,
-                        )
-
-                        results.append({
-                            "ファイル名": f.name,
-                            "結果": "✅ 成功" if result["success"] else "❌ 失敗",
-                            "URL": result.get("file_url", ""),
-                            "エラー": result.get("error", ""),
-                        })
-
-                        # API負荷軽減（3 req/sec制限）
-                        if i < total - 1:
-                            time.sleep(0.35)
-
-                    progress.empty()
-
-                    # 結果表示
-                    success_count = sum(1 for r in results if r["結果"] == "✅ 成功")
-                    fail_count = total - success_count
-
-                    if fail_count == 0:
-                        st.success(f"全 {total} ファイルのアップロードが完了しました！")
-                    elif success_count == 0:
-                        st.error(f"全 {total} ファイルのアップロードに失敗しました")
-                    else:
-                        st.warning(f"成功: {success_count} / 失敗: {fail_count}")
-
-                    st.dataframe(
-                        pd.DataFrame(results),
-                        use_container_width=True,
-                        hide_index=True
-                    )
-
-# ============================
-# 📋 CSV画像コピー
-# ============================
-elif mode == "📋 CSV画像コピー":
-    st.markdown("## 📋 CSV画像コピー")
+elif mode == "🔁 コピー：R-Cabi⇒R-Cabi":
+    st.markdown("## 🔁 コピー：R-Cabi⇒R-Cabi")
     st.markdown("CSVで指定した既存画像を、指定フォルダにコピーします。")
 
     # Excelテンプレートダウンロード（フォルダ一覧シート付き）
@@ -4997,3 +4053,705 @@ elif mode == "📋 CSV画像コピー":
                         use_container_width=True,
                         hide_index=True
                     )
+# ============================
+# ☁️ コピー：Local⇒R-Cabi
+# ============================
+elif mode == "☁️ コピー：Local⇒R-Cabi":
+    st.markdown("## ☁️ コピー：Local⇒R-Cabi")
+    st.markdown("CSVで指定したローカル画像ファイルを、指定フォルダにアップロードします。")
+
+    # Excelテンプレートダウンロード（フォルダ一覧シート付き）
+    if st.button("📥 テンプレートをダウンロード（フォルダ一覧付き）", key="local_tmpl_btn"):
+        with st.spinner("フォルダ一覧を取得中..."):
+            tmpl_folders, tmpl_error = get_all_folders()
+
+        if tmpl_error:
+            st.error(f"フォルダ一覧の取得に失敗しました: {tmpl_error}")
+        else:
+            styles, _ = get_openpyxl_styles()
+            Font = styles['Font']
+            PatternFill = styles['PatternFill']
+            Alignment = styles['Alignment']
+            from openpyxl import Workbook
+
+            wb = Workbook()
+
+            # シート1: テンプレート
+            ws1 = wb.active
+            ws1.title = "アップロード指示"
+            headers1 = ["フォルダID", "カテゴリ1", "カテゴリ2", "カテゴリ3", "ファイル名", "ファイルパス"]
+            header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+            header_font = Font(name="Meiryo UI", bold=True, color="FFFFFF", size=10)
+            cell_font = Font(name="Meiryo UI", size=10)
+
+            for col_idx, header in enumerate(headers1, 1):
+                cell = ws1.cell(row=1, column=col_idx, value=header)
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal="center")
+
+            # サンプル行
+            sample = ["13054250", "コミック", "セット", "セット1", "10000",
+                       r"C:\Users\ssasa\Pictures\10000.jpg"]
+            for col_idx, val in enumerate(sample, 1):
+                cell = ws1.cell(row=2, column=col_idx, value=val)
+                cell.font = cell_font
+
+            ws1.column_dimensions['A'].width = 14
+            ws1.column_dimensions['B'].width = 14
+            ws1.column_dimensions['C'].width = 14
+            ws1.column_dimensions['D'].width = 14
+            ws1.column_dimensions['E'].width = 16
+            ws1.column_dimensions['F'].width = 60
+
+            # シート2: フォルダ一覧
+            ws2 = wb.create_sheet(title="フォルダ一覧")
+            headers2 = ["フォルダID", "フォルダ名", "ディレクトリパス", "ファイル数"]
+            for col_idx, header in enumerate(headers2, 1):
+                cell = ws2.cell(row=1, column=col_idx, value=header)
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal="center")
+
+            for row_idx, f in enumerate(tmpl_folders, 2):
+                ws2.cell(row=row_idx, column=1, value=f["FolderId"]).font = cell_font
+                ws2.cell(row=row_idx, column=2, value=f["FolderName"]).font = cell_font
+                ws2.cell(row=row_idx, column=3, value=f["FolderPath"]).font = cell_font
+                ws2.cell(row=row_idx, column=4, value=f["FileCount"]).font = cell_font
+
+            ws2.column_dimensions['A'].width = 14
+            ws2.column_dimensions['B'].width = 30
+            ws2.column_dimensions['C'].width = 40
+            ws2.column_dimensions['D'].width = 12
+
+            excel_buffer = BytesIO()
+            wb.save(excel_buffer)
+            excel_buffer.seek(0)
+
+            st.download_button(
+                label="📥 ダウンロード",
+                data=excel_buffer.getvalue(),
+                file_name="local_upload_template.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_local_template_xlsx",
+            )
+
+    st.divider()
+
+    st.warning("⚠ この機能はローカル実行時のみ使用できます（Streamlit Cloudではファイルパスにアクセスできません）")
+
+    # ファイルアップロード（CSV/Excel対応）
+    upload_file = st.file_uploader("CSV / Excelファイルを選択", type=["csv", "xlsx"], key="local_image_upload")
+
+    if upload_file:
+        # ファイル読み込み
+        if upload_file.name.endswith(".xlsx"):
+            upload_file.seek(0)
+            df = pd.read_excel(upload_file, sheet_name=0, dtype=str).fillna("")
+        else:
+            try:
+                upload_file.seek(0)
+                df = pd.read_csv(upload_file, encoding="utf-8-sig", dtype=str).fillna("")
+            except Exception:
+                upload_file.seek(0)
+                df = pd.read_csv(upload_file, encoding="cp932", dtype=str).fillna("")
+
+        required_cols = ["ファイル名", "ファイルパス"]
+        missing_cols = [c for c in required_cols if c not in df.columns]
+        has_folder_id = "フォルダID" in df.columns
+        has_categories = all(c in df.columns for c in ["カテゴリ1", "カテゴリ2", "カテゴリ3"])
+
+        if missing_cols:
+            st.error(f"必須列が不足しています: {', '.join(missing_cols)}")
+        elif not has_folder_id and not has_categories:
+            st.error("「フォルダID」列 または 「カテゴリ1〜3」列が必要です")
+        elif len(df) == 0:
+            st.warning("データがありません。")
+        else:
+            st.info(f"📎 {len(df)} 件のデータを読み込みました")
+
+            # フォルダ一覧を取得
+            with st.spinner("フォルダ一覧を取得中..."):
+                folders, folder_error = get_all_folders()
+
+            if folder_error:
+                st.error(f"フォルダ一覧の取得に失敗しました: {folder_error}")
+            else:
+                folder_name_to_id = {}
+                folder_id_set = set()
+                for f in folders:
+                    folder_name_to_id[f["FolderName"]] = f["FolderId"]
+                    folder_id_set.add(str(f["FolderId"]))
+
+                # フォルダID解決 & ファイル存在チェック
+                preview_data = []
+                for idx, row in df.iterrows():
+                    cat_path = ""
+                    if has_categories:
+                        cat_path = "/".join([
+                            row.get("カテゴリ1", ""),
+                            row.get("カテゴリ2", ""),
+                            row.get("カテゴリ3", ""),
+                        ]).strip("/")
+
+                    folder_id = ""
+                    target_folder_name = ""
+                    if has_folder_id and row.get("フォルダID", "").strip():
+                        fid = row["フォルダID"].strip()
+                        if fid in folder_id_set:
+                            folder_id = fid
+                            status = "✅ OK"
+                            for f in folders:
+                                if str(f["FolderId"]) == fid:
+                                    target_folder_name = f["FolderName"]
+                                    break
+                        else:
+                            status = "❌ フォルダID不正"
+                    elif has_categories:
+                        target_folder_name = row.get("カテゴリ3", "").strip()
+                        if not target_folder_name:
+                            target_folder_name = row.get("カテゴリ2", "").strip()
+                        if not target_folder_name:
+                            target_folder_name = row.get("カテゴリ1", "").strip()
+                        folder_id = folder_name_to_id.get(target_folder_name, "")
+                        status = "✅ OK" if folder_id else "❌ フォルダ未検出"
+                    else:
+                        status = "❌ フォルダ指定なし"
+
+                    # ファイルパス検証
+                    file_path_local = row["ファイルパス"].strip()
+                    if not file_path_local:
+                        status = "❌ ファイルパス未入力"
+                    elif not os.path.isfile(file_path_local):
+                        status = "❌ ファイルが見つかりません"
+
+                    file_name = row["ファイル名"].strip()
+                    if not file_name:
+                        status = "❌ ファイル名未入力"
+
+                    preview_data.append({
+                        "No": idx + 1,
+                        "コピー先": f"{target_folder_name}（ID: {folder_id}）" if folder_id else target_folder_name,
+                        "カテゴリパス": cat_path,
+                        "ファイル名": file_name,
+                        "ファイルパス": file_path_local,
+                        "チェック": status,
+                        "_folder_id": folder_id,
+                        "_file_path": file_path_local,
+                        "_file_name": file_name,
+                    })
+
+                # プレビュー表示
+                preview_df = pd.DataFrame(preview_data)
+                display_df = preview_df[["No", "コピー先", "カテゴリパス", "ファイル名", "ファイルパス", "チェック"]]
+
+                ok_count = sum(1 for d in preview_data if d["チェック"] == "✅ OK")
+                ng_count = len(preview_data) - ok_count
+
+                if ng_count > 0:
+                    st.warning(f"実行可能: {ok_count} 件 / エラー: {ng_count} 件（エラー行はスキップされます）")
+                else:
+                    st.success(f"全 {ok_count} 件 実行可能です")
+
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+                # 実行範囲（バッチ処理）
+                st.divider()
+                st.markdown("### 実行設定")
+                if ok_count > 500:
+                    st.info("⏱ Streamlit Cloudのタイムアウト対策のため、500件ずつの実行を推奨します")
+                col_start, col_end = st.columns(2)
+                with col_start:
+                    batch_start = st.number_input("開始（No）", min_value=1, max_value=max(ok_count, 1), value=1, step=1, key="local_batch_start")
+                with col_end:
+                    batch_end_default = min(500, ok_count)
+                    batch_end = st.number_input("終了（No）", min_value=1, max_value=max(ok_count, 1), value=max(batch_end_default, 1), step=1, key="local_batch_end")
+
+                batch_size = batch_end - batch_start + 1
+                st.markdown(f"**実行対象: {batch_start}〜{batch_end} 件目（{batch_size} 件）**")
+
+                # 上書きオプション
+                overwrite = st.checkbox("同名ファイルが存在する場合は上書きする", value=False, key="local_overwrite")
+
+                # 実行ボタン
+                if ok_count > 0 and st.button(f"📤 アップロード実行（{batch_start}〜{batch_end}件目）", type="primary", key="local_exec"):
+                    progress = st.progress(0, text="アップロード中...")
+                    stop_placeholder = st.empty()
+                    results = []
+                    stopped = False
+                    all_ok_rows = [d for d in preview_data if d["チェック"] == "✅ OK"]
+                    target_rows = all_ok_rows[batch_start - 1:batch_end]
+                    total = len(target_rows)
+
+                    for i, row_data in enumerate(target_rows):
+                        if stop_placeholder.button("⏹ 停止", key=f"local_stop_{i}"):
+                            stopped = True
+                            break
+                        progress.progress((i + 1) / total, text=f"アップロード中... ({i + 1}/{total}) {row_data['_file_name']}")
+
+                        # ローカルファイルを読み込み
+                        try:
+                            with open(row_data["_file_path"], "rb") as local_f:
+                                file_data = local_f.read()
+                        except Exception as e:
+                            results.append({
+                                "No": row_data["No"],
+                                "ファイル名": row_data["_file_name"],
+                                "コピー先": row_data["コピー先"],
+                                "結果": "❌ 失敗",
+                                "エラー": f"ファイル読み込み失敗: {str(e)}",
+                            })
+                            continue
+
+                        # 2MB制限チェック
+                        if len(file_data) > 2 * 1024 * 1024:
+                            results.append({
+                                "No": row_data["No"],
+                                "ファイル名": row_data["_file_name"],
+                                "コピー先": row_data["コピー先"],
+                                "結果": "❌ 失敗",
+                                "エラー": f"ファイルサイズ超過: {len(file_data) / 1024 / 1024:.1f}MB（上限2MB）",
+                            })
+                            continue
+
+                        # 拡張子を取得
+                        ext = os.path.splitext(row_data["_file_path"])[1].lstrip(".").lower()
+                        if not ext:
+                            ext = "jpg"
+
+                        # fileName（画像名）: 拡張子なし
+                        api_file_name = row_data["_file_name"]
+
+                        # filePath（URLのファイル名）: 拡張子付き、20バイト制限
+                        file_path_name = f"{row_data['_file_name']}.{ext}"
+                        if len(file_path_name.encode("utf-8")) > 20:
+                            stem = row_data["_file_name"]
+                            while len(f"{stem}.{ext}".encode("utf-8")) > 20 and stem:
+                                stem = stem[:-1]
+                            file_path_name = f"{stem}.{ext}"
+
+                        # アップロード
+                        result = upload_image(
+                            file_data=file_data,
+                            file_name=api_file_name,
+                            folder_id=row_data["_folder_id"],
+                            file_path_name=file_path_name,
+                            overwrite=overwrite,
+                        )
+
+                        results.append({
+                            "No": row_data["No"],
+                            "ファイル名": row_data["_file_name"],
+                            "コピー先": row_data["コピー先"],
+                            "結果": "✅ 成功" if result["success"] else "❌ 失敗",
+                            "エラー": result.get("error", ""),
+                        })
+
+                        # API負荷軽減（3 req/sec制限）
+                        if i < total - 1:
+                            time.sleep(0.35)
+
+                    progress.empty()
+                    stop_placeholder.empty()
+
+                    # 結果表示
+                    success_count = sum(1 for r in results if r["結果"] == "✅ 成功")
+                    fail_count = sum(1 for r in results if r["結果"] == "❌ 失敗")
+                    processed = len(results)
+
+                    if stopped:
+                        st.warning(f"⏹ {processed} 件目で停止しました（成功: {success_count} / 失敗: {fail_count}）")
+                    elif fail_count == 0:
+                        st.success(f"全 {total} 件のアップロードが完了しました！")
+                    elif success_count == 0:
+                        st.error(f"全 {total} 件のアップロードに失敗しました")
+                    else:
+                        st.warning(f"成功: {success_count} / 失敗: {fail_count}")
+
+                    st.dataframe(
+                        pd.DataFrame(results),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+# ============================
+# 💾 コピー：R-Cabi⇒Local
+# ============================
+elif mode == "💾 コピー：R-Cabi⇒Local":
+    st.markdown("## 💾 コピー：R-Cabi⇒Local")
+    st.markdown("指定フォルダの画像をフォルダ構成ごとローカルにダウンロードします。")
+
+    st.warning("⚠ この機能はローカル実行時のみ使用できます（Streamlit Cloudではローカルにファイル保存できません）")
+
+    # Excelテンプレートダウンロード
+    if st.button("📥 テンプレートをダウンロード（フォルダ一覧付き）", key="dl_folder_tmpl_btn"):
+        with st.spinner("フォルダ一覧を取得中..."):
+            tmpl_folders, tmpl_error = get_all_folders()
+
+        if tmpl_error:
+            st.error(f"フォルダ一覧の取得に失敗しました: {tmpl_error}")
+        else:
+            styles, _ = get_openpyxl_styles()
+            Font = styles['Font']
+            PatternFill = styles['PatternFill']
+            Alignment = styles['Alignment']
+            from openpyxl import Workbook
+
+            wb = Workbook()
+
+            # シート1: ダウンロード指示
+            ws1 = wb.active
+            ws1.title = "ダウンロード指示"
+            header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+            header_font = Font(name="Meiryo UI", bold=True, color="FFFFFF", size=10)
+            cell_font = Font(name="Meiryo UI", size=10)
+
+            cell = ws1.cell(row=1, column=1, value="フォルダID")
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center")
+
+            ws1.cell(row=2, column=1, value="13054250").font = cell_font
+            ws1.column_dimensions['A'].width = 16
+
+            # シート2: フォルダ一覧
+            ws2 = wb.create_sheet(title="フォルダ一覧")
+            headers2 = ["フォルダID", "フォルダ名", "ディレクトリパス", "ファイル数"]
+            for col_idx, header in enumerate(headers2, 1):
+                cell = ws2.cell(row=1, column=col_idx, value=header)
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal="center")
+
+            for row_idx, f in enumerate(tmpl_folders, 2):
+                ws2.cell(row=row_idx, column=1, value=f["FolderId"]).font = cell_font
+                ws2.cell(row=row_idx, column=2, value=f["FolderName"]).font = cell_font
+                ws2.cell(row=row_idx, column=3, value=f["FolderPath"]).font = cell_font
+                ws2.cell(row=row_idx, column=4, value=f["FileCount"]).font = cell_font
+
+            ws2.column_dimensions['A'].width = 14
+            ws2.column_dimensions['B'].width = 30
+            ws2.column_dimensions['C'].width = 40
+            ws2.column_dimensions['D'].width = 12
+
+            excel_buffer = BytesIO()
+            wb.save(excel_buffer)
+            excel_buffer.seek(0)
+
+            st.download_button(
+                label="📥 ダウンロード",
+                data=excel_buffer.getvalue(),
+                file_name="folder_download_template.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_folder_dl_template",
+            )
+
+    st.divider()
+
+    # 保存先フォルダ
+    save_root = st.text_input("保存先フォルダ", value=r"C:\Users\ssasa\Downloads\rcabinet_backup", key="dl_save_root")
+
+    # CSV/Excelアップロード
+    upload_file = st.file_uploader("CSV / Excelファイルを選択（フォルダID列が必要）", type=["csv", "xlsx"], key="folder_dl_file")
+
+    if upload_file:
+        # ファイル読み込み
+        if upload_file.name.endswith(".xlsx"):
+            upload_file.seek(0)
+            df = pd.read_excel(upload_file, sheet_name=0, dtype=str).fillna("")
+        else:
+            try:
+                upload_file.seek(0)
+                df = pd.read_csv(upload_file, encoding="utf-8-sig", dtype=str).fillna("")
+            except Exception:
+                upload_file.seek(0)
+                df = pd.read_csv(upload_file, encoding="cp932", dtype=str).fillna("")
+
+        if "フォルダID" not in df.columns:
+            st.error("「フォルダID」列が必要です")
+        elif len(df) == 0:
+            st.warning("データがありません。")
+        else:
+            folder_ids_input = [r.strip() for r in df["フォルダID"] if r.strip()]
+            st.info(f"📎 {len(folder_ids_input)} 件のフォルダIDを読み込みました")
+
+            # フォルダ一覧を取得して検証
+            with st.spinner("フォルダ一覧を取得中..."):
+                folders, folder_error = get_all_folders()
+
+            if folder_error:
+                st.error(f"フォルダ一覧の取得に失敗しました: {folder_error}")
+            else:
+                # フォルダID → 情報のマップ
+                folder_map = {}
+                for f in folders:
+                    folder_map[str(f["FolderId"])] = f
+
+                # 指定フォルダIDの検証 & サブフォルダ収集
+                target_folders = []
+                preview_rows = []
+
+                for fid in folder_ids_input:
+                    if fid not in folder_map:
+                        preview_rows.append({
+                            "フォルダID": fid,
+                            "フォルダ名": "",
+                            "パス": "",
+                            "ファイル数": 0,
+                            "チェック": "❌ フォルダID不正",
+                        })
+                        continue
+
+                    f_info = folder_map[fid]
+                    f_path = f_info["FolderPath"]
+
+                    # このフォルダ自体を追加
+                    if f_info not in target_folders:
+                        target_folders.append(f_info)
+                        preview_rows.append({
+                            "フォルダID": fid,
+                            "フォルダ名": f_info["FolderName"],
+                            "パス": f_path,
+                            "ファイル数": f_info["FileCount"],
+                            "チェック": "✅ OK",
+                        })
+
+                    # サブフォルダを再帰的に収集（パスの前方一致）
+                    for sf in folders:
+                        sf_path = sf["FolderPath"]
+                        sf_id = str(sf["FolderId"])
+                        if sf_id != fid and sf_path.startswith(f_path + "/"):
+                            if sf not in target_folders:
+                                target_folders.append(sf)
+                                preview_rows.append({
+                                    "フォルダID": sf_id,
+                                    "フォルダ名": sf["FolderName"],
+                                    "パス": sf_path,
+                                    "ファイル数": sf["FileCount"],
+                                    "チェック": "✅ OK（サブフォルダ）",
+                                })
+
+                ok_count = sum(1 for r in preview_rows if "OK" in r["チェック"])
+                ng_count = len(preview_rows) - ok_count
+                total_files = sum(int(r.get("ファイル数", 0)) for r in preview_rows if "OK" in r["チェック"])
+
+                if ng_count > 0:
+                    st.warning(f"対象フォルダ: {ok_count} 件 / エラー: {ng_count} 件")
+                else:
+                    st.success(f"対象フォルダ: {ok_count} 件（推定ファイル数: {total_files} 件）")
+
+                st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+
+                if ok_count > 0:
+                    st.divider()
+
+                    # 実行ボタン
+                    if st.button(f"📥 ダウンロード実行（{ok_count} フォルダ / 推定 {total_files} ファイル）", type="primary", key="folder_dl_exec"):
+                        os.makedirs(save_root, exist_ok=True)
+
+                        progress = st.progress(0, text="ダウンロード準備中...")
+                        stop_placeholder = st.empty()
+                        results = []
+                        stopped = False
+                        total_folder_count = len(target_folders)
+
+                        # FolderPath → FolderName マップを構築（パス→表示名変換用）
+                        path_to_name = {}
+                        for f in folders:
+                            path_to_name[f["FolderPath"]] = f["FolderName"]
+
+                        def build_display_path(folder_path):
+                            """FolderPathの各階層をFolderNameに変換"""
+                            parts = folder_path.strip("/").split("/")
+                            display_parts = []
+                            for i in range(len(parts)):
+                                partial = "/" + "/".join(parts[:i + 1])
+                                display_parts.append(path_to_name.get(partial, parts[i]))
+                            return os.sep.join(display_parts)
+
+                        for fi, folder_info in enumerate(target_folders):
+                            if stop_placeholder.button("⏹ 停止", key=f"dl_stop_{fi}"):
+                                stopped = True
+                                break
+
+                            fid = str(folder_info["FolderId"])
+                            f_path = folder_info["FolderPath"]
+                            f_name = folder_info["FolderName"]
+
+                            progress.progress(
+                                (fi + 1) / total_folder_count,
+                                text=f"フォルダ取得中... ({fi + 1}/{total_folder_count}) {f_name}"
+                            )
+
+                            # ローカルのフォルダパスを構築（フォルダ名で作成）
+                            display_path = build_display_path(f_path)
+                            local_folder = os.path.join(save_root, display_path)
+                            os.makedirs(local_folder, exist_ok=True)
+
+                            # フォルダ内ファイル一覧を取得
+                            files, files_error = get_folder_files(int(fid))
+
+                            # パス分解
+                            path_parts = f_path.split("/")
+                            cat1 = path_parts[0] if len(path_parts) > 0 else ""
+                            cat2 = path_parts[1] if len(path_parts) > 1 else ""
+                            cat3 = path_parts[2] if len(path_parts) > 2 else ""
+
+                            if files_error:
+                                results.append({
+                                    "カテゴリ1": cat1,
+                                    "カテゴリ2": cat2,
+                                    "カテゴリ3": cat3,
+                                    "ファイル名": "",
+                                    "結果": "❌ 失敗",
+                                    "エラー": f"ファイル一覧取得失敗: {files_error}",
+                                })
+                                continue
+
+                            if not files:
+                                continue
+
+                            for file_info in files:
+                                if stopped:
+                                    break
+
+                                file_url = file_info["FileUrl"]
+                                # FilePath（拡張子付き）を優先、なければURLから拡張子を補完
+                                file_name_raw = file_info["FileName"]
+                                file_path_name = file_info.get("FilePath", "")
+                                if file_path_name:
+                                    file_name = file_path_name
+                                elif file_url and "." in file_url.rsplit("/", 1)[-1]:
+                                    ext = file_url.rsplit(".", 1)[-1]
+                                    file_name = f"{file_name_raw}.{ext}"
+                                else:
+                                    file_name = file_name_raw
+
+                                progress.progress(
+                                    (fi + 1) / total_folder_count,
+                                    text=f"ダウンロード中... フォルダ({fi + 1}/{total_folder_count}) {file_name}"
+                                )
+
+                                try:
+                                    img_response = requests.get(file_url, timeout=30)
+                                    if img_response.status_code != 200:
+                                        results.append({
+                                            "カテゴリ1": cat1,
+                                            "カテゴリ2": cat2,
+                                            "カテゴリ3": cat3,
+                                            "ファイル名": file_name,
+                                            "結果": "❌ 失敗",
+                                            "エラー": f"HTTP {img_response.status_code}",
+                                        })
+                                        continue
+
+                                    local_file_path = os.path.join(local_folder, file_name)
+                                    with open(local_file_path, "wb") as lf:
+                                        lf.write(img_response.content)
+
+                                    results.append({
+                                        "カテゴリ1": cat1,
+                                        "カテゴリ2": cat2,
+                                        "カテゴリ3": cat3,
+                                        "ファイル名": file_name,
+                                        "結果": "✅ 成功",
+                                        "エラー": "",
+                                    })
+
+                                except requests.exceptions.RequestException as e:
+                                    results.append({
+                                        "カテゴリ1": cat1,
+                                        "カテゴリ2": cat2,
+                                        "カテゴリ3": cat3,
+                                        "ファイル名": file_name,
+                                        "結果": "❌ 失敗",
+                                        "エラー": str(e),
+                                    })
+                                except OSError as e:
+                                    results.append({
+                                        "カテゴリ1": cat1,
+                                        "カテゴリ2": cat2,
+                                        "カテゴリ3": cat3,
+                                        "ファイル名": file_name,
+                                        "結果": "❌ 失敗",
+                                        "エラー": f"保存失敗: {str(e)}",
+                                    })
+
+                                time.sleep(0.2)
+
+                            if stopped:
+                                break
+                            time.sleep(0.3)
+
+                        progress.empty()
+                        stop_placeholder.empty()
+
+                        # 結果表示
+                        success_count = sum(1 for r in results if r["結果"] == "✅ 成功")
+                        fail_count = sum(1 for r in results if r["結果"] == "❌ 失敗")
+
+                        if stopped:
+                            st.warning(f"⏹ 停止しました（成功: {success_count} / 失敗: {fail_count}）")
+                        elif fail_count == 0:
+                            st.success(f"全 {success_count} 件のダウンロードが完了しました！")
+                        elif success_count == 0:
+                            st.error(f"全 {fail_count} 件のダウンロードに失敗しました")
+                        else:
+                            st.warning(f"成功: {success_count} / 失敗: {fail_count}")
+
+                        st.markdown(f"**保存先:** `{save_root}`")
+
+                        result_df = pd.DataFrame(results)
+                        st.dataframe(result_df, use_container_width=True, hide_index=True)
+
+                        # 結果Excelダウンロード
+                        if results:
+                            styles, _ = get_openpyxl_styles()
+                            Font = styles['Font']
+                            PatternFill = styles['PatternFill']
+                            Alignment = styles['Alignment']
+                            from openpyxl import Workbook
+
+                            wb = Workbook()
+                            ws = wb.active
+                            ws.title = "ダウンロード結果"
+
+                            header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+                            header_font = Font(name="Meiryo UI", bold=True, color="FFFFFF", size=10)
+                            cell_font = Font(name="Meiryo UI", size=10)
+
+                            headers = ["No", "カテゴリ1", "カテゴリ2", "カテゴリ3", "ファイル名", "結果", "エラー"]
+                            for col_idx, header in enumerate(headers, 1):
+                                cell = ws.cell(row=1, column=col_idx, value=header)
+                                cell.fill = header_fill
+                                cell.font = header_font
+                                cell.alignment = Alignment(horizontal="center")
+
+                            for row_idx, r in enumerate(results, 2):
+                                ws.cell(row=row_idx, column=1, value=row_idx - 1).font = cell_font
+                                ws.cell(row=row_idx, column=2, value=r["カテゴリ1"]).font = cell_font
+                                ws.cell(row=row_idx, column=3, value=r["カテゴリ2"]).font = cell_font
+                                ws.cell(row=row_idx, column=4, value=r["カテゴリ3"]).font = cell_font
+                                ws.cell(row=row_idx, column=5, value=r["ファイル名"]).font = cell_font
+                                ws.cell(row=row_idx, column=6, value=r["結果"]).font = cell_font
+                                ws.cell(row=row_idx, column=7, value=r.get("エラー", "")).font = cell_font
+
+                            ws.column_dimensions['A'].width = 8
+                            ws.column_dimensions['B'].width = 18
+                            ws.column_dimensions['C'].width = 18
+                            ws.column_dimensions['D'].width = 18
+                            ws.column_dimensions['E'].width = 24
+                            ws.column_dimensions['F'].width = 10
+                            ws.column_dimensions['G'].width = 40
+
+                            result_buffer = BytesIO()
+                            wb.save(result_buffer)
+                            result_buffer.seek(0)
+
+                            st.download_button(
+                                label="📥 結果をExcelでダウンロード",
+                                data=result_buffer.getvalue(),
+                                file_name=f"download_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key="dl_result_xlsx",
+                            )
