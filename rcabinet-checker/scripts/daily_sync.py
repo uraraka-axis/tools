@@ -9,6 +9,7 @@ import base64
 import json
 import time
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 import requests
 from supabase import create_client, Client
 
@@ -252,6 +253,22 @@ def sync_images_to_db(supabase: Client, images: list) -> dict:
         return {"success": False, "error": str(e)}
 
 
+def update_sync_meta(supabase: Client, source: str, total_files: int = 0) -> bool:
+    """rcabinet_sync_meta に最終同期時刻を記録（id=1 固定の単一行）"""
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        supabase.table("rcabinet_sync_meta").upsert({
+            "id": 1,
+            "last_sync_at": now_iso,
+            "source": source,
+            "total_files": total_files,
+        }, on_conflict="id").execute()
+        return True
+    except Exception as e:
+        print(f"  Warning: failed to update rcabinet_sync_meta: {e}")
+        return False
+
+
 def main():
     print("=" * 50)
     print("R-Cabinet Daily Sync Started")
@@ -300,6 +317,8 @@ def main():
     result = sync_images_to_db(supabase, all_files)
 
     if result.get("success"):
+        # 最終同期時刻をメタテーブルに記録
+        meta_ok = update_sync_meta(supabase, source="daily_batch", total_files=result.get("total", 0))
         print("=" * 50)
         print("Sync completed successfully!")
         print(f"  Total: {result['total']}")
@@ -307,6 +326,7 @@ def main():
         print(f"  Updated: {result['updated']}")
         print(f"  Duplicate: {result['duplicate']}")
         print(f"  Deleted: {result['deleted']}")
+        print(f"  Meta updated: {meta_ok}")
         print("=" * 50)
     else:
         print(f"Sync failed: {result.get('error')}")
