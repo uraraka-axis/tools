@@ -1222,9 +1222,9 @@ def resize_to_square(image_data: bytes, size: int = 600, center: bool = False):
     img = Image.open(BytesIO(image_data)).convert("RGB")
 
     if center:
-        # バッジなし：中央配置、表示領域をほぼキャンバス全体に
-        display_w = int(size * 0.98)
-        display_h = int(size * 0.98)
+        # バッジなし：中央配置、表示領域をキャンバスの93%に（画像の粗さ対策で少し余白を取る）
+        display_w = int(size * 0.93)
+        display_h = int(size * 0.93)
     else:
         # バッジ領域を考慮した表示領域（右側にバッジがあるため左寄せ）
         display_w = int(size * 0.75)  # 横は75%まで使用
@@ -1451,8 +1451,8 @@ def _workflow_process_one_image(data: dict, session, badge_path: str):
     need_badge = ctype in ('set', 'yoyaku')
 
     if is_tanpin:
-        # 単品: 650×650px・中央配置（バッジなし）
-        resized = resize_to_square(image_data, 650, center=True)
+        # 単品: 600×600px・中央配置（バッジなし）
+        resized = resize_to_square(image_data, 600, center=True)
         final_image = resized
         badge_status = "リサイズのみ（中央）"
     else:
@@ -2906,7 +2906,7 @@ if mode == "🎨 クリエイティブスタジオ":
                 <div>
                     <p class="step-card-title">Step ③ 画像取得＋加工</p>
                     <p class="step-card-desc">セット: JANコードで1巻目の画像を取得し、送料無料バッジを合成します（600×600px）</p>
-                    <p class="step-card-desc">単品: JANコードで対象巻の画像を取得します。中央配置（650×650px）</p>
+                    <p class="step-card-desc">単品: JANコードで対象巻の画像を取得します。中央配置（600×600px）</p>
                     <p class="step-card-desc">予約: JANコードで最新巻の画像を取得し、送料無料バッジを合成します（600×600px）</p>
                 </div>
             </div>
