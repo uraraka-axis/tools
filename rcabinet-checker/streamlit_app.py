@@ -609,6 +609,69 @@ def load_images_from_db_by_folder(folder_name: str) -> list:
         return []
 
 
+def _compute_folder_filter():
+    """FOLDER_MANAGEMENT_SHEETS ベースのフィルタ用セットを返す (prefixes, ancestors)"""
+    target_prefixes = [prefix for prefix, _ in FOLDER_MANAGEMENT_SHEETS]
+    needed_ancestors = set()
+    for prefix in target_prefixes:
+        parts = [p for p in prefix.strip('/').split('/') if p]
+        for i in range(1, len(parts)):
+            needed_ancestors.add('/' + '/'.join(parts[:i]))
+    return target_prefixes, needed_ancestors
+
+
+def is_target_folder_path(folder_path: str) -> bool:
+    """対象フォルダ（FOLDER_MANAGEMENT_SHEETS プレフィックス配下 + 親）かを判定"""
+    if not folder_path:
+        return False
+    target_prefixes, needed_ancestors = _compute_folder_filter()
+    if folder_path in needed_ancestors:
+        return True
+    return any(folder_path == p or folder_path.startswith(p + '/') for p in target_prefixes)
+
+
+def filter_target_folders(folders: list) -> list:
+    """フォルダ一覧を対象プレフィックス配下のみにフィルタ"""
+    return [f for f in folders if is_target_folder_path(f.get('FolderPath', ''))]
+
+
+def get_last_sync_at() -> tuple:
+    """rcabinet_sync_meta から最終同期日時を取得。(JST文字列, source) or (None, None)"""
+    supabase = get_supabase_client()
+    if not supabase:
+        return None, None
+    try:
+        result = supabase.table("rcabinet_sync_meta").select("last_sync_at, source").eq("id", 1).execute()
+        if result.data:
+            row = result.data[0]
+            ts_str = row.get("last_sync_at")
+            if ts_str:
+                dt_utc = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                dt_jst = dt_utc.astimezone(JST)
+                return dt_jst.strftime("%Y-%m-%d %H:%M"), row.get("source")
+    except Exception:
+        pass
+    return None, None
+
+
+def update_sync_meta(source: str, total_files: int = 0) -> bool:
+    """rcabinet_sync_meta に最終同期日時を書き込む"""
+    supabase = get_supabase_client()
+    if not supabase:
+        return False
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        supabase.table("rcabinet_sync_meta").upsert({
+            "id": 1,
+            "last_sync_at": now_iso,
+            "source": source,
+            "total_files": total_files,
+        }, on_conflict="id").execute()
+        return True
+    except Exception:
+        return False
+
+
 def build_folder_management_xlsx(folders: list, files: list) -> bytes:
     """楽天RMS画像フォルダ管理シート形式のExcelを生成"""
     import openpyxl
@@ -3814,13 +3877,14 @@ elif mode == "🛰️ R-Cabi構成把握":
         st.warning("フォルダがありません。")
         st.stop()
 
-    # 総ファイル数を計算
-    total_files = sum(f['FileCount'] for f in folders)
+    # 対象フォルダ（FOLDER_MANAGEMENT_SHEETS配下）のみに絞り込んだ件数
+    target_folders_view = filter_target_folders(folders)
+    target_files_view = sum(f.get('FileCount', 0) for f in target_folders_view)
 
-    # サイドバーにフォルダ情報（再取得ボタンは最新一覧を取得に統合したため不要）
+    # サイドバーにフォルダ情報（取得対象ベース）
     with st.sidebar:
-        st.success(f"📁 {len(folders)} フォルダ")
-        st.info(f"📷 {total_files} 画像（全体）")
+        st.success(f"📁 {len(target_folders_view)} フォルダ")
+        st.info(f"📷 {target_files_view} 画像")
 
     xlsx_col1, xlsx_col2, xlsx_col3 = st.columns([3, 3, 4])
     with xlsx_col1:
@@ -3836,28 +3900,24 @@ elif mode == "🛰️ R-Cabi構成把握":
             key="xlsx_db_btn",
         )
 
+    # 最終同期日時の表示
+    last_sync_str, last_sync_source = get_last_sync_at()
+    if last_sync_str:
+        source_label = {
+            "streamlit": "Streamlit最新取得",
+            "daily_batch": "日次バッチ",
+        }.get(last_sync_source or "", last_sync_source or "unknown")
+        st.caption(f"🕒 最終DB同期: {last_sync_str}（{source_label}）")
+    else:
+        st.caption("🕒 最終DB同期: 未記録（rcabinet_sync_meta テーブル未作成か、初回同期前）")
+
     if xlsx_latest_btn:
         with st.spinner("フォルダ一覧を取得中..."):
             latest_folders, f_err = get_all_folders()
         if f_err or not latest_folders:
             st.error(f"フォルダ取得エラー: {f_err or 'データなし'}")
         else:
-            target_prefixes = [prefix for prefix, _ in FOLDER_MANAGEMENT_SHEETS]
-            # カテゴリ名ルックアップ用に親フォルダ（例: /comic）も対象に含める
-            needed_ancestors = set()
-            for prefix in target_prefixes:
-                parts = [p for p in prefix.strip('/').split('/') if p]
-                for i in range(1, len(parts)):
-                    needed_ancestors.add('/' + '/'.join(parts[:i]))
-
-            def _is_target_folder(fp: str) -> bool:
-                if not fp:
-                    return False
-                if fp in needed_ancestors:
-                    return True
-                return any(fp == p or fp.startswith(p + '/') for p in target_prefixes)
-
-            target_folders = [f for f in latest_folders if _is_target_folder(f.get('FolderPath', ''))]
+            target_folders = filter_target_folders(latest_folders)
             skipped_count = len(latest_folders) - len(target_folders)
 
             if not target_folders:
@@ -3883,7 +3943,21 @@ elif mode == "🛰️ R-Cabi構成把握":
                     xlsx_bytes = build_folder_management_xlsx(target_folders, all_files_for_xlsx)
                 st.session_state.xlsx_latest_bytes = xlsx_bytes
                 st.session_state.xlsx_latest_count = len(all_files_for_xlsx)
-                st.success(f"✅ 最新版Excel生成完了（{len(target_folders)}フォルダ / {len(all_files_for_xlsx)}ファイル）")
+
+                # DBへ同期（Streamlit側実行）
+                with st.spinner("DBへ同期中..."):
+                    sync_result = sync_images_to_db(all_files_for_xlsx)
+                if sync_result.get("success"):
+                    update_sync_meta(source="streamlit", total_files=len(all_files_for_xlsx))
+                    st.success(
+                        f"✅ 最新版Excel生成＆DB同期完了（{len(target_folders)}フォルダ / {len(all_files_for_xlsx)}ファイル） "
+                        f"／ 新規{sync_result.get('new',0)} 更新{sync_result.get('updated',0)} 削除{sync_result.get('deleted',0)} 変更なし{sync_result.get('unchanged',0)}"
+                    )
+                else:
+                    st.warning(
+                        f"✅ Excel生成完了（{len(target_folders)}フォルダ / {len(all_files_for_xlsx)}ファイル） "
+                        f"／ ⚠️ DB同期失敗: {sync_result.get('error')}"
+                    )
 
     if xlsx_db_btn:
         with st.spinner("DBから読込中..."):
