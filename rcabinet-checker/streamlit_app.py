@@ -268,6 +268,18 @@ def download_from_github(path: str) -> dict:
         return {"success": False, "error": str(e)}
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_github_csv_bytes(path: str, cache_bust: int = 0) -> bytes:
+    """GitHubからCSVを取得してbytesで返す（download_buttonで使う安定データ用）。cache_bustで強制再取得可能"""
+    result = download_from_github(path)
+    if result.get("success"):
+        content = result["content"]
+        if isinstance(content, bytes):
+            return content
+        return content.encode('utf-8')
+    return b""
+
+
 def get_github_file_info(path: str) -> dict:
     """GitHubファイルの情報（更新日時など）を取得"""
     if not GITHUB_TOKEN:
@@ -2581,7 +2593,12 @@ if mode == "🎨 クリエイティブスタジオ":
                     # 不足リストが更新されたので、下流のキャッシュ/アップロード済フラグを無効化
                     st.session_state.workflow_data['missing_uploaded'] = False
                     st.session_state.workflow_data.pop('missing_from_github', None)
-                    st.session_state.pop('csv_downloads', None)
+                    # CSV取得キャッシュも無効化（次回取得時に最新を取りに行く）
+                    try:
+                        fetch_github_csv_bytes.clear()
+                    except Exception:
+                        pass
+                    st.session_state['csv_cache_bust'] = st.session_state.get('csv_cache_bust', 0) + 1
                     exists_count = len([r for r in results if r['存在'] == '✅ あり'])
                     missing_count = len([r for r in results if r['存在'] == '❌ なし'])
 
@@ -2774,7 +2791,40 @@ if mode == "🎨 クリエイティブスタジオ":
                 status_icon = "🟢" if run["conclusion"] == "success" else "🔴" if run["conclusion"] == "failure" else "🟡"
                 st.write(f"{status_icon} {run['created_at']} - {run['conclusion'] or '実行中'}")
 
-        if st.button("📊 CSV生成・取得", type="primary"):
+        btn_cols = st.columns([1, 1])
+        with btn_cols[0]:
+            run_clicked = st.button("📊 CSV生成・取得", type="primary", use_container_width=True)
+        with btn_cols[1]:
+            reuse_clicked = st.button(
+                "♻️ 前回の情報を取得",
+                help="GitHub Actionsを起動せず、前回生成済みの is_list.csv / comic_list.csv をそのまま取得します（テスト・再実行用）",
+                use_container_width=True,
+            )
+
+        if reuse_clicked:
+            status_area = st.empty()
+            status_area.info("📥 前回のCSVを取得中...")
+            is_result = download_from_github(GITHUB_IS_LIST_PATH)
+            cl_result = download_from_github(GITHUB_COMIC_LIST_PATH)
+            if is_result.get("success") and cl_result.get("success"):
+                is_content = is_result["content"]
+                if isinstance(is_content, bytes):
+                    is_content = is_content.decode('utf-8', errors='replace')
+                cl_content = cl_result["content"]
+                if isinstance(cl_content, bytes):
+                    cl_content = cl_content.decode('utf-8', errors='replace')
+                st.session_state.workflow_data['is_list'] = is_content
+                st.session_state.workflow_data['comic_list'] = cl_content
+                status_area.success("✅ 前回のCSVを取得しました。Step ③に進めます")
+            else:
+                err_msgs = []
+                if not is_result.get("success"):
+                    err_msgs.append(f"is_list.csv: {is_result.get('error')}")
+                if not cl_result.get("success"):
+                    err_msgs.append(f"comic_list.csv: {cl_result.get('error')}")
+                status_area.error("CSVのダウンロードに失敗しました / " + " / ".join(err_msgs))
+
+        if run_clicked:
             status_area = st.empty()
             progress_area = st.empty()
 
@@ -3057,50 +3107,48 @@ if mode == "🎨 クリエイティブスタジオ":
                 missing_comics = list(gh)
 
         # --- CSVダウンロード ---
-        with st.expander("📄 CSVファイルをダウンロード"):
-            # (表示ファイル名, GitHubパス) — 表示名はユーザー希望に合わせて missing_set.csv を使用
-            csv_files = [
-                ("missing_tanpin.csv", GITHUB_MISSING_TANPIN_PATH),
-                ("missing_set.csv", GITHUB_MISSING_CSV_PATH),
-                ("missing_yoyaku.csv", GITHUB_MISSING_YOYAKU_PATH),
-                ("is_list.csv", GITHUB_IS_LIST_PATH),
-                ("comic_list.csv", GITHUB_COMIC_LIST_PATH),
-            ]
-            if 'csv_downloads' not in st.session_state:
-                st.session_state.csv_downloads = {}
+        # (表示ファイル名, GitHubパス) — 表示名はユーザー希望に合わせて missing_set.csv を使用
+        csv_files = [
+            ("missing_tanpin.csv", GITHUB_MISSING_TANPIN_PATH),
+            ("missing_set.csv", GITHUB_MISSING_CSV_PATH),
+            ("missing_yoyaku.csv", GITHUB_MISSING_YOYAKU_PATH),
+            ("is_list.csv", GITHUB_IS_LIST_PATH),
+            ("comic_list.csv", GITHUB_COMIC_LIST_PATH),
+        ]
+        if 'csv_cache_bust' not in st.session_state:
+            st.session_state.csv_cache_bust = 0
 
-            # 未キャッシュのCSVを自動取得（1クリックでダウンロードできるように）
-            missing_csvs = [(f, p) for f, p in csv_files if f not in st.session_state.csv_downloads]
-            if missing_csvs:
-                with st.spinner(f"GitHubからCSVを取得中... ({len(missing_csvs)}件)"):
-                    for fname, gpath in missing_csvs:
-                        result = download_from_github(gpath)
-                        if result.get("success"):
-                            content = result["content"]
-                            if isinstance(content, bytes):
-                                st.session_state.csv_downloads[fname] = content
-                            else:
-                                st.session_state.csv_downloads[fname] = content.encode('utf-8')
-                        else:
-                            st.session_state.csv_downloads[fname] = None
+        dl_header_cols = st.columns([6, 1])
+        with dl_header_cols[0]:
+            st.markdown("**📄 CSVファイルをダウンロード**")
+        with dl_header_cols[1]:
+            if st.button("🔄 再取得", key="csv_refresh_btn", help="GitHubからCSVを再取得", use_container_width=True):
+                st.session_state.csv_cache_bust += 1
+                fetch_github_csv_bytes.clear()
+                st.rerun()
 
-            dl_cols = st.columns(len(csv_files))
-            for idx, (fname, gpath) in enumerate(csv_files):
-                with dl_cols[idx]:
-                    data = st.session_state.csv_downloads.get(fname)
-                    if data:
-                        st.download_button(
-                            label=f"💾 {fname}",
-                            data=data,
-                            file_name=fname,
-                            mime="text/csv",
-                            key=f"dl_{fname}",
-                            use_container_width=True,
-                        )
-                    else:
-                        if st.button(f"🔄 {fname} (再試行)", key=f"retry_{fname}", use_container_width=True):
-                            st.session_state.csv_downloads.pop(fname, None)
-                            st.rerun()
+        cache_bust = st.session_state.csv_cache_bust
+        dl_cols = st.columns(len(csv_files))
+        for idx, (fname, gpath) in enumerate(csv_files):
+            with dl_cols[idx]:
+                data = fetch_github_csv_bytes(gpath, cache_bust=cache_bust)
+                if data:
+                    st.download_button(
+                        label=f"💾 {fname}",
+                        data=data,
+                        file_name=fname,
+                        mime="text/csv",
+                        key=f"dl_{fname}_{cache_bust}",
+                        use_container_width=True,
+                    )
+                else:
+                    st.button(
+                        f"❌ {fname}",
+                        key=f"dl_err_{fname}_{cache_bust}",
+                        disabled=True,
+                        help="取得失敗（右上の再取得ボタンでリトライ）",
+                        use_container_width=True,
+                    )
 
         # --- 実行セクション ---
         st.divider()
@@ -3743,17 +3791,16 @@ elif mode == "🛰️ R-Cabi構成把握":
         st.session_state.images_loaded = False
         st.session_state.images_data = None
 
-    # フォルダ一覧を自動取得（初回のみ）
+    # フォルダ一覧を自動取得（初回のみ）- 再実行を挟まず同一runで続行し、残像を回避
     if not st.session_state.folders_loaded:
         with st.spinner("フォルダ一覧を取得中..."):
             folders, error = get_all_folders()
         st.session_state.folders_data = folders
         st.session_state.folders_error = error
         st.session_state.folders_loaded = True
-        st.rerun()
-
-    folders = st.session_state.folders_data
-    error = st.session_state.folders_error
+    else:
+        folders = st.session_state.folders_data
+        error = st.session_state.folders_error
 
     if error:
         st.error(error)
@@ -3795,26 +3842,48 @@ elif mode == "🛰️ R-Cabi構成把握":
         if f_err or not latest_folders:
             st.error(f"フォルダ取得エラー: {f_err or 'データなし'}")
         else:
-            all_files_for_xlsx = []
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            for i, folder in enumerate(latest_folders):
-                status_text.text(f"取得中: {folder['FolderName']} ({i + 1}/{len(latest_folders)})")
-                progress_bar.progress((i + 1) / len(latest_folders))
-                files, _ = get_folder_files(int(folder['FolderId']))
-                if files:
-                    for fl in files:
-                        fl['FolderName'] = folder['FolderName']
-                        fl['FolderPath'] = folder.get('FolderPath', '')
-                    all_files_for_xlsx.extend(files)
-                time.sleep(0.3)
-            progress_bar.empty()
-            status_text.empty()
-            with st.spinner("Excel生成中..."):
-                xlsx_bytes = build_folder_management_xlsx(latest_folders, all_files_for_xlsx)
-            st.session_state.xlsx_latest_bytes = xlsx_bytes
-            st.session_state.xlsx_latest_count = len(all_files_for_xlsx)
-            st.success(f"✅ 最新版Excel生成完了（{len(latest_folders)}フォルダ / {len(all_files_for_xlsx)}ファイル）")
+            target_prefixes = [prefix for prefix, _ in FOLDER_MANAGEMENT_SHEETS]
+            # カテゴリ名ルックアップ用に親フォルダ（例: /comic）も対象に含める
+            needed_ancestors = set()
+            for prefix in target_prefixes:
+                parts = [p for p in prefix.strip('/').split('/') if p]
+                for i in range(1, len(parts)):
+                    needed_ancestors.add('/' + '/'.join(parts[:i]))
+
+            def _is_target_folder(fp: str) -> bool:
+                if not fp:
+                    return False
+                if fp in needed_ancestors:
+                    return True
+                return any(fp == p or fp.startswith(p + '/') for p in target_prefixes)
+
+            target_folders = [f for f in latest_folders if _is_target_folder(f.get('FolderPath', ''))]
+            skipped_count = len(latest_folders) - len(target_folders)
+
+            if not target_folders:
+                st.error("対象フォルダが見つかりません（FOLDER_MANAGEMENT_SHEETSのプレフィックス配下が0件）")
+            else:
+                st.info(f"対象フォルダに絞り込み: {len(target_folders)}件（対象外{skipped_count}件はスキップ）")
+                all_files_for_xlsx = []
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                for i, folder in enumerate(target_folders):
+                    status_text.text(f"取得中: {folder['FolderName']} ({i + 1}/{len(target_folders)})")
+                    progress_bar.progress((i + 1) / len(target_folders))
+                    files, _ = get_folder_files(int(folder['FolderId']))
+                    if files:
+                        for fl in files:
+                            fl['FolderName'] = folder['FolderName']
+                            fl['FolderPath'] = folder.get('FolderPath', '')
+                        all_files_for_xlsx.extend(files)
+                    time.sleep(0.3)
+                progress_bar.empty()
+                status_text.empty()
+                with st.spinner("Excel生成中..."):
+                    xlsx_bytes = build_folder_management_xlsx(target_folders, all_files_for_xlsx)
+                st.session_state.xlsx_latest_bytes = xlsx_bytes
+                st.session_state.xlsx_latest_count = len(all_files_for_xlsx)
+                st.success(f"✅ 最新版Excel生成完了（{len(target_folders)}フォルダ / {len(all_files_for_xlsx)}ファイル）")
 
     if xlsx_db_btn:
         with st.spinner("DBから読込中..."):
