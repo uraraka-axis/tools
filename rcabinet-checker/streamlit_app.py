@@ -654,22 +654,88 @@ def get_last_sync_at() -> tuple:
     return None, None
 
 
-def update_sync_meta(source: str, total_files: int = 0) -> bool:
-    """rcabinet_sync_meta に最終同期日時を書き込む"""
+def update_sync_meta(source: str, total_files: int = 0, is_full_sync: bool = False) -> bool:
+    """rcabinet_sync_meta に最終同期日時を書き込む（is_full_sync=True で last_full_sync_at も更新）"""
     supabase = get_supabase_client()
     if not supabase:
         return False
     try:
         now_iso = datetime.now(timezone.utc).isoformat()
-        supabase.table("rcabinet_sync_meta").upsert({
+        payload = {
             "id": 1,
             "last_sync_at": now_iso,
             "source": source,
             "total_files": total_files,
-        }, on_conflict="id").execute()
+        }
+        if is_full_sync:
+            payload["last_full_sync_at"] = now_iso
+        supabase.table("rcabinet_sync_meta").upsert(payload, on_conflict="id").execute()
         return True
     except Exception:
         return False
+
+
+def should_do_full_sync(days: int = 7) -> tuple:
+    """前回フル取得から days 日以上経過しているか判定。(force_full: bool, last_full_dt_jst_str: Optional[str])"""
+    supabase = get_supabase_client()
+    if not supabase:
+        return True, None
+    try:
+        result = supabase.table("rcabinet_sync_meta").select("last_full_sync_at").eq("id", 1).execute()
+        if not result.data:
+            return True, None
+        ts_str = result.data[0].get("last_full_sync_at")
+        if not ts_str:
+            return True, None
+        dt_last_utc = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        dt_last_jst_str = dt_last_utc.astimezone(JST).strftime("%Y-%m-%d %H:%M")
+        elapsed = datetime.now(timezone.utc) - dt_last_utc
+        return (elapsed.days >= days), dt_last_jst_str
+    except Exception:
+        return True, None
+
+
+def get_db_files_by_folder_name() -> dict:
+    """DBから {folder_name: [file_record_dict]} を構築。
+    file_record_dict は API取得物と同じキー(FileName/FileUrl/FileSize/TimeStamp/FolderName)を持つ。
+    FolderPath は呼び出し側でフォルダメタから注入する。
+    """
+    supabase = get_supabase_client()
+    if not supabase:
+        return {}
+    try:
+        rows = fetch_all_from_supabase(
+            supabase,
+            "rcabinet_images",
+            "file_name, folder_names, file_url, file_size, file_timestamp",
+        )
+    except Exception:
+        return {}
+
+    result: dict = {}
+    for row in rows:
+        folder_names = row.get("folder_names") or ""
+        if not folder_names:
+            continue
+        file_url_raw = row.get("file_url") or ""
+        try:
+            url_map = json.loads(file_url_raw) if file_url_raw else {}
+            if not isinstance(url_map, dict):
+                url_map = {}
+        except (json.JSONDecodeError, TypeError):
+            url_map = {}
+        for folder_name in folder_names.split(", "):
+            folder_name = folder_name.strip()
+            if not folder_name:
+                continue
+            result.setdefault(folder_name, []).append({
+                "FileName": row.get("file_name", ""),
+                "FileUrl": url_map.get(folder_name, ""),
+                "FileSize": row.get("file_size", 0),
+                "TimeStamp": row.get("file_timestamp", ""),
+                "FolderName": folder_name,
+            })
+    return result
 
 
 def build_folder_management_xlsx(folders: list, files: list) -> bytes:
@@ -3911,7 +3977,9 @@ elif mode == "🛰️ R-Cabi構成把握":
     if last_sync_str:
         source_label = {
             "streamlit": "Streamlit最新取得",
-            "daily_batch": "日次バッチ",
+            "streamlit_full": "Streamlit最新取得（フル）",
+            "streamlit_diff": "Streamlit最新取得（差分）",
+            "daily_batch": "日次バッチ（フル）",
         }.get(last_sync_source or "", last_sync_source or "unknown")
         st.caption(f"🕒 最終DB同期: {last_sync_str}（{source_label}）")
     else:
@@ -3930,21 +3998,56 @@ elif mode == "🛰️ R-Cabi構成把握":
                 st.error("対象フォルダが見つかりません（FOLDER_MANAGEMENT_SHEETSのプレフィックス配下が0件）")
             else:
                 st.info(f"対象フォルダに絞り込み: {len(target_folders)}件（対象外{skipped_count}件はスキップ）")
+
+                # 週1フル取得判定
+                force_full, last_full_str = should_do_full_sync(days=7)
+                if force_full:
+                    st.warning(
+                        f"📢 フル取得モード（前回フル取得: {last_full_str or '未記録'} → 7日以上経過または未実施）"
+                    )
+                    db_files_by_folder = {}
+                else:
+                    st.info(f"⚡ 差分スキップモード（前回フル取得: {last_full_str}）")
+                    with st.spinner("DBから既存データを読込中..."):
+                        db_files_by_folder = get_db_files_by_folder_name()
+
                 all_files_for_xlsx = []
+                fetched_folder_count = 0
+                skipped_folder_count = 0
                 progress_bar = st.progress(0)
                 status_text = st.empty()
+
                 for i, folder in enumerate(target_folders):
-                    status_text.text(f"取得中: {folder['FolderName']} ({i + 1}/{len(target_folders)})")
+                    folder_name = folder['FolderName']
+                    folder_path = folder.get('FolderPath', '')
+                    api_count = int(folder.get('FileCount', 0) or 0)
+                    db_files = db_files_by_folder.get(folder_name, [])
+                    db_count = len(db_files)
+
                     progress_bar.progress((i + 1) / len(target_folders))
-                    files, _ = get_folder_files(int(folder['FolderId']))
-                    if files:
-                        for fl in files:
-                            fl['FolderName'] = folder['FolderName']
-                            fl['FolderPath'] = folder.get('FolderPath', '')
-                        all_files_for_xlsx.extend(files)
-                    time.sleep(0.3)
+
+                    if (not force_full) and api_count == db_count:
+                        # 件数一致 → DB流用でAPI呼ばない
+                        status_text.text(f"スキップ: {folder_name}（件数一致 {api_count}件・DB流用） ({i + 1}/{len(target_folders)})")
+                        for fl in db_files:
+                            fl['FolderPath'] = folder_path
+                        all_files_for_xlsx.extend(db_files)
+                        skipped_folder_count += 1
+                    else:
+                        reason = "フル取得" if force_full else f"件数不一致 API:{api_count} DB:{db_count}"
+                        status_text.text(f"取得中: {folder_name}（{reason}） ({i + 1}/{len(target_folders)})")
+                        files, _ = get_folder_files(int(folder['FolderId']))
+                        if files:
+                            for fl in files:
+                                fl['FolderName'] = folder_name
+                                fl['FolderPath'] = folder_path
+                            all_files_for_xlsx.extend(files)
+                        fetched_folder_count += 1
+                        time.sleep(0.3)
+
                 progress_bar.empty()
                 status_text.empty()
+
                 with st.spinner("Excel生成中..."):
                     xlsx_bytes = build_folder_management_xlsx(target_folders, all_files_for_xlsx)
                 st.session_state.xlsx_latest_bytes = xlsx_bytes
@@ -3954,14 +4057,19 @@ elif mode == "🛰️ R-Cabi構成把握":
                 with st.spinner("DBへ同期中..."):
                     sync_result = sync_images_to_db(all_files_for_xlsx)
                 if sync_result.get("success"):
-                    update_sync_meta(source="streamlit", total_files=len(all_files_for_xlsx))
+                    # フル取得モードで実行した場合のみ last_full_sync_at を更新
+                    update_sync_meta(
+                        source="streamlit_full" if force_full else "streamlit_diff",
+                        total_files=len(all_files_for_xlsx),
+                        is_full_sync=force_full,
+                    )
                     st.success(
-                        f"✅ 最新版Excel生成＆DB同期完了（{len(target_folders)}フォルダ / {len(all_files_for_xlsx)}ファイル） "
+                        f"✅ 完了（API取得 {fetched_folder_count}フォルダ / DB流用 {skipped_folder_count}フォルダ / 計 {len(all_files_for_xlsx)}ファイル） "
                         f"／ 新規{sync_result.get('new',0)} 更新{sync_result.get('updated',0)} 削除{sync_result.get('deleted',0)} 変更なし{sync_result.get('unchanged',0)}"
                     )
                 else:
                     st.warning(
-                        f"✅ Excel生成完了（{len(target_folders)}フォルダ / {len(all_files_for_xlsx)}ファイル） "
+                        f"✅ Excel生成完了（API取得 {fetched_folder_count}フォルダ / DB流用 {skipped_folder_count}フォルダ / 計 {len(all_files_for_xlsx)}ファイル） "
                         f"／ ⚠️ DB同期失敗: {sync_result.get('error')}"
                     )
 
