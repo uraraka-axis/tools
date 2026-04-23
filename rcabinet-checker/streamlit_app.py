@@ -2173,6 +2173,12 @@ with st.sidebar:
     st.divider()
     st.markdown("<br>", unsafe_allow_html=True)
 
+# モード切替直後に即rerunして前ページのDOM残像をクリア
+# （切替後の最初のrunでは重い処理をせず、2回目のrunで本体を描画する）
+if st.session_state.get("_last_mode") != mode:
+    st.session_state["_last_mode"] = mode
+    st.rerun()
+
 
 # ============================================================
 # 画像ワークフロー（統合モード）のカスタムCSS
