@@ -951,17 +951,83 @@ def get_bookoff_image(jan_code, session):
         return None
 
 
-def get_amazon_image(jan_code, session):
-    """Amazonから画像URL取得（複数セレクタ対応）"""
-    search_url = f"https://www.amazon.co.jp/s?k={jan_code}&i=stripbooks"
+# Amazon用 User-Agent プール（ローテーションでBot判定回避）
+AMAZON_USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+]
+
+AMAZON_BOT_MARKERS = [
+    'api-services-support@amazon.com',
+    'to discuss automated access to amazon',
+    "sorry, we just need to make sure you're not a robot",
+    'type the characters you see in this image',
+    'enter the characters you see below',
+    '/errors/validatecaptcha',
+    'captcha',
+]
+
+
+def _amazon_headers(referer='https://www.amazon.co.jp/'):
+    """Amazon用のブラウザ風ヘッダを生成（User-Agentはランダム選択）"""
+    random = get_random()
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': random.choice(AMAZON_USER_AGENTS),
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
         'Accept-Encoding': 'gzip, deflate, br',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-User': '?1',
     }
+    if referer:
+        headers['Referer'] = referer
+        headers['Sec-Fetch-Site'] = 'same-origin'
+    else:
+        headers['Sec-Fetch-Site'] = 'none'
+    return headers
 
-    # 複数のセレクタを試す（サイト構造変更に対応）
+
+def _is_amazon_bot_page(response):
+    """AmazonのBot検出ページ（CAPTCHA等）かどうか判定"""
+    if response is None:
+        return False
+    if response.status_code in (503, 429):
+        return True
+    try:
+        text_lower = (response.text or '')[:8000].lower()
+    except Exception:
+        return False
+    return any(marker in text_lower for marker in AMAZON_BOT_MARKERS)
+
+
+def _warmup_amazon_session(session):
+    """初回アクセス時にAmazonトップページを訪問してCookieを獲得"""
+    if getattr(session, '_amazon_warmed_up', False):
+        return
+    try:
+        session.get(
+            'https://www.amazon.co.jp/',
+            headers=_amazon_headers(referer=None),
+            timeout=15,
+        )
+    except Exception:
+        pass
+    session._amazon_warmed_up = True
+
+
+def get_amazon_image(jan_code, session):
+    """Amazonから画像URL取得（UAローテーション・Cookieウォームアップ・CAPTCHA検出・1回リトライ）"""
+    import re
+    search_url = f"https://www.amazon.co.jp/s?k={jan_code}&i=stripbooks"
+    random = get_random()
+
+    _warmup_amazon_session(session)
+
     SELECTORS = [
         '.s-image',
         'img[data-image-latency]',
@@ -972,44 +1038,52 @@ def get_amazon_image(jan_code, session):
     ]
     BeautifulSoup = get_bs4()
 
-    try:
-        response = session.get(search_url, headers=headers, timeout=15)
-        if response.status_code == 503:
+    for attempt in range(2):  # 初回 + リトライ1回
+        try:
+            response = session.get(search_url, headers=_amazon_headers(), timeout=15)
+
+            # Bot判定ページ検出 → リトライ or 諦め
+            if _is_amazon_bot_page(response):
+                if attempt == 0:
+                    time.sleep(random.uniform(4.0, 7.0))
+                    continue
+                return None
+
+            if response.status_code != 200:
+                return None
+
+            soup = BeautifulSoup(response.content, 'html.parser')
+
+            # 複数のセレクタを順番に試す
+            for selector in SELECTORS:
+                img_tags = soup.select(selector)
+                for img_tag in img_tags:
+                    src = img_tag.get('src') or img_tag.get('data-src')
+                    if src and ('images-na' in src or 'm.media-amazon' in src or 'images-amazon' in src):
+                        if 'no-img' not in src.lower() and 'no_image' not in src.lower():
+                            if '_AC_' in src:
+                                src = src.split('._AC_')[0] + '._SY466_.jpg'
+                            elif '_SX' in src or '_SY' in src:
+                                src = re.sub(r'\._S[XY]\d+_', '._SY466_', src)
+                            return src
+
+            # フォールバック: 正規表現でAmazon画像URLを探す
+            amazon_img_pattern = r'(https?://[^"\']+(?:images-na\.ssl-images-amazon|m\.media-amazon|images-amazon)[^"\'\s]+\.(?:jpg|jpeg|png))'
+            matches = re.findall(amazon_img_pattern, response.text)
+            for match in matches:
+                if 'no-img' not in match.lower() and 'no_image' not in match.lower() and 'sprite' not in match.lower():
+                    if '_AC_' in match:
+                        match = match.split('._AC_')[0] + '._SY466_.jpg'
+                    return match
+
             return None
-        response.raise_for_status()
+        except Exception:
+            if attempt == 0:
+                time.sleep(random.uniform(2.0, 4.0))
+                continue
+            return None
 
-        soup = BeautifulSoup(response.content, 'html.parser')
-
-        # 複数のセレクタを順番に試す
-        for selector in SELECTORS:
-            img_tags = soup.select(selector)
-            for img_tag in img_tags:
-                src = img_tag.get('src') or img_tag.get('data-src')
-                if src and ('images-na' in src or 'm.media-amazon' in src or 'images-amazon' in src):
-                    # NO IMAGE系を除外
-                    if 'no-img' not in src.lower() and 'no_image' not in src.lower():
-                        # 高解像度版に変換
-                        if '_AC_' in src:
-                            src = src.split('._AC_')[0] + '._SY466_.jpg'
-                        elif '_SX' in src or '_SY' in src:
-                            # サイズ指定を大きくする
-                            import re
-                            src = re.sub(r'\._S[XY]\d+_', '._SY466_', src)
-                        return src
-
-        # フォールバック: 正規表現でAmazon画像URLを探す
-        import re
-        amazon_img_pattern = r'(https?://[^"\']+(?:images-na\.ssl-images-amazon|m\.media-amazon|images-amazon)[^"\'\s]+\.(?:jpg|jpeg|png))'
-        matches = re.findall(amazon_img_pattern, response.text)
-        for match in matches:
-            if 'no-img' not in match.lower() and 'no_image' not in match.lower() and 'sprite' not in match.lower():
-                if '_AC_' in match:
-                    match = match.split('._AC_')[0] + '._SY466_.jpg'
-                return match
-
-        return None
-    except Exception:
-        return None
+    return None
 
 
 def get_rakuten_image(jan_code, session):
@@ -1138,14 +1212,23 @@ def download_image(image_url, session):
         return None
 
 
-def resize_to_square(image_data: bytes, size: int = 600):
-    """画像を正方形にリサイズ（アスペクト比維持、白背景パディング、表紙を大きく表示）"""
+def resize_to_square(image_data: bytes, size: int = 600, center: bool = False):
+    """画像を正方形にリサイズ（アスペクト比維持、白背景パディング、表紙を大きく表示）
+
+    - center=False: バッジ領域を想定して左寄せ（セット・予約用）
+    - center=True: バッジなしで中央配置（単品用）
+    """
     Image = get_pil()
     img = Image.open(BytesIO(image_data)).convert("RGB")
 
-    # バッジ領域を考慮した表示領域（右側にバッジがあるため左寄せ）
-    display_w = int(size * 0.75)  # 横は75%まで使用
-    display_h = int(size * 0.90)  # 縦は90%まで使用
+    if center:
+        # バッジなし：中央配置、表示領域をほぼキャンバス全体に
+        display_w = int(size * 0.98)
+        display_h = int(size * 0.98)
+    else:
+        # バッジ領域を考慮した表示領域（右側にバッジがあるため左寄せ）
+        display_w = int(size * 0.75)  # 横は75%まで使用
+        display_h = int(size * 0.90)  # 縦は90%まで使用
 
     # アスペクト比を維持して表示領域にフィット（拡大も許可）
     ratio = min(display_w / img.width, display_h / img.height)
@@ -1153,10 +1236,16 @@ def resize_to_square(image_data: bytes, size: int = 600):
     new_h = int(img.height * ratio)
     img = img.resize((new_w, new_h), Image.LANCZOS)
 
-    # 白背景の正方形キャンバスに左寄せ・上下中央配置
+    # 白背景の正方形キャンバス
     canvas = Image.new("RGB", (size, size), (255, 255, 255))
-    x = (display_w - new_w) // 2 + int(size * 0.02)  # 左寄せ（少し余白）
-    y = (size - new_h) // 2
+    if center:
+        # 中央配置
+        x = (size - new_w) // 2
+        y = (size - new_h) // 2
+    else:
+        # 左寄せ（少し余白）・上下中央
+        x = (display_w - new_w) // 2 + int(size * 0.02)
+        y = (size - new_h) // 2
     canvas.paste(img, (x, y))
 
     return canvas
@@ -1191,11 +1280,16 @@ def image_to_bytes(image, quality: int = 95) -> bytes:
     return buf.getvalue()
 
 
-def process_workflow_images(missing_comics: list, is_list_content: str, comic_list_content: str, badge_path: str, progress_bar=None, status_text=None, log_container=None):
-    """ワークフロー用：不足画像を取得してバッジ合成まで行う"""
-    import os
+def _workflow_prepare_target_data(missing_comics: list, is_list_content: str, comic_list_content: str, missing_yoyaku: list = None):
+    """画像取得対象(target_data)を構築する（CSV読み込み・マージ・単品/予約JAN引き当て）
 
-    # CSVをDataFrameに変換
+    - セット: comic_no（'_'なし）→ is_list.csvの1巻JAN（extract_first_volumes）
+    - 単品: comic_no（'_'あり：base_no_vol）→ is_list.csvの該当巻JAN
+    - 予約: comic_no（'_'なし）→ is_list.csvの最新巻（最大vol）JAN
+    """
+    if missing_yoyaku is None:
+        missing_yoyaku = []
+
     try:
         is_df = pd.read_csv(BytesIO(is_list_content.encode('utf-8')), header=None)
     except:
@@ -1206,47 +1300,62 @@ def process_workflow_images(missing_comics: list, is_list_content: str, comic_li
     except:
         cl_df = pd.read_csv(BytesIO(comic_list_content.encode('cp932')), header=None)
 
-    # CSVマージ＋JAN抽出
     merged_df = merge_csv_data(is_df, cl_df)
     result_data = extract_first_volumes(merged_df)
 
-    # missing_comicsでフィルタリング（.0除去で正規化して比較）
-    missing_set = set(normalize_jan_code(c) for c in missing_comics if normalize_jan_code(c))
-    # セット品のみ（_なし）でresult_dataをフィルタリング
-    missing_set_only = set(c for c in missing_set if '_' not in c)
-    target_data = [d for d in result_data if str(d.get('comic_no', '')).strip() in missing_set_only]
-
-    # 単品（_あり）はis_listから直接JAN検索
-    # is_dfから (comic_no, volume) → JAN の辞書を構築
-    is_jan_lookup = {}  # (comic_no, volume) → JAN
+    # is_list からのJAN引き当て辞書を構築
+    is_jan_lookup = {}                 # (comic_no, vol_str) → jan
+    latest_vol_lookup = {}             # comic_no → (max_vol_int, jan)
     for i in range(1, len(is_df)):
         try:
             cno = str(is_df.iloc[i, 6]).strip() if pd.notna(is_df.iloc[i, 6]) else ''
             cno = cno.replace('.0', '')
-            vol = str(is_df.iloc[i, 9]).strip() if pd.notna(is_df.iloc[i, 9]) else ''
-            vol = vol.replace('.0', '')
+            vol_s = str(is_df.iloc[i, 9]).strip() if pd.notna(is_df.iloc[i, 9]) else ''
+            vol_s = vol_s.replace('.0', '')
             jan = normalize_jan_code(is_df.iloc[i, 5])
-            if cno and jan:
-                is_jan_lookup[(cno, vol)] = jan
+            if not cno or not jan:
+                continue
+            is_jan_lookup[(cno, vol_s)] = jan
+            try:
+                vol_n = int(vol_s)
+                prev = latest_vol_lookup.get(cno)
+                if prev is None or vol_n > prev[0]:
+                    latest_vol_lookup[cno] = (vol_n, jan)
+            except:
+                pass
         except:
             continue
 
     result_data_dict = {str(d.get('comic_no', '')).strip(): d for d in result_data}
 
+    # 予約 comic_no のセット（'_'なしのセット品と区別するため除外判定に使う）
+    yoyaku_set = set(normalize_jan_code(c) for c in missing_yoyaku if normalize_jan_code(c))
+
+    # セット（'_'なし かつ 予約セットに含まれない）
+    missing_norm = set(normalize_jan_code(c) for c in missing_comics if normalize_jan_code(c))
+    missing_set_only = set(c for c in missing_norm if '_' not in c and c not in yoyaku_set)
+    target_data = []
+    for d in result_data:
+        cno = str(d.get('comic_no', '')).strip()
+        if cno in missing_set_only:
+            entry = dict(d)
+            entry['type'] = 'set'
+            entry['is_tanpin'] = False
+            target_data.append(entry)
+
+    # 単品（'_'あり）
     tanpin_comics = [c for c in missing_comics if '_' in str(c)]
     for tc in tanpin_comics:
         parts = str(tc).split('_')
         base_no = parts[0]
         vol_num = int(parts[1]) if len(parts) > 1 else 1
-
-        # (comic_no, volume) 完全一致でJAN検索
         jan_code = is_jan_lookup.get((base_no, str(vol_num)), '')
-
         base_info = result_data_dict.get(base_no, {})
         if jan_code:
             target_data.append({
                 'comic_no': tc,
                 'first_jan': jan_code,
+                'type': 'tanpin',
                 'is_tanpin': True,
                 'genre': base_info.get('genre', ''),
                 'publisher': base_info.get('publisher', ''),
@@ -1254,15 +1363,133 @@ def process_workflow_images(missing_comics: list, is_list_content: str, comic_li
                 'title': base_info.get('title', ''),
             })
 
-    # セット品フラグ追加
-    for d in target_data:
-        if 'is_tanpin' not in d:
-            d['is_tanpin'] = '_' in str(d.get('comic_no', ''))
+    # 予約（'_'なし、最新巻のJANを引き当て）
+    yoyaku_unresolved = []  # is_list.csvに該当なしでJAN引き当て失敗した予約コミックNo
+    for yc in missing_yoyaku:
+        cno = normalize_jan_code(yc)
+        if not cno:
+            continue
+        latest = latest_vol_lookup.get(cno)
+        jan_code = latest[1] if latest else ''
+        base_info = result_data_dict.get(cno, {})
+        if jan_code:
+            target_data.append({
+                'comic_no': cno,
+                'first_jan': jan_code,
+                'type': 'yoyaku',
+                'is_tanpin': False,
+                'genre': base_info.get('genre', ''),
+                'publisher': base_info.get('publisher', ''),
+                'series': base_info.get('series', ''),
+                'title': base_info.get('title', ''),
+            })
+        else:
+            yoyaku_unresolved.append(cno)
 
+    if yoyaku_unresolved:
+        try:
+            st.warning(
+                "予約コミックNoがis_list.csvに存在せずJANを引き当てできませんでした: "
+                + ", ".join(yoyaku_unresolved)
+                + "\n（Step ② のJAN取得ワークフローを実行してis_list.csvを更新してください）"
+            )
+        except Exception:
+            pass
+
+    # 型未設定の保険
+    for d in target_data:
+        if 'type' not in d:
+            d['type'] = 'tanpin' if d.get('is_tanpin') or '_' in str(d.get('comic_no', '')) else 'set'
+        if 'is_tanpin' not in d:
+            d['is_tanpin'] = (d.get('type') == 'tanpin')
+
+    return target_data
+
+
+def _workflow_process_one_image(data: dict, session, badge_path: str):
+    """1件分の画像取得＋加工。結果dict(success/comic_no/jan_code/log/source/image)を返す"""
+    import os
+    random = get_random()
+    comic_no = str(data.get('comic_no', '')).strip()
+    jan_code = normalize_jan_code(data.get('first_jan', ''))
+
+    if not jan_code:
+        return {'success': False, 'comic_no': comic_no, 'jan_code': '',
+                'log': f"⚠️ {comic_no}: JANコードなし - スキップ", 'source': None, 'image': None}
+
+    image_url = get_bookoff_image(jan_code, session)
+    source = 'bookoff'
+
+    if not image_url:
+        time.sleep(random.uniform(1.5, 3.0))
+        image_url = get_amazon_image(jan_code, session)
+        source = 'amazon'
+
+    if not image_url:
+        time.sleep(random.uniform(0.3, 0.6))
+        image_url = get_rakuten_image(jan_code, session)
+        source = 'rakuten'
+
+    if not image_url and GEMINI_API_KEY:
+        time.sleep(random.uniform(0.5, 1.0))
+        ai_result = get_image_with_gemini_ai(jan_code, session, "amazon")
+        if ai_result:
+            image_url = ai_result
+            source = 'gemini_ai'
+
+    if not image_url:
+        return {'success': False, 'comic_no': comic_no, 'jan_code': jan_code,
+                'log': f"❌ {comic_no} (JAN: {jan_code}): 画像が見つかりません", 'source': None, 'image': None}
+
+    image_data = download_image(image_url, session)
+    if not image_data:
+        return {'success': False, 'comic_no': comic_no, 'jan_code': jan_code,
+                'log': f"❌ {comic_no}: ダウンロード失敗 ({source})", 'source': source, 'image': None}
+
+    ctype = data.get('type') or ('tanpin' if data.get('is_tanpin') else 'set')
+    is_tanpin = (ctype == 'tanpin')
+    need_badge = ctype in ('set', 'yoyaku')
+
+    if is_tanpin:
+        # 単品: 650×650px・中央配置（バッジなし）
+        resized = resize_to_square(image_data, 650, center=True)
+        final_image = resized
+        badge_status = "リサイズのみ（中央）"
+    else:
+        # セット・予約: 600×600px・左寄せ＋送料無料バッジ
+        resized = resize_to_square(image_data, 600)
+        if os.path.exists(badge_path):
+            final_image = add_shipping_badge(resized, badge_path)
+            badge_status = "バッジ付き"
+        else:
+            final_image = resized
+            badge_status = "バッジ画像なし"
+    final_bytes = image_to_bytes(final_image)
+
+    image_dict = {
+        'comic_no': comic_no,
+        'jan_code': jan_code,
+        'image_data': final_bytes,
+        'source': source,
+        'type': ctype,
+        'is_tanpin': is_tanpin,
+        'badge': need_badge,
+        'genre': data.get('genre', ''),
+        'publisher': data.get('publisher', ''),
+        'series': data.get('series', ''),
+        'title': data.get('title', ''),
+    }
+    return {'success': True, 'comic_no': comic_no, 'jan_code': jan_code,
+            'log': f"✅ {comic_no} (JAN: {jan_code}): {source} - {badge_status}",
+            'source': source, 'image': image_dict}
+
+
+def process_workflow_images(missing_comics: list, is_list_content: str, comic_list_content: str, badge_path: str, progress_bar=None, status_text=None, log_container=None):
+    """ワークフロー用：不足画像を取得してバッジ合成まで行う（一括実行版）"""
+    target_data = _workflow_prepare_target_data(missing_comics, is_list_content, comic_list_content)
     if not target_data:
         return {'success': False, 'error': '処理対象がありません', 'images': [], 'stats': {}}
 
-    # 画像取得
     session = requests.Session()
     random = get_random()
     downloaded_images = []
@@ -1270,94 +1497,21 @@ def process_workflow_images(missing_comics: list, is_list_content: str, comic_li
     logs = []
 
     for i, data in enumerate(target_data):
-        comic_no = str(data.get('comic_no', '')).strip()
-        jan_code = normalize_jan_code(data.get('first_jan', ''))
-
         if progress_bar:
             progress_bar.progress((i + 1) / len(target_data))
         if status_text:
-            status_text.text(f"処理中: {comic_no} ({i + 1}/{len(target_data)})")
+            status_text.text(f"処理中: {data.get('comic_no', '')} ({i + 1}/{len(target_data)})")
 
-        if not jan_code:
-            logs.append(f"⚠️ {comic_no}: JANコードなし - スキップ")
-            stats['failed'] += 1
-            continue
-
-        # 画像取得（優先順）
-        image_url = None
-        source = ''
-
-        # 1. ブックオフ
-        image_url = get_bookoff_image(jan_code, session)
-        source = 'bookoff'
-
-        # 2. Amazon
-        if not image_url:
-            time.sleep(random.uniform(0.5, 1.0))
-            image_url = get_amazon_image(jan_code, session)
-            source = 'amazon'
-
-        # 3. 楽天
-        if not image_url:
-            time.sleep(random.uniform(0.3, 0.6))
-            image_url = get_rakuten_image(jan_code, session)
-            source = 'rakuten'
-
-        # 4. Gemini AI
-        if not image_url and GEMINI_API_KEY:
-            time.sleep(random.uniform(0.5, 1.0))
-            ai_result = get_image_with_gemini_ai(jan_code, session, "amazon")
-            if ai_result:
-                image_url = ai_result
-                source = 'gemini_ai'
-
-        if not image_url:
-            logs.append(f"❌ {comic_no} (JAN: {jan_code}): 画像が見つかりません")
-            stats['failed'] += 1
-            continue
-
-        # ダウンロード
-        image_data = download_image(image_url, session)
-        if not image_data:
-            logs.append(f"❌ {comic_no}: ダウンロード失敗 ({source})")
-            stats['failed'] += 1
-            continue
-
-        is_tanpin = data.get('is_tanpin', False)
-
-        if is_tanpin:
-            # 単品：取得した画像をそのまま使用（加工なし）
-            final_bytes = image_data
-            badge_status = "加工なし"
+        result = _workflow_process_one_image(data, session, badge_path)
+        logs.append(result['log'])
+        if result['success']:
+            downloaded_images.append(result['image'])
+            stats['success'] += 1
+            if result['source']:
+                stats[result['source']] = stats.get(result['source'], 0) + 1
         else:
-            # セット品：600x600リサイズ＋バッジ合成
-            resized = resize_to_square(image_data, 600)
-            if os.path.exists(badge_path):
-                final_image = add_shipping_badge(resized, badge_path)
-                badge_status = "バッジ付き"
-            else:
-                final_image = resized
-                badge_status = "バッジ画像なし"
-            final_bytes = image_to_bytes(final_image)
+            stats['failed'] += 1
 
-        downloaded_images.append({
-            'comic_no': comic_no,
-            'jan_code': jan_code,
-            'image_data': final_bytes,
-            'source': source,
-            'is_tanpin': is_tanpin,
-            'badge': not is_tanpin,
-            'genre': data.get('genre', ''),
-            'publisher': data.get('publisher', ''),
-            'series': data.get('series', ''),
-            'title': data.get('title', '')
-        })
-
-        stats['success'] += 1
-        stats[source] += 1
-        logs.append(f"✅ {comic_no} (JAN: {jan_code}): {source} - {badge_status}")
-
-        # レート制限
         time.sleep(random.uniform(0.3, 0.8))
 
     return {'success': True, 'images': downloaded_images, 'stats': stats, 'logs': logs}
@@ -2365,28 +2519,44 @@ if mode == "🎨 クリエイティブスタジオ":
                 st.session_state.workflow_data['typed_comics'] = typed_comics_unique
                 st.session_state.workflow_data['yahoo_excel_files'] = yahoo_files_data
         else:
-            # テキスト入力
+            # テキスト入力（種別ごとに独立したテキストエリア。空欄の種別はスキップ）
             st.caption(
-                "🔍 存在チェック対象フォルダ: **セット** / **単品** / **予約** のみ（他フォルダ・サブフォルダは対象外）"
+                "🔍 存在チェック対象フォルダ: **セット** / **単品** / **予約** のみ（他フォルダ・サブフォルダは対象外）／ "
+                "各エリアに改行区切りでコミックNoを入力。使わない種別は空欄のままでOK。"
             )
-            text_type = st.radio(
-                "種別を選択",
-                ["セット品", "単品", "予約"],
-                horizontal=True,
-                key="step1_text_type",
-            )
-            text_input = st.text_area(
-                "コミックNo（改行区切り）",
-                height=150,
-                placeholder="123456\n234567\n19763_003"
-            )
-            if text_input:
-                comic_numbers = [line.strip() for line in text_input.split('\n') if line.strip()]
-                comic_numbers = list(dict.fromkeys(comic_numbers))
-                st.info(f"入力: {len(comic_numbers)}件 / 種別: **{text_type}**（{text_type}フォルダ配下のみ検索）")
-                # 選択された種別にのみ紐付けて typed_comics を構築
-                typed_comics_text = {"セット品": [], "単品": [], "予約": []}
-                typed_comics_text[text_type] = comic_numbers
+            text_cols = st.columns(3)
+            text_inputs = {}
+            placeholders = {
+                "セット品": "123456\n234567",
+                "単品": "19763_003\n19763_004",
+                "予約": "345678\n456789",
+            }
+            for col, type_label in zip(text_cols, ["セット品", "単品", "予約"]):
+                with col:
+                    text_inputs[type_label] = st.text_area(
+                        f"{type_label}（改行区切り）",
+                        height=180,
+                        placeholder=placeholders[type_label],
+                        key=f"step1_text_{type_label}",
+                    )
+
+            # 種別ごとにユニーク化（順序保持）
+            typed_comics_text = {"セット品": [], "単品": [], "予約": []}
+            for type_label, raw in text_inputs.items():
+                if not raw:
+                    continue
+                nums = [line.strip() for line in raw.split('\n') if line.strip()]
+                typed_comics_text[type_label] = list(dict.fromkeys(nums))
+
+            total_unique = sum(len(v) for v in typed_comics_text.values())
+            if total_unique:
+                st.info(
+                    f"合計: {total_unique}件 "
+                    f"（セット: {len(typed_comics_text['セット品'])}件, "
+                    f"単品: {len(typed_comics_text['単品'])}件, "
+                    f"予約: {len(typed_comics_text['予約'])}件）"
+                )
+                comic_numbers = [c for v in typed_comics_text.values() for c in v]
                 st.session_state.workflow_data['typed_comics'] = typed_comics_text
 
         col1, col2 = st.columns([1, 1])
@@ -2408,6 +2578,10 @@ if mode == "🎨 クリエイティブスタジオ":
 
                 if results:
                     st.session_state.workflow_data['check_results'] = results
+                    # 不足リストが更新されたので、下流のキャッシュ/アップロード済フラグを無効化
+                    st.session_state.workflow_data['missing_uploaded'] = False
+                    st.session_state.workflow_data.pop('missing_from_github', None)
+                    st.session_state.pop('csv_downloads', None)
                     exists_count = len([r for r in results if r['存在'] == '✅ あり'])
                     missing_count = len([r for r in results if r['存在'] == '❌ なし'])
 
@@ -2604,26 +2778,26 @@ if mode == "🎨 クリエイティブスタジオ":
             status_area = st.empty()
             progress_area = st.empty()
 
-            # 1. 不足リストが未アップロードなら自動アップロード
-            if not st.session_state.workflow_data.get('missing_uploaded'):
-                check_results = st.session_state.workflow_data.get('check_results', [])
-                missing = [r for r in check_results if r.get('存在') == '❌ なし']
-                if missing:
-                    set_comics = [r['コミックNo'] for r in missing if r.get('種別') == 'セット品']
-                    tanpin_comics = [r['コミックNo'] for r in missing if r.get('種別') == '単品']
-                    yoyaku_comics = [r['コミックNo'] for r in missing if r.get('種別') == '予約']
-                    today = datetime.now(JST).strftime('%Y-%m-%d %H:%M')
-                    status_area.info("📤 不足リストをGitHubにアップロード中...")
-                    if set_comics:
-                        content = '\n'.join([str(c) for c in set_comics])
-                        upload_to_github(content, GITHUB_MISSING_CSV_PATH, f"Update missing_comics.csv ({len(set_comics)}件) - {today}")
-                    if tanpin_comics:
-                        content = '\n'.join([str(c) for c in tanpin_comics])
-                        upload_to_github(content, GITHUB_MISSING_TANPIN_PATH, f"Update missing_tanpin.csv ({len(tanpin_comics)}件) - {today}")
-                    if yoyaku_comics:
-                        content = '\n'.join([str(c) for c in yoyaku_comics])
-                        upload_to_github(content, GITHUB_MISSING_YOYAKU_PATH, f"Update missing_yoyaku.csv ({len(yoyaku_comics)}件) - {today}")
-                    st.session_state.workflow_data['missing_uploaded'] = True
+            # 1. 不足リストを常にGitHubへアップロード（現在のStep①結果で上書き）
+            #    - ステールな前回データがGitHub側に残らないよう、各種別とも空でも上書きする
+            check_results = st.session_state.workflow_data.get('check_results', [])
+            missing = [r for r in check_results if r.get('存在') == '❌ なし']
+            set_comics = [r['コミックNo'] for r in missing if r.get('種別') == 'セット品']
+            tanpin_comics = [r['コミックNo'] for r in missing if r.get('種別') == '単品']
+            yoyaku_comics = [r['コミックNo'] for r in missing if r.get('種別') == '予約']
+            today = datetime.now(JST).strftime('%Y-%m-%d %H:%M')
+            status_area.info(
+                f"📤 不足リストをGitHubにアップロード中... "
+                f"(セット品:{len(set_comics)}件 / 単品:{len(tanpin_comics)}件 / 予約:{len(yoyaku_comics)}件)"
+            )
+            # 完全な空はGitHub APIで失敗する可能性があるため、空時は改行1文字（下流の split('\n') + strip でスキップされる）
+            set_content = '\n'.join([str(c) for c in set_comics]) if set_comics else '\n'
+            tanpin_content = '\n'.join([str(c) for c in tanpin_comics]) if tanpin_comics else '\n'
+            yoyaku_content = '\n'.join([str(c) for c in yoyaku_comics]) if yoyaku_comics else '\n'
+            upload_to_github(set_content, GITHUB_MISSING_CSV_PATH, f"Update missing_comics.csv ({len(set_comics)}件) - {today}")
+            upload_to_github(tanpin_content, GITHUB_MISSING_TANPIN_PATH, f"Update missing_tanpin.csv ({len(tanpin_comics)}件) - {today}")
+            upload_to_github(yoyaku_content, GITHUB_MISSING_YOYAKU_PATH, f"Update missing_yoyaku.csv ({len(yoyaku_comics)}件) - {today}")
+            st.session_state.workflow_data['missing_uploaded'] = True
 
             # 2. GitHub Actionsを起動
             status_area.info("🚀 GitHub Actionsを起動中...")
@@ -2731,7 +2905,9 @@ if mode == "🎨 クリエイティブスタジオ":
                 <div class="step-card-icon">🖼️</div>
                 <div>
                     <p class="step-card-title">Step ③ 画像取得＋加工</p>
-                    <p class="step-card-desc">JANコードで画像を取得し、送料無料バッジを合成します（600×600px）</p>
+                    <p class="step-card-desc">セット: JANコードで1巻目の画像を取得し、送料無料バッジを合成します（600×600px）</p>
+                    <p class="step-card-desc">単品: JANコードで対象巻の画像を取得します。中央配置（650×650px）</p>
+                    <p class="step-card-desc">予約: JANコードで最新巻の画像を取得し、送料無料バッジを合成します（600×600px）</p>
                 </div>
             </div>
         </div>
@@ -2741,17 +2917,34 @@ if mode == "🎨 クリエイティブスタジオ":
         st.markdown("### 入力データ")
 
         # 不足リスト（Step ①の結果 or GitHubから取得済み）
+        # missing_comics: セット+単品の従来リスト（下流互換用）
+        # missing_yoyaku: 予約のcomic_noリスト（新規）
         missing_comics = []
+        missing_yoyaku = []
         if 'check_results' in st.session_state.workflow_data:
             missing = [r for r in st.session_state.workflow_data['check_results'] if r['存在'] == '❌ なし']
-            missing_comics = [normalize_jan_code(r['コミックNo']) for r in missing]
+            for r in missing:
+                cno = normalize_jan_code(r['コミックNo'])
+                if not cno:
+                    continue
+                t = r.get('種別', '')
+                if t == '予約':
+                    missing_yoyaku.append(cno)
+                else:
+                    missing_comics.append(cno)
         elif st.session_state.workflow_data.get('missing_from_github'):
-            missing_comics = st.session_state.workflow_data['missing_from_github']
+            gh = st.session_state.workflow_data['missing_from_github']
+            if isinstance(gh, dict):
+                missing_comics = list(gh.get('set', [])) + list(gh.get('tanpin', []))
+                missing_yoyaku = list(gh.get('yoyaku', []))
+            else:
+                missing_comics = list(gh)
 
+        total_missing = len(missing_comics) + len(missing_yoyaku)
         col_s1, col_s2, col_s3 = st.columns(3)
         with col_s1:
-            if missing_comics:
-                st.success(f"✅ 不足リスト: {len(missing_comics)}件")
+            if total_missing:
+                st.success(f"✅ 不足リスト: {total_missing}件")
             else:
                 st.warning("⬜ 不足リスト: なし")
                 st.caption("Step ①を実行するか、GitHubから取得してください")
@@ -2767,51 +2960,63 @@ if mode == "🎨 クリエイティブスタジオ":
                 st.warning("⬜ comic_list.csv 未取得")
 
         # GitHubから取得ボタン群
-        need_fetch = not missing_comics or not st.session_state.workflow_data.get('is_list') or not st.session_state.workflow_data.get('comic_list')
+        need_fetch = (not missing_comics and not missing_yoyaku) or not st.session_state.workflow_data.get('is_list') or not st.session_state.workflow_data.get('comic_list')
         if need_fetch:
             st.divider()
             fetch_cols = st.columns(3)
             with fetch_cols[0]:
-                if not missing_comics and st.button("📥 不足リスト取得"):
+                if (not missing_comics and not missing_yoyaku) and st.button("📥 不足リスト取得"):
                     with st.spinner("GitHubから取得中..."):
-                        parsed_comics = []
+                        parsed_set = []
+                        parsed_tanpin = []
+                        parsed_yoyaku = []
 
-                        # セット品（missing_comics.csv）
-                        result_set = download_from_github(GITHUB_MISSING_CSV_PATH)
-                        if result_set.get("success"):
-                            content = result_set.get("content", b"")
-                            if isinstance(content, bytes):
-                                content = content.decode('utf-8', errors='replace')
-                            for l in content.strip().split('\n'):
+                        def _parse_csv_lines(content_bytes, is_set_csv=False):
+                            """CSVの各行から comic_no を抽出"""
+                            out = []
+                            if isinstance(content_bytes, bytes):
+                                content_str = content_bytes.decode('utf-8', errors='replace')
+                            else:
+                                content_str = str(content_bytes)
+                            for l in content_str.strip().split('\n'):
                                 l = l.strip()
                                 if not l:
                                     continue
-                                if ',' in l:
-                                    fields = [f.strip() for f in l.split(',') if f.strip()]
-                                    for f in fields:
+                                if is_set_csv and ',' in l:
+                                    # セット: カンマ区切りの複数フィールドから数字っぽいものを拾う
+                                    for f in (x.strip() for x in l.split(',') if x.strip()):
                                         if f.replace('_', '').replace('.0', '').isdigit() and len(f.replace('.0', '')) > 1:
-                                            parsed_comics.append(f.replace('.0', ''))
+                                            out.append(f.replace('.0', ''))
                                             break
                                 else:
-                                    parsed_comics.append(l)
+                                    out.append(l)
+                            return out
+
+                        # セット品（missing_comics.csv → 表示上は missing_set.csv）
+                        r_set = download_from_github(GITHUB_MISSING_CSV_PATH)
+                        if r_set.get("success"):
+                            parsed_set = _parse_csv_lines(r_set.get("content", b""), is_set_csv=True)
 
                         # 単品（missing_tanpin.csv）
-                        result_tanpin = download_from_github(GITHUB_MISSING_TANPIN_PATH)
-                        if result_tanpin.get("success"):
-                            content = result_tanpin.get("content", b"")
-                            if isinstance(content, bytes):
-                                content = content.decode('utf-8', errors='replace')
-                            for l in content.strip().split('\n'):
-                                l = l.strip()
-                                if l:
-                                    parsed_comics.append(l)
+                        r_tanpin = download_from_github(GITHUB_MISSING_TANPIN_PATH)
+                        if r_tanpin.get("success"):
+                            parsed_tanpin = _parse_csv_lines(r_tanpin.get("content", b""))
 
-                    if parsed_comics:
-                        missing_comics = parsed_comics
-                        st.session_state.workflow_data['missing_from_github'] = missing_comics
-                        set_c = len([c for c in parsed_comics if '_' not in str(c)])
-                        tanpin_c = len([c for c in parsed_comics if '_' in str(c)])
-                        st.success(f"{len(parsed_comics)}件取得（セット品: {set_c}件 / 単品: {tanpin_c}件）")
+                        # 予約（missing_yoyaku.csv）
+                        r_yoyaku = download_from_github(GITHUB_MISSING_YOYAKU_PATH)
+                        if r_yoyaku.get("success"):
+                            parsed_yoyaku = _parse_csv_lines(r_yoyaku.get("content", b""))
+
+                    total = len(parsed_set) + len(parsed_tanpin) + len(parsed_yoyaku)
+                    if total:
+                        missing_comics = parsed_set + parsed_tanpin
+                        missing_yoyaku = parsed_yoyaku
+                        st.session_state.workflow_data['missing_from_github'] = {
+                            'set': parsed_set,
+                            'tanpin': parsed_tanpin,
+                            'yoyaku': parsed_yoyaku,
+                        }
+                        st.success(f"{total}件取得（セット: {len(parsed_set)}件 / 単品: {len(parsed_tanpin)}件 / 予約: {len(parsed_yoyaku)}件）")
                         st.rerun()
                     else:
                         st.error("取得失敗またはデータなし")
@@ -2843,81 +3048,194 @@ if mode == "🎨 クリエイティブスタジオ":
                         st.error("取得失敗")
 
         # GitHubから取得した不足リストも反映
-        if not missing_comics and st.session_state.workflow_data.get('missing_from_github'):
-            missing_comics = st.session_state.workflow_data['missing_from_github']
+        if not missing_comics and not missing_yoyaku and st.session_state.workflow_data.get('missing_from_github'):
+            gh = st.session_state.workflow_data['missing_from_github']
+            if isinstance(gh, dict):
+                missing_comics = list(gh.get('set', [])) + list(gh.get('tanpin', []))
+                missing_yoyaku = list(gh.get('yoyaku', []))
+            else:
+                missing_comics = list(gh)
 
         # --- CSVダウンロード ---
         with st.expander("📄 CSVファイルをダウンロード"):
-            dl_cols = st.columns(4)
+            # (表示ファイル名, GitHubパス) — 表示名はユーザー希望に合わせて missing_set.csv を使用
             csv_files = [
                 ("missing_tanpin.csv", GITHUB_MISSING_TANPIN_PATH),
-                ("missing_comics.csv", GITHUB_MISSING_CSV_PATH),
+                ("missing_set.csv", GITHUB_MISSING_CSV_PATH),
+                ("missing_yoyaku.csv", GITHUB_MISSING_YOYAKU_PATH),
                 ("is_list.csv", GITHUB_IS_LIST_PATH),
                 ("comic_list.csv", GITHUB_COMIC_LIST_PATH),
             ]
-            # キャッシュキー
             if 'csv_downloads' not in st.session_state:
                 st.session_state.csv_downloads = {}
+
+            # 未キャッシュのCSVを自動取得（1クリックでダウンロードできるように）
+            missing_csvs = [(f, p) for f, p in csv_files if f not in st.session_state.csv_downloads]
+            if missing_csvs:
+                with st.spinner(f"GitHubからCSVを取得中... ({len(missing_csvs)}件)"):
+                    for fname, gpath in missing_csvs:
+                        result = download_from_github(gpath)
+                        if result.get("success"):
+                            content = result["content"]
+                            if isinstance(content, bytes):
+                                st.session_state.csv_downloads[fname] = content
+                            else:
+                                st.session_state.csv_downloads[fname] = content.encode('utf-8')
+                        else:
+                            st.session_state.csv_downloads[fname] = None
+
+            dl_cols = st.columns(len(csv_files))
             for idx, (fname, gpath) in enumerate(csv_files):
                 with dl_cols[idx]:
-                    if fname in st.session_state.csv_downloads:
-                        data = st.session_state.csv_downloads[fname]
+                    data = st.session_state.csv_downloads.get(fname)
+                    if data:
                         st.download_button(
                             label=f"💾 {fname}",
                             data=data,
                             file_name=fname,
                             mime="text/csv",
-                            key=f"dl_{fname}"
+                            key=f"dl_{fname}",
+                            use_container_width=True,
                         )
                     else:
-                        if st.button(f"📥 {fname}", key=f"fetch_{fname}"):
-                            with st.spinner("取得中..."):
-                                result = download_from_github(gpath)
-                            if result.get("success"):
-                                content = result["content"]
-                                if isinstance(content, bytes):
-                                    st.session_state.csv_downloads[fname] = content
-                                else:
-                                    st.session_state.csv_downloads[fname] = content.encode('utf-8')
-                                st.rerun()
-                            else:
-                                st.error(f"取得失敗: {result.get('error')}")
+                        if st.button(f"🔄 {fname} (再試行)", key=f"retry_{fname}", use_container_width=True):
+                            st.session_state.csv_downloads.pop(fname, None)
+                            st.rerun()
 
         # --- 実行セクション ---
         st.divider()
-        all_ready = missing_comics and st.session_state.workflow_data.get('is_list') and st.session_state.workflow_data.get('comic_list')
+        has_any = bool(missing_comics) or bool(missing_yoyaku)
+        all_ready = has_any and st.session_state.workflow_data.get('is_list') and st.session_state.workflow_data.get('comic_list')
 
-        # セット品と単品の内訳
-        if missing_comics:
+        # セット品・単品・予約の内訳
+        if has_any:
             set_count = len([c for c in missing_comics if '_' not in str(c)])
             tanpin_count = len([c for c in missing_comics if '_' in str(c)])
-            st.markdown(f"**対象: {len(missing_comics)}件**（セット品: {set_count}件 / 単品: {tanpin_count}件）")
+            yoyaku_count = len(missing_yoyaku)
+            total_count = set_count + tanpin_count + yoyaku_count
+            st.markdown(f"**対象: {total_count}件**（セット品: {set_count}件 / 単品: {tanpin_count}件 / 予約: {yoyaku_count}件）")
 
-        if st.button("🖼️ 画像取得開始", type="primary", disabled=not all_ready):
-            badge_path = os.path.join(os.path.dirname(__file__), "images", "badge_free_shipping.jpg")
+        # --- 画像取得：1件ずつrerunで進めるインクリメンタル方式 ---
+        if 'wf_img_processing' not in st.session_state:
+            st.session_state.wf_img_processing = False
+        if 'wf_img_paused' not in st.session_state:
+            st.session_state.wf_img_paused = False
+        if 'wf_img_target_data' not in st.session_state:
+            st.session_state.wf_img_target_data = []
+        if 'wf_img_index' not in st.session_state:
+            st.session_state.wf_img_index = 0
+        if 'wf_img_downloaded' not in st.session_state:
+            st.session_state.wf_img_downloaded = []
+        if 'wf_img_stats' not in st.session_state:
+            st.session_state.wf_img_stats = {}
+        if 'wf_img_logs' not in st.session_state:
+            st.session_state.wf_img_logs = []
+        if 'wf_img_badge_path' not in st.session_state:
+            st.session_state.wf_img_badge_path = ''
 
-            progress = st.progress(0)
-            status = st.empty()
+        is_processing = st.session_state.wf_img_processing
+        is_paused = st.session_state.wf_img_paused
 
-            result = process_workflow_images(
-                missing_comics=missing_comics,
-                is_list_content=st.session_state.workflow_data['is_list'],
-                comic_list_content=st.session_state.workflow_data['comic_list'],
-                badge_path=badge_path,
-                progress_bar=progress,
-                status_text=status
+        ctrl_cols = st.columns([3, 2, 5])
+        with ctrl_cols[0]:
+            start_clicked = st.button(
+                "🖼️ 画像取得開始",
+                type="primary",
+                disabled=not all_ready or is_processing,
+                key="wf_img_start_btn",
+                use_container_width=True,
             )
+        with ctrl_cols[1]:
+            pause_clicked = False
+            resume_clicked = False
+            if is_processing and is_paused:
+                resume_clicked = st.button("▶️ 再開", key="wf_img_resume_btn", use_container_width=True)
+            elif is_processing:
+                pause_clicked = st.button("⏸️ 一時停止", key="wf_img_pause_btn", use_container_width=True)
 
-            progress.empty()
-            status.empty()
+        if start_clicked:
+            badge_path = os.path.join(os.path.dirname(__file__), "images", "badge_free_shipping.jpg")
+            target_data = _workflow_prepare_target_data(
+                missing_comics,
+                st.session_state.workflow_data['is_list'],
+                st.session_state.workflow_data['comic_list'],
+                missing_yoyaku=missing_yoyaku,
+            )
+            if not target_data:
+                st.error("処理対象がありません")
+            else:
+                st.session_state.wf_img_target_data = target_data
+                st.session_state.wf_img_index = 0
+                st.session_state.wf_img_downloaded = []
+                st.session_state.wf_img_stats = {
+                    'total': len(target_data), 'success': 0, 'failed': 0,
+                    'bookoff': 0, 'amazon': 0, 'rakuten': 0, 'gemini_ai': 0,
+                }
+                st.session_state.wf_img_logs = []
+                st.session_state.wf_img_badge_path = badge_path
+                st.session_state.wf_img_processing = True
+                st.session_state.wf_img_paused = False
+                st.session_state.wf_img_session = requests.Session()
+                # 既存結果をクリア
+                for k in ('downloaded_images', 'image_stats', 'image_logs'):
+                    st.session_state.workflow_data.pop(k, None)
+                st.rerun()
 
-            if result.get('success'):
-                st.session_state.workflow_data['downloaded_images'] = result['images']
-                st.session_state.workflow_data['image_stats'] = result['stats']
-                st.session_state.workflow_data['image_logs'] = result['logs']
+        if pause_clicked:
+            st.session_state.wf_img_paused = True
+            # そこまでの結果を保存（ダウンロード可能にする）
+            st.session_state.workflow_data['downloaded_images'] = list(st.session_state.wf_img_downloaded)
+            st.session_state.workflow_data['image_stats'] = dict(st.session_state.wf_img_stats)
+            st.session_state.workflow_data['image_logs'] = list(st.session_state.wf_img_logs)
+            st.rerun()
+
+        if resume_clicked:
+            st.session_state.wf_img_paused = False
+            st.rerun()
+
+        # 進捗表示
+        if is_processing:
+            total = len(st.session_state.wf_img_target_data)
+            idx = st.session_state.wf_img_index
+            if total:
+                st.progress(min(idx / total, 1.0))
+            if is_paused:
+                st.warning(f"⏸️ 一時停止中（{idx}/{total}件処理済み）。下部の「取得結果」から現時点の画像をダウンロードできます。")
+            else:
+                cur_no = st.session_state.wf_img_target_data[idx].get('comic_no', '') if idx < total else ''
+                st.info(f"🔄 処理中: {idx + 1}/{total} {cur_no}")
+
+        # 1件処理 → rerun
+        if is_processing and not is_paused:
+            total = len(st.session_state.wf_img_target_data)
+            idx = st.session_state.wf_img_index
+            if idx < total:
+                data = st.session_state.wf_img_target_data[idx]
+                session = st.session_state.get('wf_img_session') or requests.Session()
+                result = _workflow_process_one_image(data, session, st.session_state.wf_img_badge_path)
+                st.session_state.wf_img_logs.append(result['log'])
+                if result['success']:
+                    st.session_state.wf_img_downloaded.append(result['image'])
+                    st.session_state.wf_img_stats['success'] = st.session_state.wf_img_stats.get('success', 0) + 1
+                    if result['source']:
+                        st.session_state.wf_img_stats[result['source']] = st.session_state.wf_img_stats.get(result['source'], 0) + 1
+                else:
+                    st.session_state.wf_img_stats['failed'] = st.session_state.wf_img_stats.get('failed', 0) + 1
+                st.session_state.wf_img_index += 1
+                # 毎回ワークフロー側にも反映（途中停止でも最新状態を保持）
+                st.session_state.workflow_data['downloaded_images'] = list(st.session_state.wf_img_downloaded)
+                st.session_state.workflow_data['image_stats'] = dict(st.session_state.wf_img_stats)
+                st.session_state.workflow_data['image_logs'] = list(st.session_state.wf_img_logs)
+                # レート制限
+                time.sleep(get_random().uniform(0.3, 0.8))
                 st.rerun()
             else:
-                st.error(result.get('error', '画像取得に失敗しました'))
+                # 完了
+                st.session_state.wf_img_processing = False
+                st.session_state.workflow_data['downloaded_images'] = list(st.session_state.wf_img_downloaded)
+                st.session_state.workflow_data['image_stats'] = dict(st.session_state.wf_img_stats)
+                st.session_state.workflow_data['image_logs'] = list(st.session_state.wf_img_logs)
+                st.rerun()
 
         # --- 結果表示セクション ---
         if 'downloaded_images' in st.session_state.workflow_data:

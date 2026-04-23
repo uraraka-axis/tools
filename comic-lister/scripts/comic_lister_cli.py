@@ -33,6 +33,7 @@ ISBN_SETTING = os.environ.get("ISBN_SETTING", "1st")  # lst, dat, max, 1st
 GITHUB_REPO = "uraraka-axis/tools"
 GITHUB_CSV_PATH = "comic-lister/data/missing_comics.csv"
 GITHUB_TANPIN_CSV_PATH = "comic-lister/data/missing_tanpin.csv"
+GITHUB_YOYAKU_CSV_PATH = "comic-lister/data/missing_yoyaku.csv"
 GITHUB_OUTPUT_PATH = "comic-lister/data/comic_list.csv"  # 出力先
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
@@ -169,6 +170,40 @@ def get_tanpin_comic_numbers_from_github():
 
     except Exception as e:
         log(f"単品データ取得エラー: {e}")
+        return []
+
+
+def get_yoyaku_comic_numbers_from_github():
+    """GitHubからmissing_yoyaku.csvを取得して予約のコミックNo.を抽出（1列形式）"""
+    try:
+        log("GitHubから予約データ取得中...")
+
+        raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/master/{GITHUB_YOYAKU_CSV_PATH}"
+
+        headers = {}
+        if GITHUB_TOKEN:
+            headers["Authorization"] = f"token {GITHUB_TOKEN}"
+
+        response = requests.get(raw_url, headers=headers)
+
+        if response.status_code != 200:
+            log(f"missing_yoyaku.csv取得エラー: HTTP {response.status_code}")
+            return []
+
+        comic_numbers = set()
+        for line in response.text.strip().split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            cno = line.split(',')[0].strip()
+            if cno:
+                comic_numbers.add(cno)
+
+        log(f"予約から取得したコミックNo.: {len(comic_numbers)}件")
+        return list(comic_numbers)
+
+    except Exception as e:
+        log(f"予約データ取得エラー: {e}")
         return []
 
 
@@ -580,13 +615,17 @@ def main():
     # 出力ディレクトリ作成
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 1. GitHubからコミックNo.を取得（セット品 + 単品のベース）
+    # 1. GitHubからコミックNo.を取得（セット品 + 単品のベース + 予約）
     set_comic_numbers = get_comic_numbers_from_github()
     tanpin_comic_numbers = get_tanpin_comic_numbers_from_github()
+    yoyaku_comic_numbers = get_yoyaku_comic_numbers_from_github()
 
     # 重複排除して統合
-    comic_numbers = list(set(set_comic_numbers + tanpin_comic_numbers))
-    log(f"統合コミックNo.: {len(comic_numbers)}件（セット品: {len(set_comic_numbers)}件, 単品ベース: {len(tanpin_comic_numbers)}件）")
+    comic_numbers = list(set(set_comic_numbers + tanpin_comic_numbers + yoyaku_comic_numbers))
+    log(
+        f"統合コミックNo.: {len(comic_numbers)}件"
+        f"（セット品: {len(set_comic_numbers)}件, 単品ベース: {len(tanpin_comic_numbers)}件, 予約: {len(yoyaku_comic_numbers)}件）"
+    )
 
     if not comic_numbers:
         log("コミックNo.が取得できませんでした。終了します。")
