@@ -172,74 +172,69 @@ def fetch_all_from_supabase(supabase: Client, table: str, columns: str = "*") ->
 
 
 def sync_images_to_db(supabase: Client, images: list) -> dict:
-    """画像一覧をDBに同期（upsert）"""
+    """画像一覧をDBに同期（upsert）。
+    複合主キー (folder_name, file_name) の1行 = 1ファイル。
+    """
     try:
-        # file_nameごとにグループ化（重複検出）
-        file_dict = {}
+        # (folder_name, file_name) をキーにレコード化
+        records_dict = {}
         for img in images:
             file_name = img.get("FileName", "")
             folder_name = img.get("FolderName", "")
-            folder_path = img.get("FolderPath", "")
-            if file_name in file_dict:
-                existing = file_dict[file_name]
-                existing_folders = existing["folder_names"].split(", ")
-                if folder_name not in existing_folders:
-                    existing["folder_names"] += f", {folder_name}"
-                try:
-                    path_map = json.loads(existing["folder_path"]) if existing["folder_path"] else {}
-                except (json.JSONDecodeError, TypeError):
-                    path_map = {}
-                path_map[folder_name] = folder_path
-                existing["folder_path"] = json.dumps(path_map, ensure_ascii=False)
-            else:
-                file_dict[file_name] = {
-                    "file_name": file_name,
-                    "folder_names": folder_name,
-                    "folder_path": json.dumps({folder_name: folder_path}, ensure_ascii=False),
-                    "file_url": img.get("FileUrl", ""),
-                    "file_size": img.get("FileSize", 0),
-                    "file_timestamp": img.get("TimeStamp", "")
-                }
+            if not file_name or not folder_name:
+                continue
+            key = (folder_name, file_name)
+            records_dict[key] = {
+                "folder_name": folder_name,
+                "file_name": file_name,
+                "folder_path": img.get("FolderPath", ""),
+                "file_url": img.get("FileUrl", ""),
+                "file_size": img.get("FileSize", 0),
+                "file_timestamp": img.get("TimeStamp", ""),
+            }
 
-        # 既存データを取得（ページネーション対応）
-        existing_data = fetch_all_from_supabase(supabase, "rcabinet_images", "file_name, file_timestamp, folder_path")
-        existing_dict = {row["file_name"]: (row.get("file_timestamp"), row.get("folder_path")) for row in existing_data}
+        # 既存データ取得
+        existing_data = fetch_all_from_supabase(
+            supabase, "rcabinet_images", "folder_name, file_name, file_timestamp"
+        )
+        existing_dict = {
+            (row["folder_name"], row["file_name"]): row.get("file_timestamp")
+            for row in existing_data
+        }
 
         # 差分計算
         new_count = 0
         updated_count = 0
-        duplicate_count = 0
 
         records_to_upsert = []
-        for file_name, record in file_dict.items():
-            if ", " in record["folder_names"]:
-                duplicate_count += 1
-
-            if file_name not in existing_dict:
+        for key, record in records_dict.items():
+            if key not in existing_dict:
                 new_count += 1
                 records_to_upsert.append(record)
-            else:
-                existing_ts, existing_path = existing_dict[file_name]
-                # timestamp変化 or folder_path未設定（初回マイグレーション）で更新
-                if existing_ts != record["file_timestamp"] or not existing_path:
-                    updated_count += 1
-                    records_to_upsert.append(record)
+            elif existing_dict[key] != record["file_timestamp"]:
+                updated_count += 1
+                records_to_upsert.append(record)
 
-        # 削除済み検出
-        deleted_files = set(existing_dict.keys()) - set(file_dict.keys())
-        deleted_count = len(deleted_files)
+        # 削除検出
+        deleted_keys = set(existing_dict.keys()) - set(records_dict.keys())
+        deleted_count = len(deleted_keys)
 
-        # upsert実行（100件ずつ）
+        # ファイル名重複（複数フォルダに同名）件数
+        from collections import Counter
+        name_counter = Counter(file_name for _folder, file_name in records_dict.keys())
+        duplicate_count = sum(1 for c in name_counter.values() if c > 1)
+
+        # upsert（100件ずつ、複合キー指定）
         for i in range(0, len(records_to_upsert), 100):
-            batch = records_to_upsert[i:i+100]
+            batch = records_to_upsert[i:i + 100]
             supabase.table("rcabinet_images").upsert(
-                batch, on_conflict="file_name"
+                batch, on_conflict="folder_name,file_name"
             ).execute()
 
-        # 削除済みファイルをDBから削除
-        if deleted_files:
-            for file_name in deleted_files:
-                supabase.table("rcabinet_images").delete().eq("file_name", file_name).execute()
+        # 削除実行
+        for folder_name, file_name in deleted_keys:
+            supabase.table("rcabinet_images").delete()\
+                .eq("folder_name", folder_name).eq("file_name", file_name).execute()
 
         return {
             "success": True,
@@ -247,7 +242,7 @@ def sync_images_to_db(supabase: Client, images: list) -> dict:
             "updated": updated_count,
             "duplicate": duplicate_count,
             "deleted": deleted_count,
-            "total": len(file_dict)
+            "total": len(records_dict)
         }
     except Exception as e:
         return {"success": False, "error": str(e)}

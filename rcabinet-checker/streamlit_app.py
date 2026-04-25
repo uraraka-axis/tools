@@ -10,6 +10,7 @@ APP_VERSION = "5.0.0"
 import streamlit as st
 import requests
 import base64
+import os
 import xml.etree.ElementTree as ET
 import pandas as pd
 import time
@@ -121,6 +122,16 @@ CHECK_TARGET_FOLDERS = {
     "単品": "/comic/comic-tanpin",        # 単品配下
     "予約": "/comic/comic-yoyaku",        # 予約配下
 }
+
+# 楽天アップロード時の振り分け先（種別 → 親パス・サブフォルダ命名 prefix）
+# サブフォルダは「<prefix><N>」形式（例: セット1, セット2）。Nが最大かつ FileCount<2000 のフォルダに格納し、
+# 2000件に達したら自動で N+1 のフォルダを新規作成する運用。
+TYPE_FOLDER_CONFIG = {
+    "set":    {"parent_path": "/comic/comic-set",    "subfolder_prefix": "セット"},
+    "tanpin": {"parent_path": "/comic/comic-tanpin", "subfolder_prefix": "単品"},
+    "yoyaku": {"parent_path": "/comic/comic-yoyaku", "subfolder_prefix": "予約"},
+}
+RAKUTEN_FOLDER_LIMIT = 2000
 GITHUB_COMIC_LIST_PATH = "comic-lister/data/comic_list.csv"
 GITHUB_FOLDER_HIERARCHY_PATH = "comic-lister/data/folder_hierarchy.xlsx"
 
@@ -399,77 +410,87 @@ def fetch_all_from_supabase(supabase, table: str, columns: str = "*", filter_col
     return all_data
 
 
+def _safe_int(v, default: int = 0) -> int:
+    if v is None or v == "":
+        return default
+    try:
+        return int(float(v))
+    except (ValueError, TypeError):
+        return default
+
+
 def sync_images_to_db(images: list) -> dict:
-    """画像一覧をDBに同期（upsert）"""
+    """画像一覧をDBに同期（upsert）。
+    複合主キー (folder_name, file_name) の1行 = 1ファイル。
+    同名ファイルが別フォルダにあっても別行として保持される。
+    """
     supabase = get_supabase_client()
     if not supabase:
         return {"success": False, "error": "Supabase未設定"}
 
     try:
-        # file_nameごとにグループ化（重複検出）
-        # file_urlはJSONで {フォルダ名: URL} 形式で保存（複数フォルダの場合でも正確なURLを保持）
-        file_dict = {}
+        # (folder_name, file_name) をキーにレコード化
+        records_dict = {}
         for img in images:
             file_name = img.get("FileName", "")
             folder_name = img.get("FolderName", "")
-            file_url = img.get("FileUrl", "")
-            if file_name in file_dict:
-                # 重複: folder_namesに追加、URLもフォルダ別に記録
-                existing_folders = file_dict[file_name]["folder_names"].split(", ")
-                if folder_name not in existing_folders:
-                    file_dict[file_name]["folder_names"] += f", {folder_name}"
-                    url_dict = json.loads(file_dict[file_name]["file_url"])
-                    url_dict[folder_name] = file_url
-                    file_dict[file_name]["file_url"] = json.dumps(url_dict, ensure_ascii=False)
-            else:
-                file_dict[file_name] = {
-                    "file_name": file_name,
-                    "folder_names": folder_name,
-                    "file_url": json.dumps({folder_name: file_url}, ensure_ascii=False),
-                    "file_size": img.get("FileSize", 0),
-                    "file_timestamp": img.get("TimeStamp", "")
-                }
+            if not file_name or not folder_name:
+                continue
+            key = (folder_name, file_name)
+            records_dict[key] = {
+                "folder_name": folder_name,
+                "file_name": file_name,
+                "folder_path": img.get("FolderPath", ""),
+                "file_url": img.get("FileUrl", ""),
+                "file_size": _safe_int(img.get("FileSize")),
+                "file_timestamp": img.get("TimeStamp", ""),
+            }
 
-        # 既存データを取得（ページネーション対応）
-        existing_data = fetch_all_from_supabase(supabase, "rcabinet_images", "file_name, file_timestamp")
-        existing_dict = {row["file_name"]: row["file_timestamp"] for row in existing_data}
+        # 既存データ取得（複合キー単位）
+        existing_data = fetch_all_from_supabase(
+            supabase, "rcabinet_images", "folder_name, file_name, file_timestamp"
+        )
+        existing_dict = {
+            (row["folder_name"], row["file_name"]): row.get("file_timestamp")
+            for row in existing_data
+        }
 
         # 差分計算
         new_count = 0
         updated_count = 0
-        duplicate_count = 0
         unchanged_count = 0
 
         records_to_upsert = []
-        for file_name, record in file_dict.items():
-            # 重複チェック（複数フォルダにある）
-            if ", " in record["folder_names"]:
-                duplicate_count += 1
-
-            if file_name not in existing_dict:
+        for key, record in records_dict.items():
+            if key not in existing_dict:
                 new_count += 1
                 records_to_upsert.append(record)
-            elif existing_dict[file_name] != record["file_timestamp"]:
+            elif existing_dict[key] != record["file_timestamp"]:
                 updated_count += 1
                 records_to_upsert.append(record)
             else:
                 unchanged_count += 1
 
-        # 削除済み検出（DBにあるがAPIにない）
-        deleted_files = set(existing_dict.keys()) - set(file_dict.keys())
-        deleted_count = len(deleted_files)
+        # 削除検出（DBにあるがAPIにない）
+        deleted_keys = set(existing_dict.keys()) - set(records_dict.keys())
+        deleted_count = len(deleted_keys)
 
-        # upsert実行（100件ずつ）
+        # ファイル名重複（複数フォルダに同名ファイル存在）件数
+        from collections import Counter
+        name_counter = Counter(file_name for _folder, file_name in records_dict.keys())
+        duplicate_count = sum(1 for c in name_counter.values() if c > 1)
+
+        # upsert（100件ずつ、複合キー指定）
         for i in range(0, len(records_to_upsert), 100):
-            batch = records_to_upsert[i:i+100]
+            batch = records_to_upsert[i:i + 100]
             supabase.table("rcabinet_images").upsert(
-                batch, on_conflict="file_name"
+                batch, on_conflict="folder_name,file_name"
             ).execute()
 
-        # 削除済みファイルをDBから削除
-        if deleted_files:
-            for file_name in deleted_files:
-                supabase.table("rcabinet_images").delete().eq("file_name", file_name).execute()
+        # 削除実行
+        for folder_name, file_name in deleted_keys:
+            supabase.table("rcabinet_images").delete()\
+                .eq("folder_name", folder_name).eq("file_name", file_name).execute()
 
         return {
             "success": True,
@@ -478,80 +499,57 @@ def sync_images_to_db(images: list) -> dict:
             "duplicate": duplicate_count,
             "unchanged": unchanged_count,
             "deleted": deleted_count,
-            "total": len(file_dict)
+            "total": len(records_dict),
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 def load_images_from_db() -> tuple[list, str]:
-    """DBから画像一覧を読み込み（ページネーション対応）"""
+    """DBから画像一覧を読み込み（ページネーション対応）。
+    1行 = 1(folder, file) なので JSON展開は不要。
+    """
     supabase = get_supabase_client()
     if not supabase:
         return [], "Supabase未設定"
 
     try:
         all_data = fetch_all_from_supabase(supabase, "rcabinet_images", "*")
-        images = []
-        for row in all_data:
-            folder_names_str = row.get("folder_names", "")
-            file_url_raw = row.get("file_url", "")
-            file_name = row.get("file_name", "")
-            file_size = row.get("file_size", 0)
-            file_timestamp = row.get("file_timestamp", "")
-            # folder_path をパース（新形式: {フォルダ名: パス} の辞書 / 未設定の場合は None）
-            folder_path_raw = row.get("folder_path", "")
-            try:
-                path_map = json.loads(folder_path_raw) if folder_path_raw else {}
-                if not isinstance(path_map, dict):
-                    path_map = {}
-            except (json.JSONDecodeError, TypeError):
-                path_map = {}
-            # file_urlをJSONとして解析（新形式: {フォルダ名: URL} の辞書）
-            try:
-                url_data = json.loads(file_url_raw)
-                if not isinstance(url_data, dict):
-                    url_data = {}
-            except (json.JSONDecodeError, TypeError):
-                url_data = {}
-
-            # folder_names は必ず分割して展開（file_urlの形式に依存しない）
-            folder_list = [f.strip() for f in folder_names_str.split(", ") if f.strip()]
-            if not folder_list:
-                folder_list = [folder_names_str] if folder_names_str else [""]
-
-            for folder in folder_list:
-                if url_data:
-                    url = url_data.get(folder, next(iter(url_data.values()), ""))
-                else:
-                    url = file_url_raw
-                images.append({
-                    "FolderName": folder,
-                    "FolderPath": path_map.get(folder, ""),
-                    "FileName": file_name,
-                    "FileUrl": url,
-                    "FileSize": file_size,
-                    "TimeStamp": file_timestamp
-                })
+        images = [
+            {
+                "FolderName": row.get("folder_name", ""),
+                "FolderPath": row.get("folder_path", "") or "",
+                "FileName": row.get("file_name", ""),
+                "FileUrl": row.get("file_url", "") or "",
+                "FileSize": row.get("file_size", 0) or 0,
+                "TimeStamp": row.get("file_timestamp", "") or "",
+            }
+            for row in all_data
+        ]
         return images, f"{len(images)}件を読み込みました"
     except Exception as e:
         return [], str(e)
 
 
 def get_db_stats() -> dict:
-    """DBの統計情報を取得（カウントクエリで高速化）"""
+    """DBの統計情報を取得。
+    duplicates は「同名 file_name が複数フォルダに存在するファイル数」。
+    """
     supabase = get_supabase_client()
     if not supabase:
         return {}
 
     try:
-        # 全件数をカウント（全件フェッチせず高速）
+        # 全件数（行数 = (folder, file) ペア数）
         total_resp = supabase.table("rcabinet_images").select("*", count="exact").limit(1).execute()
         total = total_resp.count or 0
 
-        # 重複ファイル数（folder_namesにカンマを含む件数）
-        dup_resp = supabase.table("rcabinet_images").select("*", count="exact").ilike("folder_names", "%, %").limit(1).execute()
-        duplicates = dup_resp.count or 0
+        # 重複ファイル名カウント: file_name のみ取得して Python で集計
+        # （Supabase REST には GROUP BY HAVING が無いため）
+        rows = fetch_all_from_supabase(supabase, "rcabinet_images", "file_name")
+        from collections import Counter
+        counter = Counter(r.get("file_name", "") for r in rows if r.get("file_name"))
+        duplicates = sum(1 for c in counter.values() if c > 1)
 
         return {"total": total, "duplicates": duplicates, "last_updated": None}
     except Exception:
@@ -565,46 +563,35 @@ def load_images_from_db_by_folder(folder_name: str) -> list:
         return []
 
     try:
-        all_data = fetch_all_from_supabase(supabase, "rcabinet_images", "*", "folder_names", folder_name)
-        images = []
-        for row in all_data:
-            folder_names_str = row.get("folder_names", "")
-            file_url_raw = row.get("file_url", "")
-            file_name = row.get("file_name", "")
-            file_size = row.get("file_size", 0)
-            file_timestamp = row.get("file_timestamp", "")
-            try:
-                url_data = json.loads(file_url_raw)
-                if isinstance(url_data, dict) and url_data:
-                    # 新形式: フォルダ別に行を展開
-                    for folder in folder_names_str.split(", "):
-                        folder = folder.strip()
-                        if folder:
-                            url = url_data.get(folder, next(iter(url_data.values()), ""))
-                            images.append({
-                                "FolderName": folder,
-                                "FileName": file_name,
-                                "FileUrl": url,
-                                "FileSize": file_size,
-                                "TimeStamp": file_timestamp
-                            })
-                else:
-                    images.append({
-                        "FolderName": folder_names_str,
-                        "FileName": file_name,
-                        "FileUrl": file_url_raw,
-                        "FileSize": file_size,
-                        "TimeStamp": file_timestamp
-                    })
-            except (json.JSONDecodeError, TypeError):
-                images.append({
-                    "FolderName": folder_names_str,
-                    "FileName": file_name,
-                    "FileUrl": file_url_raw,
-                    "FileSize": file_size,
-                    "TimeStamp": file_timestamp
-                })
-        return images
+        all_data = []
+        page_size = 1000
+        offset = 0
+        while True:
+            resp = (
+                supabase.table("rcabinet_images")
+                .select("*")
+                .eq("folder_name", folder_name)
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+            if not resp.data:
+                break
+            all_data.extend(resp.data)
+            if len(resp.data) < page_size:
+                break
+            offset += page_size
+
+        return [
+            {
+                "FolderName": row.get("folder_name", ""),
+                "FolderPath": row.get("folder_path", "") or "",
+                "FileName": row.get("file_name", ""),
+                "FileUrl": row.get("file_url", "") or "",
+                "FileSize": row.get("file_size", 0) or 0,
+                "TimeStamp": row.get("file_timestamp", "") or "",
+            }
+            for row in all_data
+        ]
     except Exception:
         return []
 
@@ -671,7 +658,8 @@ def update_sync_meta(source: str, total_files: int = 0, is_full_sync: bool = Fal
             payload["last_full_sync_at"] = now_iso
         supabase.table("rcabinet_sync_meta").upsert(payload, on_conflict="id").execute()
         return True
-    except Exception:
+    except Exception as e:
+        st.warning(f"⚠️ update_sync_meta 失敗: {type(e).__name__}: {e}")
         return False
 
 
@@ -707,34 +695,23 @@ def get_db_files_by_folder_name() -> dict:
         rows = fetch_all_from_supabase(
             supabase,
             "rcabinet_images",
-            "file_name, folder_names, file_url, file_size, file_timestamp",
+            "folder_name, file_name, file_url, file_size, file_timestamp",
         )
     except Exception:
         return {}
 
     result: dict = {}
     for row in rows:
-        folder_names = row.get("folder_names") or ""
-        if not folder_names:
+        folder_name = row.get("folder_name") or ""
+        if not folder_name:
             continue
-        file_url_raw = row.get("file_url") or ""
-        try:
-            url_map = json.loads(file_url_raw) if file_url_raw else {}
-            if not isinstance(url_map, dict):
-                url_map = {}
-        except (json.JSONDecodeError, TypeError):
-            url_map = {}
-        for folder_name in folder_names.split(", "):
-            folder_name = folder_name.strip()
-            if not folder_name:
-                continue
-            result.setdefault(folder_name, []).append({
-                "FileName": row.get("file_name", ""),
-                "FileUrl": url_map.get(folder_name, ""),
-                "FileSize": row.get("file_size", 0),
-                "TimeStamp": row.get("file_timestamp", ""),
-                "FolderName": folder_name,
-            })
+        result.setdefault(folder_name, []).append({
+            "FileName": row.get("file_name", ""),
+            "FileUrl": row.get("file_url", "") or "",
+            "FileSize": row.get("file_size", 0) or 0,
+            "TimeStamp": row.get("file_timestamp", "") or "",
+            "FolderName": folder_name,
+        })
     return result
 
 
@@ -1392,6 +1369,40 @@ def resize_to_square(image_data: bytes, size: int = 600, center: bool = False):
     return canvas
 
 
+def compose_with_obi_frame(image_data: bytes, obi_path: str, size: int = 700):
+    """帯フレーム画像に表紙を中央配置して合成（単品用・実験）
+
+    - 帯画像を size×size にリサイズしてベースに使用
+    - 右側のタイトル帯を避けた領域（左から約85%）の中央に表紙を配置
+    - 表紙はその領域の縦約56%・横約56%にフィット（アスペクト比維持）
+    """
+    Image = get_pil()
+    # 帯画像をベースに（正方形リサイズ）
+    base = Image.open(obi_path).convert("RGB").resize((size, size), Image.LANCZOS)
+
+    # 表紙配置エリア（キャンバス中央・やや下寄り、縦はキャンバスの約82%）
+    area_left = int(size * 0.10)
+    area_right = int(size * 0.90)
+    area_top = int(size * 0.14)
+    area_bottom = int(size * 0.96)
+    area_w = area_right - area_left
+    area_h = area_bottom - area_top
+
+    # 表紙をエリアにフィット（アスペクト比維持）
+    cover = Image.open(BytesIO(image_data)).convert("RGB")
+    ratio = min(area_w / cover.width, area_h / cover.height)
+    new_w = int(cover.width * ratio)
+    new_h = int(cover.height * ratio)
+    cover = cover.resize((new_w, new_h), Image.LANCZOS)
+
+    # エリア中央に配置
+    x = area_left + (area_w - new_w) // 2
+    y = area_top + (area_h - new_h) // 2
+    base.paste(cover, (x, y))
+
+    return base
+
+
 def add_shipping_badge(base_image, badge_path: str):
     """送料無料バッジを合成（白背景を透明化してオーバーレイ）"""
     Image = get_pil()
@@ -1547,7 +1558,7 @@ def _workflow_prepare_target_data(missing_comics: list, is_list_content: str, co
     return target_data
 
 
-def _workflow_process_one_image(data: dict, session, badge_path: str):
+def _workflow_process_one_image(data: dict, session, badge_path: str, obi_path: str = '', use_obi_frame: bool = False):
     """1件分の画像取得＋加工。結果dict(success/comic_no/jan_code/log/source/image)を返す"""
     import os
     random = get_random()
@@ -1592,10 +1603,15 @@ def _workflow_process_one_image(data: dict, session, badge_path: str):
     need_badge = ctype in ('set', 'yoyaku')
 
     if is_tanpin:
-        # 単品: 600×600px・中央配置（バッジなし）
-        resized = resize_to_square(image_data, 600, center=True)
-        final_image = resized
-        badge_status = "リサイズのみ（中央）"
+        if use_obi_frame and obi_path and os.path.exists(obi_path):
+            # 単品: 帯フレームに表紙を合成（実験モード）
+            final_image = compose_with_obi_frame(image_data, obi_path, 700)
+            badge_status = "帯フレーム合成"
+        else:
+            # 単品: 600×600px・中央配置（バッジなし）
+            resized = resize_to_square(image_data, 600, center=True)
+            final_image = resized
+            badge_status = "リサイズのみ（中央）"
     else:
         # セット・予約: 600×600px・左寄せ＋送料無料バッジ
         resized = resize_to_square(image_data, 600)
@@ -1768,6 +1784,129 @@ def prepare_yahoo_zips(images: list, excel_set_df, excel_tanpin_df, additional_d
         'unmapped': unmapped,
         'total_files': len(file_entries),
         'logs': logs
+    }
+
+
+def prepare_rakuten_upload_plan(images: list, folders: list) -> dict:
+    """種別ベースで楽天R-Cabinetへの振り分け計画を立てる。
+
+    画像ごとに `type`（'set'/'tanpin'/'yoyaku'）から TYPE_FOLDER_CONFIG で親パス＋サブフォルダ名 prefix を引き、
+    R-Cabinet上の最大Nのサブフォルダ（FileCount < RAKUTEN_FOLDER_LIMIT）から順に詰める。
+    上限に達したら N+1 を新規作成（folders_to_create に積む）。
+
+    Returns:
+        {
+          'plan': [{'type','comic_no','file_name','image_data',
+                    'target_folder_name','parent_path'}, ...],
+          'folders_to_create': [{'type','folder_name','directory_name',
+                                 'parent_folder_id','parent_path'}, ...],
+          'mapped': int, 'unmapped': [str, ...], 'logs': [str, ...]
+        }
+    """
+    import re
+    plan = []
+    folders_to_create = []
+    creation_seen = set()
+    unmapped = []
+    logs = []
+
+    for ctype, cfg in TYPE_FOLDER_CONFIG.items():
+        parent_path = cfg["parent_path"]
+        prefix = cfg["subfolder_prefix"]
+        type_images = [img for img in images if img.get("type") == ctype]
+        if not type_images:
+            continue
+
+        # 親フォルダ（/comic/comic-set 等）を探す
+        parent = next((f for f in folders if f.get("FolderPath") == parent_path), None)
+        if not parent:
+            for img in type_images:
+                cno = str(img.get("comic_no", ""))
+                unmapped.append(cno)
+                logs.append(f"❌ {cno}: 親フォルダ {parent_path} がR-Cabinetに見つかりません")
+            continue
+        parent_id = parent.get("FolderId")
+
+        # 配下のサブフォルダ（<prefix><N>形式のみ拾う）を列挙
+        subfolders = []
+        name_pattern = re.compile(rf"^{re.escape(prefix)}(\d+)$")
+        path_prefix = parent_path + "/"
+        for f in folders:
+            fpath = f.get("FolderPath", "") or ""
+            fname = f.get("FolderName", "") or ""
+            if not fpath.startswith(path_prefix):
+                continue
+            m = name_pattern.match(fname)
+            if not m:
+                continue
+            subfolders.append({
+                "n": int(m.group(1)),
+                "folder_id": f.get("FolderId"),
+                "folder_name": fname,
+                "directory_name": fpath.rsplit("/", 1)[-1],
+                "file_count": f.get("FileCount", 0) or 0,
+            })
+        subfolders.sort(key=lambda x: x["n"])
+
+        # ディレクトリ命名規則の推定（既存の最大Nのフォルダのdirectory_nameから数字部分を分離）
+        if subfolders:
+            sample_dir = subfolders[-1]["directory_name"]
+            dm = re.search(r"(\d+)$", sample_dir)
+            directory_template = sample_dir[: dm.start()] if dm else ""
+        else:
+            directory_template = ""
+
+        # 振り分け開始位置を決定
+        if subfolders:
+            current_n = subfolders[-1]["n"]
+            current_folder_name = subfolders[-1]["folder_name"]
+            current_file_count = subfolders[-1]["file_count"]
+        else:
+            current_n = 0
+            current_folder_name = None
+            current_file_count = RAKUTEN_FOLDER_LIMIT  # 強制で N=1 を新規作成
+
+        for img in type_images:
+            cno = str(img.get("comic_no", ""))
+            # R-Cabinet: fileName=画像名（拡張子なし）, filePath=URLスラッグ（拡張子付き）
+            api_file_name = cno
+            api_file_path = f"{cno}.jpg"
+
+            # 上限に達していたら次のN+1を新規作成対象として登録
+            if current_file_count >= RAKUTEN_FOLDER_LIMIT:
+                current_n += 1
+                current_folder_name = f"{prefix}{current_n}"
+                current_file_count = 0
+                key = (ctype, current_folder_name)
+                if key not in creation_seen:
+                    creation_seen.add(key)
+                    folders_to_create.append({
+                        "type": ctype,
+                        "folder_name": current_folder_name,
+                        "directory_name": (f"{directory_template}{current_n}" if directory_template else None),
+                        "parent_folder_id": parent_id,
+                        "parent_path": parent_path,
+                    })
+                    logs.append(f"➕ 新規フォルダ作成予定: {parent_path}/{current_folder_name}")
+
+            plan.append({
+                "type": ctype,
+                "comic_no": cno,
+                "file_name": api_file_name,        # R-Cabinet fileName（画像名・拡張子なし）
+                "file_path_name": api_file_path,   # R-Cabinet filePath（URLスラッグ・拡張子付き）
+                "image_data": img.get("image_data"),
+                "target_folder_name": current_folder_name,
+                "parent_path": parent_path,
+            })
+            current_file_count += 1
+            logs.append(f"✅ {cno} → {parent_path}/{current_folder_name}")
+
+    return {
+        "plan": plan,
+        "folders_to_create": folders_to_create,
+        "mapped": len(plan),
+        "unmapped": unmapped,
+        "logs": logs,
     }
 
 
@@ -2257,10 +2396,11 @@ WORKFLOW_CSS = """
     justify-content: space-between;
     align-items: center;
     padding: 1.5rem 2rem;
-    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+    border: 1px solid #e2e8f0;
     border-radius: 16px;
     margin-bottom: 2rem;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+    box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06);
     position: relative;
     overflow: hidden;
 }
@@ -2272,7 +2412,7 @@ WORKFLOW_CSS = """
     left: 0;
     right: 0;
     height: 3px;
-    background: linear-gradient(90deg, #667eea, #764ba2, #f093fb);
+    background: linear-gradient(90deg, #a5b4fc, #c4b5fd, #f5d0fe);
 }
 
 .step-item {
@@ -2304,40 +2444,95 @@ WORKFLOW_CSS = """
 }
 
 .step-circle.active {
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
     color: white;
-    box-shadow: 0 4px 20px rgba(102, 126, 234, 0.5);
     transform: scale(1.1);
     animation: pulse 2s infinite;
+    --pulse-color: rgba(129, 140, 248, 0.45);
 }
 
 .step-circle.pending {
-    background: rgba(255, 255, 255, 0.1);
-    color: rgba(255, 255, 255, 0.5);
-    border: 2px dashed rgba(255, 255, 255, 0.2);
+    background: #ffffff;
+    color: #94a3b8;
+    border: 2px solid #e2e8f0;
+}
+
+/* パレット風：各ステップ固有のパステルカラー */
+/* ① 不足特定 — Rose */
+.step-1 .step-circle.active {
+    background: linear-gradient(135deg, #fda4af 0%, #f472b6 100%);
+    --pulse-color: rgba(244, 114, 182, 0.45);
+}
+.step-1 .step-circle.pending {
+    background: #fff1f5;
+    color: #db2777;
+    border-color: #fbcfe8;
+}
+
+/* ② JAN取得 — Amber */
+.step-2 .step-circle.active {
+    background: linear-gradient(135deg, #fcd34d 0%, #fbbf24 100%);
+    --pulse-color: rgba(251, 191, 36, 0.45);
+}
+.step-2 .step-circle.pending {
+    background: #fffbeb;
+    color: #d97706;
+    border-color: #fde68a;
+}
+
+/* ③ 画像取得 — Mint */
+.step-3 .step-circle.active {
+    background: linear-gradient(135deg, #86efac 0%, #4ade80 100%);
+    --pulse-color: rgba(74, 222, 128, 0.45);
+}
+.step-3 .step-circle.pending {
+    background: #f0fdf4;
+    color: #059669;
+    border-color: #bbf7d0;
+}
+
+/* ④ 準備 — Sky */
+.step-4 .step-circle.active {
+    background: linear-gradient(135deg, #7dd3fc 0%, #38bdf8 100%);
+    --pulse-color: rgba(56, 189, 248, 0.45);
+}
+.step-4 .step-circle.pending {
+    background: #f0f9ff;
+    color: #0284c7;
+    border-color: #bae6fd;
+}
+
+/* ⑤ アップロード — Lavender */
+.step-5 .step-circle.active {
+    background: linear-gradient(135deg, #c4b5fd 0%, #a78bfa 100%);
+    --pulse-color: rgba(167, 139, 250, 0.45);
+}
+.step-5 .step-circle.pending {
+    background: #faf5ff;
+    color: #7c3aed;
+    border-color: #ddd6fe;
 }
 
 @keyframes pulse {
-    0%, 100% { box-shadow: 0 4px 20px rgba(102, 126, 234, 0.5); }
-    50% { box-shadow: 0 4px 30px rgba(102, 126, 234, 0.8); }
+    0%, 100% { box-shadow: 0 4px 16px var(--pulse-color); }
+    50% { box-shadow: 0 4px 28px var(--pulse-color); }
 }
 
 .step-label {
     font-size: 0.75rem;
-    color: rgba(255, 255, 255, 0.7);
+    color: #64748b;
     text-align: center;
     max-width: 80px;
 }
 
 .step-label.active {
-    color: white;
+    color: #1e293b;
     font-weight: 600;
 }
 
 .step-connector {
     flex: 0.5;
     height: 3px;
-    background: rgba(255, 255, 255, 0.1);
+    background: #e2e8f0;
     position: relative;
     margin-top: -24px;
 }
@@ -2373,9 +2568,9 @@ WORKFLOW_CSS = """
     align-items: center;
     justify-content: center;
     font-size: 1.5rem;
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    color: white;
-    box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
+    background: #eef2ff;
+    color: #6366f1;
+    box-shadow: 0 2px 8px rgba(99, 102, 241, 0.15);
 }
 
 .step-card-title {
@@ -2492,8 +2687,7 @@ def render_workflow_step_nav(current_step: int, completed_steps: list):
         ("①", "不足特定"),
         ("②", "JAN取得"),
         ("③", "画像取得"),
-        ("④", "準備"),
-        ("⑤", "アップロード")
+        ("④", "アップロード")
     ]
 
     html = '<div class="workflow-nav">'
@@ -2513,7 +2707,7 @@ def render_workflow_step_nav(current_step: int, completed_steps: list):
         label_class = "active" if step_num == current_step else ""
 
         html += f'''
-        <div class="step-item">
+        <div class="step-item step-{step_num}">
             <div class="step-circle {status}">{icon}</div>
             <div class="step-label {label_class}">{label}</div>
         </div>
@@ -2555,8 +2749,7 @@ if mode == "🎨 クリエイティブスタジオ":
             "① 不足特定": 1,
             "② JAN取得": 2,
             "③ 画像取得": 3,
-            "④ アップロード準備": 4,
-            "⑤ アップロード": 5
+            "④ アップロード": 4
         }
         selected = st.selectbox(
             "移動先",
@@ -3319,6 +3512,15 @@ if mode == "🎨 クリエイティブスタジオ":
         is_processing = st.session_state.wf_img_processing
         is_paused = st.session_state.wf_img_paused
 
+        # 実験: 単品に帯フレームを合成するON/OFF
+        use_obi_frame_ui = st.checkbox(
+            "🎨 単品画像に帯フレームを合成する（実験）",
+            value=st.session_state.get('wf_img_use_obi_frame', False),
+            disabled=is_processing,
+            key="wf_img_use_obi_frame_ui",
+            help="ONにすると単品画像を haruurarakanashobo-obi.jpg の中心に配置した合成画像を生成します。",
+        )
+
         ctrl_cols = st.columns([3, 2, 5])
         with ctrl_cols[0]:
             start_clicked = st.button(
@@ -3338,6 +3540,7 @@ if mode == "🎨 クリエイティブスタジオ":
 
         if start_clicked:
             badge_path = os.path.join(os.path.dirname(__file__), "images", "badge_free_shipping.jpg")
+            obi_path = os.path.join(os.path.dirname(__file__), "images", "haruurarakanashobo-obi.jpg")
             target_data = _workflow_prepare_target_data(
                 missing_comics,
                 st.session_state.workflow_data['is_list'],
@@ -3356,6 +3559,8 @@ if mode == "🎨 クリエイティブスタジオ":
                 }
                 st.session_state.wf_img_logs = []
                 st.session_state.wf_img_badge_path = badge_path
+                st.session_state.wf_img_obi_path = obi_path
+                st.session_state.wf_img_use_obi_frame = use_obi_frame_ui
                 st.session_state.wf_img_processing = True
                 st.session_state.wf_img_paused = False
                 st.session_state.wf_img_session = requests.Session()
@@ -3395,7 +3600,13 @@ if mode == "🎨 クリエイティブスタジオ":
             if idx < total:
                 data = st.session_state.wf_img_target_data[idx]
                 session = st.session_state.get('wf_img_session') or requests.Session()
-                result = _workflow_process_one_image(data, session, st.session_state.wf_img_badge_path)
+                result = _workflow_process_one_image(
+                    data,
+                    session,
+                    st.session_state.wf_img_badge_path,
+                    obi_path=st.session_state.get('wf_img_obi_path', ''),
+                    use_obi_frame=st.session_state.get('wf_img_use_obi_frame', False),
+                )
                 st.session_state.wf_img_logs.append(result['log'])
                 if result['success']:
                     st.session_state.wf_img_downloaded.append(result['image'])
@@ -3490,17 +3701,17 @@ if mode == "🎨 クリエイティブスタジオ":
                 st.rerun()
 
     # ============================================================
-    # Step 4: アップロード準備
+    # Step 4: アップロード（楽天=API / ヤフー=ZIP）
     # ============================================================
     elif current_step == 4:
         import os as _os
         st.markdown("""
         <div class="step-card">
             <div class="step-card-header">
-                <div class="step-card-icon">📦</div>
+                <div class="step-card-icon">🚀</div>
                 <div>
-                    <p class="step-card-title">Step ④ アップロード準備</p>
-                    <p class="step-card-desc">楽天・ヤフー向けにファイルを整形します</p>
+                    <p class="step-card-title">Step ④ アップロード</p>
+                    <p class="step-card-desc">楽天はAPIで直接アップロード、ヤフーはZIP生成します</p>
                 </div>
             </div>
         </div>
@@ -3514,12 +3725,215 @@ if mode == "🎨 クリエイティブスタジオ":
                 st.session_state.workflow_step = 3
                 st.rerun()
         else:
-            st.info(f"対象画像: {len(images)}件（セット品: {len([i for i in images if not i.get('is_tanpin')])}件 / 単品: {len([i for i in images if i.get('is_tanpin')])}件）")
+            n_set = len([i for i in images if i.get('type') == 'set'])
+            n_tanpin = len([i for i in images if i.get('type') == 'tanpin'])
+            n_yoyaku = len([i for i in images if i.get('type') == 'yoyaku'])
+            st.info(f"対象画像: {len(images)}件（セット品: {n_set}件 / 単品: {n_tanpin}件 / 予約: {n_yoyaku}件）")
 
-            tab_yahoo, tab_rakuten = st.tabs(["🛒 ヤフー準備", "🏪 楽天準備"])
+            tab_rakuten, tab_yahoo = st.tabs(["🏪 楽天アップロード", "🛒 ヤフー準備"])
 
             # ============================================
-            # ヤフータブ
+            # 楽天タブ（API直接アップロード）
+            # ============================================
+            with tab_rakuten:
+                st.markdown("### R-Cabinet APIアップロード")
+                st.caption("種別ごとに /comic/comic-{set|tanpin|yoyaku} 配下の最新サブフォルダへアップロードします。2000件埋まっている場合は連番＋1のフォルダを自動作成します。")
+
+                # フォルダ最新化
+                col_r1, col_r2 = st.columns([1, 1])
+                with col_r1:
+                    if st.button("📂 R-Cabinetフォルダ最新化", key="rakuten_refetch_folders"):
+                        with st.spinner("R-Cabinet APIから取得中..."):
+                            try:
+                                get_all_folders.clear()
+                            except Exception:
+                                pass
+                            folders, error = get_all_folders()
+                        if error:
+                            st.error(error)
+                        elif folders:
+                            st.session_state.workflow_data['rakuten_folders'] = folders
+                            # 計画は最新化のたびに再生成させるためクリア
+                            st.session_state.workflow_data.pop('rakuten_plan', None)
+                            st.session_state.workflow_data.pop('rakuten_upload_result', None)
+                            st.success(f"{len(folders)}フォルダ取得")
+                            st.rerun()
+
+                with col_r2:
+                    folders = st.session_state.workflow_data.get('rakuten_folders')
+                    if folders:
+                        st.success(f"✅ 取得済み: {len(folders)}件")
+                    else:
+                        st.warning("⬜ 未取得（先に最新化してください）")
+
+                # 計画作成
+                st.divider()
+                folders_ready = bool(st.session_state.workflow_data.get('rakuten_folders'))
+
+                if st.button("📋 振り分け計画を作成", type="primary", disabled=not folders_ready, key="rakuten_plan_btn"):
+                    folders = st.session_state.workflow_data['rakuten_folders']
+                    plan_result = prepare_rakuten_upload_plan(images, folders)
+                    st.session_state.workflow_data['rakuten_plan'] = plan_result
+                    # 既存のアップロード結果はクリア
+                    st.session_state.workflow_data.pop('rakuten_upload_result', None)
+                    st.rerun()
+
+                # 計画表示
+                plan_result = st.session_state.workflow_data.get('rakuten_plan')
+                if plan_result:
+                    col_m1, col_m2, col_m3 = st.columns(3)
+                    col_m1.metric("マッピング成功", plan_result['mapped'])
+                    col_m2.metric("未マッチ", len(plan_result['unmapped']))
+                    col_m3.metric("新規フォルダ作成予定", len(plan_result['folders_to_create']))
+
+                    if plan_result['folders_to_create']:
+                        st.markdown("**🆕 新規作成予定フォルダ**")
+                        create_df = pd.DataFrame([
+                            {
+                                '種別': c['type'],
+                                'パス': f"{c['parent_path']}/{c['folder_name']}",
+                                'ディレクトリ名': c.get('directory_name') or '(R-Cabinet自動採番)',
+                            }
+                            for c in plan_result['folders_to_create']
+                        ])
+                        st.dataframe(create_df, use_container_width=True, height=120)
+
+                    if plan_result['plan']:
+                        st.markdown("**📤 アップロード計画**")
+                        plan_df = pd.DataFrame([
+                            {
+                                '種別': p['type'],
+                                'コミックNo': p['comic_no'],
+                                'ファイル名': p['file_name'],
+                                'アップロード先': f"{p['parent_path']}/{p['target_folder_name']}",
+                            }
+                            for p in plan_result['plan']
+                        ])
+                        st.dataframe(plan_df, use_container_width=True, height=240)
+
+                    if plan_result['unmapped']:
+                        st.warning(f"未マッチ: {', '.join(plan_result['unmapped'])}")
+
+                    with st.expander("詳細ログ", expanded=False):
+                        for log in plan_result['logs']:
+                            st.text(log)
+
+                    # 2段階目: 実行確認
+                    st.divider()
+                    upload_result = st.session_state.workflow_data.get('rakuten_upload_result')
+                    if not upload_result:
+                        st.warning("⚠️ 下記内容でR-Cabinetへ実際にアップロードします。実行前に計画内容を確認してください。")
+                        confirm = st.checkbox("上記内容で実行することを確認しました", key="rakuten_confirm_upload")
+                        if st.button(
+                            "✅ アップロード実行",
+                            type="primary",
+                            disabled=not (confirm and plan_result['plan']),
+                            key="rakuten_execute_btn"
+                        ):
+                            log_lines = []
+                            created_folders = {}
+                            create_errors = []
+                            upload_success = 0
+                            upload_failed = []
+
+                            # 既存フォルダ名 → folder_id のマップ
+                            folder_id_by_name = {
+                                f.get('FolderName'): f.get('FolderId')
+                                for f in st.session_state.workflow_data['rakuten_folders']
+                            }
+
+                            progress = st.progress(0.0)
+                            status = st.empty()
+
+                            # 1) 新規フォルダ作成
+                            total_creates = len(plan_result['folders_to_create'])
+                            for idx, c in enumerate(plan_result['folders_to_create']):
+                                status.text(f"📁 フォルダ作成中: {c['parent_path']}/{c['folder_name']} ({idx+1}/{total_creates})")
+                                res = create_folder(
+                                    folder_name=c['folder_name'],
+                                    directory_name=c.get('directory_name'),
+                                    upper_folder_id=c['parent_folder_id'],
+                                )
+                                if res.get('success'):
+                                    new_id = res.get('folder_id')
+                                    created_folders[c['folder_name']] = new_id
+                                    folder_id_by_name[c['folder_name']] = new_id
+                                    log_lines.append(f"✅ フォルダ作成: {c['parent_path']}/{c['folder_name']} (id={new_id})")
+                                else:
+                                    err_msg = res.get('error', '不明なエラー')
+                                    create_errors.append({'folder': c['folder_name'], 'error': err_msg})
+                                    log_lines.append(f"❌ フォルダ作成失敗: {c['parent_path']}/{c['folder_name']}: {err_msg}")
+
+                            # 2) 画像アップロード
+                            total = len(plan_result['plan'])
+                            for idx, p in enumerate(plan_result['plan']):
+                                progress.progress((idx + 1) / max(total, 1))
+                                status.text(f"📤 アップロード中: {p['comic_no']} → {p['parent_path']}/{p['target_folder_name']} ({idx+1}/{total})")
+
+                                target_folder_id = folder_id_by_name.get(p['target_folder_name'])
+                                if not target_folder_id:
+                                    upload_failed.append({'comic_no': p['comic_no'], 'error': f"フォルダID未解決: {p['target_folder_name']}"})
+                                    log_lines.append(f"❌ {p['comic_no']}: フォルダID未解決 ({p['target_folder_name']})")
+                                    continue
+
+                                res = upload_image(
+                                    file_data=p['image_data'],
+                                    file_name=p['file_name'],
+                                    folder_id=target_folder_id,
+                                    file_path_name=p.get('file_path_name'),
+                                    overwrite=True,
+                                )
+                                if res.get('success'):
+                                    upload_success += 1
+                                    log_lines.append(f"✅ {p['comic_no']} → {p['parent_path']}/{p['target_folder_name']}/{p['file_path_name']}")
+                                else:
+                                    err_msg = res.get('error', '不明なエラー')
+                                    upload_failed.append({'comic_no': p['comic_no'], 'error': err_msg})
+                                    log_lines.append(f"❌ {p['comic_no']}: {err_msg}")
+
+                            status.empty()
+                            progress.empty()
+
+                            st.session_state.workflow_data['rakuten_upload_result'] = {
+                                'created_folders': created_folders,
+                                'create_errors': create_errors,
+                                'upload_success': upload_success,
+                                'upload_failed': upload_failed,
+                                'logs': log_lines,
+                                'total': total,
+                            }
+                            # フォルダ状態が変わったのでキャッシュをクリア
+                            try:
+                                get_all_folders.clear()
+                            except Exception:
+                                pass
+                            st.rerun()
+                    else:
+                        st.markdown("### 📊 実行結果")
+                        col_u1, col_u2, col_u3 = st.columns(3)
+                        col_u1.metric("✅ アップロード成功", upload_result['upload_success'])
+                        col_u2.metric("❌ アップロード失敗", len(upload_result['upload_failed']))
+                        col_u3.metric("📁 新規作成フォルダ", len(upload_result['created_folders']))
+
+                        if upload_result['upload_failed']:
+                            st.error("失敗したアップロード:")
+                            st.dataframe(pd.DataFrame(upload_result['upload_failed']), use_container_width=True, height=150)
+
+                        if upload_result['create_errors']:
+                            st.error("失敗したフォルダ作成:")
+                            st.dataframe(pd.DataFrame(upload_result['create_errors']), use_container_width=True, height=120)
+
+                        with st.expander("実行ログ", expanded=False):
+                            for log in upload_result['logs']:
+                                st.text(log)
+
+                        if st.button("🔁 計画を再生成して再実行", key="rakuten_reset_upload"):
+                            st.session_state.workflow_data.pop('rakuten_upload_result', None)
+                            st.session_state.workflow_data.pop('rakuten_plan', None)
+                            st.rerun()
+
+            # ============================================
+            # ヤフータブ（ZIP生成）
             # ============================================
             with tab_yahoo:
                 st.markdown("### データフォーマットExcel")
@@ -3650,112 +4064,6 @@ if mode == "🎨 クリエイティブスタジオ":
                         for log in result['logs']:
                             st.text(log)
 
-            # ============================================
-            # 楽天タブ
-            # ============================================
-            with tab_rakuten:
-                st.markdown("### フォルダマッピング")
-
-                # フォルダ階層リスト取得
-                col_r1, col_r2 = st.columns(2)
-                with col_r1:
-                    if st.button("📥 フォルダ階層リスト取得", key="rakuten_hierarchy_btn"):
-                        with st.spinner("GitHubから取得中..."):
-                            result = download_from_github(GITHUB_FOLDER_HIERARCHY_PATH)
-                        if result.get("success"):
-                            content = result["content"]
-                            if isinstance(content, bytes):
-                                st.session_state.workflow_data['hierarchy_xlsx'] = content
-                            st.success("フォルダ階層リスト取得完了")
-                            st.rerun()
-                        else:
-                            st.error(f"取得失敗: {result.get('error')}")
-
-                with col_r2:
-                    if st.button("📂 楽天フォルダ一覧取得", key="rakuten_folders_btn"):
-                        with st.spinner("R-Cabinet APIから取得中..."):
-                            folders, error = get_all_folders()
-                        if error:
-                            st.error(error)
-                        elif folders:
-                            st.session_state.workflow_data['rakuten_folders'] = folders
-                            st.success(f"{len(folders)}フォルダ取得")
-                            st.rerun()
-
-                # 状態表示
-                col_s1, col_s2 = st.columns(2)
-                with col_s1:
-                    if st.session_state.workflow_data.get('hierarchy_xlsx'):
-                        st.success("✅ フォルダ階層リスト取得済み")
-                    else:
-                        st.warning("⬜ フォルダ階層リスト未取得")
-                with col_s2:
-                    folders = st.session_state.workflow_data.get('rakuten_folders')
-                    if folders:
-                        st.success(f"✅ 楽天フォルダ: {len(folders)}件")
-                    else:
-                        st.warning("⬜ 楽天フォルダ未取得")
-
-                # データ確認エリア
-                with st.expander("データ確認（中身を見る）", expanded=False):
-                    # 1. 画像に紐づく情報（merge_csv_data結果）
-                    st.markdown("**画像の出版社・シリーズ情報**")
-                    img_info_df = pd.DataFrame([
-                        {'コミックNo': img['comic_no'], 'ジャンル': img.get('genre', ''), '出版社': img.get('publisher', ''), 'シリーズ': img.get('series', ''), 'タイトル': img.get('title', '')}
-                        for img in images
-                    ])
-                    st.dataframe(img_info_df, use_container_width=True, height=150)
-
-                    # 2. フォルダ階層リスト
-                    if st.session_state.workflow_data.get('hierarchy_xlsx'):
-                        st.markdown("**フォルダ階層リスト**")
-                        try:
-                            h_df = pd.read_excel(BytesIO(st.session_state.workflow_data['hierarchy_xlsx']), sheet_name="フォルダ階層リスト", header=None)
-                            col_names = ['ジャンル', '出版社', 'シリーズ', 'メインフォルダ', 'サブフォルダ'] + [f'列{i}' for i in range(6, 20)]
-                            h_df.columns = col_names[:len(h_df.columns)]
-                            st.dataframe(h_df, use_container_width=True, height=200)
-                        except Exception as e:
-                            st.error(f"表示エラー: {e}")
-
-                    # 3. 楽天フォルダ一覧
-                    if st.session_state.workflow_data.get('rakuten_folders'):
-                        st.markdown("**楽天フォルダ一覧（R-Cabinet API）**")
-                        f_df = pd.DataFrame(st.session_state.workflow_data['rakuten_folders'])
-                        st.dataframe(f_df, use_container_width=True, height=200)
-
-                # キュー生成
-                st.divider()
-                hierarchy_ready = st.session_state.workflow_data.get('hierarchy_xlsx')
-                folders_ready = st.session_state.workflow_data.get('rakuten_folders')
-
-                if st.button("🏪 アップロードキュー生成", type="primary", disabled=not (hierarchy_ready and folders_ready), key="rakuten_queue_btn"):
-                    hierarchy_bytes = st.session_state.workflow_data['hierarchy_xlsx']
-                    hierarchy_df = pd.read_excel(BytesIO(hierarchy_bytes), sheet_name="フォルダ階層リスト", header=None)
-                    folders = st.session_state.workflow_data['rakuten_folders']
-
-                    result = prepare_rakuten_queue(images, hierarchy_df, folders)
-                    st.session_state.workflow_data['rakuten_queue'] = result
-                    st.rerun()
-
-                # キュー結果表示
-                if 'rakuten_queue' in st.session_state.workflow_data:
-                    result = st.session_state.workflow_data['rakuten_queue']
-
-                    col_m1, col_m2 = st.columns(2)
-                    col_m1.metric("マッピング成功", result['mapped'])
-                    col_m2.metric("未マッチ", len(result['unmapped']))
-
-                    if result['queue']:
-                        queue_df = pd.DataFrame([
-                            {'コミックNo': q['comic_no'], 'メインフォルダ': q.get('main_folder', ''), 'サブフォルダ': q['folder_name'], 'FolderId': q['folder_id']}
-                            for q in result['queue']
-                        ])
-                        st.dataframe(queue_df, use_container_width=True, height=200)
-
-                    with st.expander("ログ", expanded=False):
-                        for log in result['logs']:
-                            st.text(log)
-
             # ナビゲーション
             st.divider()
             col1, col2 = st.columns([1, 1])
@@ -3764,153 +4072,11 @@ if mode == "🎨 クリエイティブスタジオ":
                     st.session_state.workflow_step = 3
                     st.rerun()
             with col2:
-                yahoo_ready = 'yahoo_zips' in st.session_state.workflow_data
-                rakuten_ready = 'rakuten_queue' in st.session_state.workflow_data
-                if st.button("次へ進む →", type="primary", disabled=not (yahoo_ready or rakuten_ready)):
-                    if 4 not in st.session_state.workflow_completed:
-                        st.session_state.workflow_completed.append(4)
-                    st.session_state.workflow_step = 5
+                if st.button("ワークフローをリセット", type="secondary"):
+                    st.session_state.workflow_step = 1
+                    st.session_state.workflow_completed = []
+                    st.session_state.workflow_data = {}
                     st.rerun()
-
-    # ============================================================
-    # Step 5: アップロード
-    # ============================================================
-    elif current_step == 5:
-        st.markdown("""
-        <div class="step-card">
-            <div class="step-card-header">
-                <div class="step-card-icon">🚀</div>
-                <div>
-                    <p class="step-card-title">Step ⑤ アップロード</p>
-                    <p class="step-card-desc">楽天・ヤフーに画像をアップロードします（手動 / API）</p>
-                </div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        tab_manual, tab_api = st.tabs(["📁 手動アップロード", "🤖 APIアップロード"])
-
-        with tab_manual:
-            st.markdown("### 手動アップロード用ZIP")
-            st.caption("フォルダ構成どおりに画像を振り分けたZIPをダウンロードし、R-Cabinetに手動でアップロードします。")
-
-            rakuten_queue = st.session_state.workflow_data.get('rakuten_queue')
-            yahoo_zips = st.session_state.workflow_data.get('yahoo_zips')
-
-            # 楽天ZIP生成
-            st.markdown("#### 楽天（R-Cabinet）")
-            if rakuten_queue and rakuten_queue.get('queue'):
-                queue = rakuten_queue['queue']
-                st.info(f"対象: {len(queue)}件（{len(rakuten_queue.get('unmapped', []))}件未マッチ）")
-
-                if st.button("📦 楽天用ZIP生成", type="primary", key="rakuten_manual_zip"):
-                    import zipfile
-                    import openpyxl
-                    zip_buffer = BytesIO()
-                    mapping_rows = []
-                    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-                        for q in queue:
-                            main_folder = q.get('main_folder', '')
-                            sub_folder = q.get('folder_name', '')
-                            file_name = q['file_name']
-                            # sub_folderとmain_folderが同じ場合はサブフォルダなし
-                            if sub_folder and sub_folder != main_folder:
-                                zip_path = f"{main_folder}/{sub_folder}/{file_name}"
-                            elif main_folder:
-                                zip_path = f"{main_folder}/{file_name}"
-                            else:
-                                zip_path = f"{sub_folder}/{file_name}"
-                            zf.writestr(zip_path, q['file_bytes'])
-                            mapping_rows.append({
-                                'コミックNo': q['comic_no'],
-                                'メインフォルダ': main_folder,
-                                'サブフォルダ': sub_folder if sub_folder != main_folder else '',
-                                'ファイル名': file_name,
-                                'ZIPパス': zip_path
-                            })
-
-                        # マッピング一覧Excelを生成してZIP直下に配置
-                        wb = openpyxl.Workbook()
-                        ws = wb.active
-                        ws.title = "振り分け一覧"
-                        font = openpyxl.styles.Font(name='Meiryo UI')
-                        headers = ['No', 'コミックNo', 'メインフォルダ', 'サブフォルダ', 'ファイル名', 'ZIPパス']
-                        ws.append(headers)
-                        for idx, row in enumerate(mapping_rows, 1):
-                            ws.append([idx, row['コミックNo'], row['メインフォルダ'], row['サブフォルダ'], row['ファイル名'], row['ZIPパス']])
-                        # フォント適用・列幅調整（全角文字は幅2として計算）
-                        def calc_display_width(text):
-                            return sum(2 if ord(c) > 0x7F else 1 for c in str(text))
-
-                        for col_idx, header in enumerate(headers, 1):
-                            max_w = calc_display_width(header)
-                            for r in range(1, ws.max_row + 1):
-                                cell = ws.cell(row=r, column=col_idx)
-                                cell.font = font
-                                max_w = max(max_w, calc_display_width(cell.value or ''))
-                            ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = min(max_w + 2, 80)
-                        xlsx_buffer = BytesIO()
-                        wb.save(xlsx_buffer)
-                        zf.writestr("振り分け一覧.xlsx", xlsx_buffer.getvalue())
-
-                    st.session_state.workflow_data['rakuten_manual_zip'] = zip_buffer.getvalue()
-                    st.rerun()
-
-                if st.session_state.workflow_data.get('rakuten_manual_zip'):
-                    zip_data = st.session_state.workflow_data['rakuten_manual_zip']
-                    size_mb = len(zip_data) / (1024 * 1024)
-                    st.download_button(
-                        label=f"📥 rakuten_upload.zip ({size_mb:.1f}MB)",
-                        data=zip_data,
-                        file_name="rakuten_upload.zip",
-                        mime="application/zip",
-                        key="rakuten_manual_zip_dl"
-                    )
-            else:
-                st.warning("Step ④でアップロードキューを生成してください。")
-
-            # ヤフーZIP
-            st.divider()
-            st.markdown("#### ヤフー")
-            if yahoo_zips and yahoo_zips.get('zips'):
-                zips = yahoo_zips['zips']
-                st.info(f"マッピング成功: {yahoo_zips['mapped']}件 / ZIP数: {len(zips)}")
-                for i, zip_data in enumerate(zips):
-                    size_mb = len(zip_data) / (1024 * 1024)
-                    st.download_button(
-                        label=f"📥 yahoo_upload_{i+1:03d}.zip ({size_mb:.1f}MB)",
-                        data=zip_data,
-                        file_name=f"yahoo_upload_{i+1:03d}.zip",
-                        mime="application/zip",
-                        key=f"yahoo_manual_zip_dl_{i}"
-                    )
-            else:
-                st.warning("Step ④でヤフー用ZIPを生成してください。")
-
-        with tab_api:
-            st.markdown("### APIアップロード")
-            st.info("🚧 この機能は現在実装中です。")
-
-            tab_api_yahoo, tab_api_rakuten = st.tabs(["🛒 ヤフー", "🏪 楽天"])
-
-            with tab_api_yahoo:
-                st.warning("Yahoo認証トークンが未設定です。設定後にアップロードが可能になります。")
-
-            with tab_api_rakuten:
-                st.success("楽天API認証は設定済みです。実装予定。")
-
-        st.divider()
-        col1, col2 = st.columns([1, 1])
-        with col1:
-            if st.button("← 戻る"):
-                st.session_state.workflow_step = 4
-                st.rerun()
-        with col2:
-            if st.button("ワークフローをリセット", type="secondary"):
-                st.session_state.workflow_step = 1
-                st.session_state.workflow_completed = []
-                st.session_state.workflow_data = {}
-                st.rerun()
 
 
 elif mode == "🛰️ R-Cabi構成把握":
@@ -3926,37 +4092,18 @@ elif mode == "🛰️ R-Cabi構成把握":
         st.session_state.images_loaded = False
         st.session_state.images_data = None
 
-    # フォルダ一覧を自動取得（初回のみ）- 再実行を挟まず同一runで続行し、残像を回避
-    if not st.session_state.folders_loaded:
-        with st.spinner("フォルダ一覧を取得中..."):
-            folders, error = get_all_folders()
-        st.session_state.folders_data = folders
-        st.session_state.folders_error = error
-        st.session_state.folders_loaded = True
-    else:
-        folders = st.session_state.folders_data
-        error = st.session_state.folders_error
+    # フォルダ一覧はボタン押下時のみ取得（タブ切替時の自動取得は廃止）
+    folders = st.session_state.folders_data
+    error = st.session_state.folders_error
 
-    if error:
-        st.error(error)
-        if st.button("🔄 再試行"):
-            st.session_state.folders_loaded = False
-            st.cache_data.clear()
-            st.rerun()
-        st.stop()
-
-    if not folders:
-        st.warning("フォルダがありません。")
-        st.stop()
-
-    # 対象フォルダ（FOLDER_MANAGEMENT_SHEETS配下）のみに絞り込んだ件数
-    target_folders_view = filter_target_folders(folders)
-    target_files_view = sum(f.get('FileCount', 0) for f in target_folders_view)
-
-    # サイドバーにフォルダ情報（取得対象ベース）
-    with st.sidebar:
-        st.success(f"📁 {len(target_folders_view)} フォルダ")
-        st.info(f"📷 {target_files_view} 画像")
+    def _ensure_folders_loaded():
+        if not st.session_state.folders_loaded:
+            with st.spinner("フォルダ一覧を取得中..."):
+                f, e = get_all_folders()
+            st.session_state.folders_data = f
+            st.session_state.folders_error = e
+            st.session_state.folders_loaded = True
+        return st.session_state.folders_data, st.session_state.folders_error
 
     xlsx_col1, xlsx_col2, xlsx_col3 = st.columns([3, 3, 4])
     with xlsx_col1:
@@ -3986,10 +4133,13 @@ elif mode == "🛰️ R-Cabi構成把握":
         st.caption("🕒 最終DB同期: 未記録（rcabinet_sync_meta テーブル未作成か、初回同期前）")
 
     if xlsx_latest_btn:
-        with st.spinner("フォルダ一覧を取得中..."):
-            latest_folders, f_err = get_all_folders()
-        if f_err or not latest_folders:
-            st.error(f"フォルダ取得エラー: {f_err or 'データなし'}")
+        # 押下時にフォルダ一覧を取得（初回のみAPI、以降はキャッシュ再利用）
+        latest_folders, latest_error = _ensure_folders_loaded()
+        folders = latest_folders
+        if latest_error:
+            st.error(latest_error)
+        elif not latest_folders:
+            st.error("フォルダ取得エラー: データなし")
         else:
             target_folders = filter_target_folders(latest_folders)
             skipped_count = len(latest_folders) - len(target_folders)
@@ -4074,9 +4224,16 @@ elif mode == "🛰️ R-Cabi構成把握":
                     )
 
     if xlsx_db_btn:
+        # DB読込時もフォルダ構造は必要なので取得
+        db_folders, db_folder_error = _ensure_folders_loaded()
+        folders = db_folders
         with st.spinner("DBから読込中..."):
             db_images, _msg = load_images_from_db()
-        if not db_images:
+        if db_folder_error:
+            st.error(db_folder_error)
+        elif not db_folders:
+            st.error("フォルダ取得エラー: データなし")
+        elif not db_images:
             st.warning("DBにデータがありません。日次同期が完了してから再実行してください。")
         else:
             with st.spinner("Excel生成中..."):
