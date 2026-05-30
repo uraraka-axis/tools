@@ -1674,38 +1674,41 @@ def process_workflow_images(missing_comics: list, is_list_content: str, comic_li
     return {'success': True, 'images': downloaded_images, 'stats': stats, 'logs': logs}
 
 
-def prepare_yahoo_zips(images: list, excel_set_df, excel_tanpin_df, additional_dir: str) -> dict:
-    """ヤフー用にリネーム＋追加画像＋ZIP分割生成"""
+def prepare_yahoo_zips(target_image_map: dict, excel_set_df, excel_tanpin_df, excel_yoyaku_df, additional_dir: str) -> dict:
+    """ヤフー用にリネーム＋追加画像＋ZIP分割生成（検索対象の全量ベース）。
+
+    Args:
+        target_image_map: {comic_no(str): image_data(bytes)}。不足分（Step③取得）と
+                          既存分（R-Cabinet URL取得）を統合済みの画像辞書。
+        excel_set_df:    セット品シート（A列=商品コード / D列=コミックNo）
+        excel_tanpin_df: 単品シート（A列=商品コード / E列=コミックNo）
+        excel_yoyaku_df: 予約シート（A列=商品コード / D列=コミックNo）
+        additional_dir:  追加画像（additional_1.jpg / additional_2.jpg）の格納ディレクトリ
+    """
     import os
     zipfile = get_zipfile()
-    Image = get_pil()
 
     MAX_ZIP_SIZE = 25 * 1024 * 1024  # 25MB
 
-    # コミックNo → 商品コード のマッピング構築
+    # コミックNo → {code, type} のマッピングを出品シート（＝検索対象の全量）から構築
     comic_to_product = {}
 
-    # セット品シート: A列=商品コード, D列=コミックNo
-    if excel_set_df is not None:
-        for i in range(len(excel_set_df)):
+    def _build_mapping(df, col_idx, type_label):
+        if df is None:
+            return
+        for i in range(len(df)):
             try:
-                product_code = str(excel_set_df.iloc[i, 0]).strip()
-                comic_no = str(excel_set_df.iloc[i, 3]).strip().replace('.0', '')
+                product_code = str(df.iloc[i, 0]).strip()
+                comic_no = str(df.iloc[i, col_idx]).strip().replace('.0', '')
                 if product_code and comic_no and product_code != 'nan' and comic_no != 'nan':
-                    comic_to_product[comic_no] = {'code': product_code, 'type': 'set'}
+                    comic_to_product[comic_no] = {'code': product_code, 'type': type_label}
             except:
                 continue
 
-    # 単品シート: A列=商品コード, E列=コミックNo
-    if excel_tanpin_df is not None:
-        for i in range(len(excel_tanpin_df)):
-            try:
-                product_code = str(excel_tanpin_df.iloc[i, 0]).strip()
-                comic_no = str(excel_tanpin_df.iloc[i, 4]).strip().replace('.0', '')
-                if product_code and comic_no and product_code != 'nan' and comic_no != 'nan':
-                    comic_to_product[comic_no] = {'code': product_code, 'type': 'tanpin'}
-            except:
-                continue
+    # セット品=D列(3) / 単品=E列(4) / 予約=D列(3)
+    _build_mapping(excel_set_df, 3, 'set')
+    _build_mapping(excel_tanpin_df, 4, 'tanpin')
+    _build_mapping(excel_yoyaku_df, 3, 'yoyaku')
 
     # 追加画像読み込み
     additional_1_path = os.path.join(additional_dir, "additional_1.jpg")
@@ -1719,36 +1722,38 @@ def prepare_yahoo_zips(images: list, excel_set_df, excel_tanpin_df, additional_d
         with open(additional_2_path, 'rb') as f:
             additional_2_data = f.read()
 
-    # ファイルリスト構築
+    # ファイルリスト構築（出品シート全量を基準にループ）
     file_entries = []  # [(filename, bytes)]
     mapped_count = 0
-    unmapped = []
+    unmapped = []        # 商品コードはあるが画像が未取得
+    no_image = []        # 画像辞書に存在しない（不足取得漏れ／既存DL失敗など）
     logs = []
 
-    for img in images:
-        comic_no = str(img['comic_no']).strip()
-        mapping = comic_to_product.get(comic_no)
+    for comic_no, mapping in comic_to_product.items():
+        product_code = mapping['code']
+        ctype = mapping['type']
 
-        if not mapping:
-            unmapped.append(comic_no)
-            logs.append(f"⚠️ {comic_no}: 商品コードが見つかりません")
+        image_data = target_image_map.get(comic_no)
+        if not image_data:
+            no_image.append(comic_no)
+            logs.append(f"⚠️ {comic_no} → {product_code}: 画像が未取得のためスキップ")
             continue
 
-        product_code = mapping['code']
-        is_set = mapping['type'] == 'set'
-
         # メイン画像
-        file_entries.append((f"{product_code}.jpg", img['image_data']))
+        file_entries.append((f"{product_code}.jpg", image_data))
 
-        # セット品のみ追加画像
-        if is_set:
+        # セット品・予約は追加画像（_1 / _2）を付与。単品はメインのみ
+        with_additional = ctype in ('set', 'yoyaku')
+        if with_additional:
             if additional_1_data:
                 file_entries.append((f"{product_code}_1.jpg", additional_1_data))
             if additional_2_data:
                 file_entries.append((f"{product_code}_2.jpg", additional_2_data))
 
         mapped_count += 1
-        logs.append(f"✅ {comic_no} → {product_code} {'(セット品+追加画像)' if is_set else '(単品)'}")
+        type_jp = {'set': 'セット品', 'tanpin': '単品', 'yoyaku': '予約'}.get(ctype, ctype)
+        suffix = '+追加画像' if with_additional else 'メインのみ'
+        logs.append(f"✅ {comic_no} → {product_code} ({type_jp}・{suffix})")
 
     # ZIP分割生成
     zip_buffers = []
@@ -1782,6 +1787,7 @@ def prepare_yahoo_zips(images: list, excel_set_df, excel_tanpin_df, additional_d
         'zips': zip_buffers,
         'mapped': mapped_count,
         'unmapped': unmapped,
+        'no_image': no_image,
         'total_files': len(file_entries),
         'logs': logs
     }
@@ -3717,10 +3723,12 @@ if mode == "🎨 クリエイティブスタジオ":
         </div>
         """, unsafe_allow_html=True)
 
-        # Step ③の画像確認
+        # Step ③の画像（不足分）と Step① のチェック結果（検索対象の全量）
         images = st.session_state.workflow_data.get('downloaded_images', [])
-        if not images:
-            st.warning("Step ③で画像を取得してください。")
+        check_results_all = st.session_state.workflow_data.get('check_results', [])
+        # ヤフーZIPは全量（不足＋既存）を対象とするため、どちらかがあれば表示
+        if not images and not check_results_all:
+            st.warning("Step ①でチェック実行、Step ③で画像を取得してください。")
             if st.button("← Step ③に戻る"):
                 st.session_state.workflow_step = 3
                 st.rerun()
@@ -3728,7 +3736,13 @@ if mode == "🎨 クリエイティブスタジオ":
             n_set = len([i for i in images if i.get('type') == 'set'])
             n_tanpin = len([i for i in images if i.get('type') == 'tanpin'])
             n_yoyaku = len([i for i in images if i.get('type') == 'yoyaku'])
-            st.info(f"対象画像: {len(images)}件（セット品: {n_set}件 / 単品: {n_tanpin}件 / 予約: {n_yoyaku}件）")
+            n_exist = len([r for r in check_results_all if r.get('存在') == '✅ あり'])
+            st.info(
+                f"不足画像（取得済）: {len(images)}件（セット品: {n_set}件 / 単品: {n_tanpin}件 / 予約: {n_yoyaku}件） ／ "
+                f"既存画像（R-Cabinetにあり）: {n_exist}件"
+            )
+            if not images:
+                st.caption("※ 不足画像は0件です。楽天タブはアップロード対象なし、ヤフータブは既存画像のみで全量ZIPを生成します。")
 
             tab_rakuten, tab_yahoo = st.tabs(["🏪 楽天アップロード", "🛒 ヤフー準備"])
 
@@ -3738,6 +3752,8 @@ if mode == "🎨 クリエイティブスタジオ":
             with tab_rakuten:
                 st.markdown("### R-Cabinet APIアップロード")
                 st.caption("種別ごとに /comic/comic-{set|tanpin|yoyaku} 配下の最新サブフォルダへアップロードします。2000件埋まっている場合は連番＋1のフォルダを自動作成します。")
+                if not images:
+                    st.info("不足画像が0件のため、楽天へのアップロード対象はありません（既にR-Cabinetに存在）。ヤフータブで全量ZIPを生成できます。")
 
                 # フォルダ最新化
                 col_r1, col_r2 = st.columns([1, 1])
@@ -3937,9 +3953,14 @@ if mode == "🎨 クリエイティブスタジオ":
             # ============================================
             with tab_yahoo:
                 st.markdown("### データフォーマットExcel")
+                st.caption(
+                    "ヤフーZIPは **検索対象の全量**（不足画像＋既存R-Cabinet画像）を対象にします。"
+                    "既存画像はR-CabinetのURLから取得し、取得できないもの（RECフォルダのみ／URL無し）はスキップします。"
+                )
 
                 excel_set_df = None
                 excel_tanpin_df = None
+                excel_yoyaku_df = None
 
                 # Step ①で出品シートExcelが読み込み済みか確認
                 yahoo_from_step1 = st.session_state.workflow_data.get('yahoo_excel_files')
@@ -3949,17 +3970,22 @@ if mode == "🎨 クリエイティブスタジオ":
                     try:
                         set_dfs = []
                         tanpin_dfs = []
+                        yoyaku_dfs = []
                         for fd in yahoo_from_step1:
                             df = pd.read_excel(BytesIO(fd['bytes']), sheet_name=0, header=None)
                             if fd['type'] == 'set':
                                 set_dfs.append(df)
+                            elif fd['type'] == 'yoyaku':
+                                yoyaku_dfs.append(df)
                             else:
                                 tanpin_dfs.append(df)
                         if set_dfs:
                             excel_set_df = pd.concat(set_dfs, ignore_index=True)
                         if tanpin_dfs:
                             excel_tanpin_df = pd.concat(tanpin_dfs, ignore_index=True)
-                        st.caption(f"セット品: {len(set_dfs)}ファイル / 単品: {len(tanpin_dfs)}ファイル")
+                        if yoyaku_dfs:
+                            excel_yoyaku_df = pd.concat(yoyaku_dfs, ignore_index=True)
+                        st.caption(f"セット品: {len(set_dfs)}ファイル / 単品: {len(tanpin_dfs)}ファイル / 予約: {len(yoyaku_dfs)}ファイル")
                     except Exception as e:
                         st.error(f"Excel読み込みエラー: {e}")
                         yahoo_from_step1 = None
@@ -3968,7 +3994,8 @@ if mode == "🎨 クリエイティブスタジオ":
                     st.info(
                         "**出品シートExcelをアップロード（複数可）**\n\n"
                         "- セット品 → A列: 商品コード ／ D列: コミックNo\n"
-                        "- 単品 → A列: 商品コード ／ E列: コミックNo\n\n"
+                        "- 単品 → A列: 商品コード ／ E列: コミックNo\n"
+                        "- 予約 → A列: 商品コード ／ D列: コミックNo\n\n"
                         "各ファイルの **Sheet1** が読み込まれます。"
                     )
                     yahoo_excels = st.file_uploader("Excelファイル", type=['xlsx', 'xls'], key="yahoo_excel", accept_multiple_files=True)
@@ -3976,10 +4003,11 @@ if mode == "🎨 クリエイティブスタジオ":
                     if yahoo_excels:
                         set_dfs = []
                         tanpin_dfs = []
+                        yoyaku_dfs = []
                         for idx, yf in enumerate(yahoo_excels):
                             file_type = st.radio(
                                 f"📄 {yf.name}",
-                                ["セット品", "単品"],
+                                ["セット品", "単品", "予約"],
                                 horizontal=True,
                                 key=f"yahoo_ftype_{idx}"
                             )
@@ -3987,6 +4015,8 @@ if mode == "🎨 クリエイティブスタジオ":
                                 df = pd.read_excel(yf, sheet_name=0, header=None)
                                 if file_type == "セット品":
                                     set_dfs.append(df)
+                                elif file_type == "予約":
+                                    yoyaku_dfs.append(df)
                                 else:
                                     tanpin_dfs.append(df)
                             except Exception as e:
@@ -3996,32 +4026,47 @@ if mode == "🎨 クリエイティブスタジオ":
                             excel_set_df = pd.concat(set_dfs, ignore_index=True)
                         if tanpin_dfs:
                             excel_tanpin_df = pd.concat(tanpin_dfs, ignore_index=True)
+                        if yoyaku_dfs:
+                            excel_yoyaku_df = pd.concat(yoyaku_dfs, ignore_index=True)
+
+                # 検索対象（全量）= 不足画像（取得済）＋ 既存画像（R-Cabinetにあり）
+                check_results = st.session_state.workflow_data.get('check_results', [])
+                missing_comic_nos = set(str(img['comic_no']).strip() for img in images)
+                # 既存（存在あり）かつ取得可能（URLあり・RECフォルダ以外）なコミックNo
+                existing_available = {}  # comic_no -> item
+                for r in check_results:
+                    if r.get('存在') != '✅ あり':
+                        continue
+                    folder = (r.get('フォルダ', '') or '')
+                    url = r.get('URL', '')
+                    cno = str(r.get('コミックNo', '')).strip()
+                    if not cno:
+                        continue
+                    if 'REC' in folder.upper() or not url or url == '-':
+                        continue
+                    existing_available[cno] = r
+                available_comic_nos = missing_comic_nos | set(existing_available.keys())
 
                 # プレビュー（どちらの読み込み方法でも共通）
-                if excel_set_df is not None:
-                    with st.expander("マッピングプレビュー", expanded=True):
-                        set_mappings = []
-                        for i in range(len(excel_set_df)):
-                            try:
-                                code = str(excel_set_df.iloc[i, 0]).strip()
-                                cno = str(excel_set_df.iloc[i, 3]).strip().replace('.0', '')
-                                if code != 'nan' and cno != 'nan' and code and cno and cno.replace('_', '').isdigit():
-                                    matched = any(str(img['comic_no']) == cno for img in images)
-                                    set_mappings.append({'商品コード': code, 'コミックNo': cno, '対象画像': '✅' if matched else '❌'})
-                            except:
-                                continue
+                def _preview_rows(df, col_idx):
+                    rows = []
+                    if df is None:
+                        return rows
+                    for i in range(len(df)):
+                        try:
+                            code = str(df.iloc[i, 0]).strip()
+                            cno = str(df.iloc[i, col_idx]).strip().replace('.0', '')
+                            if code != 'nan' and cno != 'nan' and code and cno and cno.replace('_', '').isdigit():
+                                rows.append({'商品コード': code, 'コミックNo': cno, '対象画像': '✅' if cno in available_comic_nos else '❌'})
+                        except:
+                            continue
+                    return rows
 
-                        tanpin_mappings = []
-                        if excel_tanpin_df is not None:
-                            for i in range(len(excel_tanpin_df)):
-                                try:
-                                    code = str(excel_tanpin_df.iloc[i, 0]).strip()
-                                    cno = str(excel_tanpin_df.iloc[i, 4]).strip().replace('.0', '')
-                                    if code != 'nan' and cno != 'nan' and code and cno and cno.replace('_', '').isdigit():
-                                        matched = any(str(img['comic_no']) == cno for img in images)
-                                        tanpin_mappings.append({'商品コード': code, 'コミックNo': cno, '対象画像': '✅' if matched else '❌'})
-                                except:
-                                    continue
+                if excel_set_df is not None or excel_tanpin_df is not None or excel_yoyaku_df is not None:
+                    with st.expander("マッピングプレビュー", expanded=True):
+                        set_mappings = _preview_rows(excel_set_df, 3)
+                        tanpin_mappings = _preview_rows(excel_tanpin_df, 4)
+                        yoyaku_mappings = _preview_rows(excel_yoyaku_df, 3)
 
                         if set_mappings:
                             st.markdown(f"**セット品: {len(set_mappings)}件**")
@@ -4029,13 +4074,53 @@ if mode == "🎨 クリエイティブスタジオ":
                         if tanpin_mappings:
                             st.markdown(f"**単品: {len(tanpin_mappings)}件**")
                             st.dataframe(pd.DataFrame(tanpin_mappings), use_container_width=True, height=150)
+                        if yoyaku_mappings:
+                            st.markdown(f"**予約: {len(yoyaku_mappings)}件**")
+                            st.dataframe(pd.DataFrame(yoyaku_mappings), use_container_width=True, height=150)
+                        st.caption(
+                            f"検索対象の画像: 不足取得済 {len(missing_comic_nos)}件 / 既存取得可 {len(existing_available)}件"
+                        )
 
                 # ZIP生成ボタン
                 st.divider()
-                can_generate = excel_set_df is not None
+                can_generate = (excel_set_df is not None or excel_tanpin_df is not None or excel_yoyaku_df is not None)
                 if st.button("📦 ZIP生成", type="primary", disabled=not can_generate, key="yahoo_zip_btn"):
+                    # 画像辞書 target_image_map を構築（不足分＋既存分）
+                    target_image_map = {}
+                    skipped_existing = []
+
+                    # 不足分（Step③取得済の加工画像）
+                    for img in images:
+                        cno = str(img['comic_no']).strip()
+                        if img.get('image_data'):
+                            target_image_map[cno] = img['image_data']
+
+                    # 既存分（R-CabinetのURLから取得）
+                    if existing_available:
+                        dl_progress = st.progress(0, text="既存画像をR-Cabinetから取得中...")
+                        dl_session = requests.Session()
+                        total_existing = len(existing_available)
+                        for i, (cno, item) in enumerate(existing_available.items()):
+                            dl_progress.progress((i + 1) / total_existing, text=f"既存画像取得中... ({i+1}/{total_existing}) {cno}")
+                            url = item.get('URL', '')
+                            try:
+                                resp = dl_session.get(url, timeout=15)
+                                if resp.status_code == 200 and len(resp.content) > 100:
+                                    target_image_map[cno] = resp.content
+                                else:
+                                    skipped_existing.append(cno)
+                            except Exception:
+                                skipped_existing.append(cno)
+                        dl_progress.empty()
+
                     additional_dir = _os.path.join(_os.path.dirname(__file__), "images")
-                    result = prepare_yahoo_zips(images, excel_set_df, excel_tanpin_df, additional_dir)
+                    result = prepare_yahoo_zips(target_image_map, excel_set_df, excel_tanpin_df, excel_yoyaku_df, additional_dir)
+                    # 既存DL失敗分のログを追記
+                    if skipped_existing:
+                        result.setdefault('logs', []).append(
+                            f"⚠️ 既存画像の取得に失敗（スキップ）: {len(skipped_existing)}件 - " + ", ".join(skipped_existing[:20])
+                        )
+                    result['skipped_existing'] = skipped_existing
 
                     st.session_state.workflow_data['yahoo_zips'] = result
                     st.rerun()
@@ -4045,10 +4130,11 @@ if mode == "🎨 クリエイティブスタジオ":
                     result = st.session_state.workflow_data['yahoo_zips']
                     zips = result['zips']
 
-                    col_m1, col_m2, col_m3 = st.columns(3)
+                    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
                     col_m1.metric("マッピング成功", result['mapped'])
-                    col_m2.metric("未マッチ", len(result['unmapped']))
-                    col_m3.metric("ZIP数", len(zips))
+                    col_m2.metric("画像未取得", len(result.get('no_image', [])))
+                    col_m3.metric("既存DL失敗", len(result.get('skipped_existing', [])))
+                    col_m4.metric("ZIP数", len(zips))
 
                     for i, zip_data in enumerate(zips):
                         size_mb = len(zip_data) / (1024 * 1024)
