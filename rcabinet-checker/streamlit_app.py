@@ -4219,7 +4219,12 @@ elif mode == "🛰️ R-Cabi構成把握":
         st.caption("🕒 最終DB同期: 未記録（rcabinet_sync_meta テーブル未作成か、初回同期前）")
 
     if xlsx_latest_btn:
-        # 押下時にフォルダ一覧を取得（初回のみAPI、以降はキャッシュ再利用）
+        # 「最新を取得」は常にAPIから取り直す（新規作成フォルダを反映するためキャッシュを破棄）
+        try:
+            get_all_folders.clear()
+        except Exception:
+            pass
+        st.session_state.folders_loaded = False
         latest_folders, latest_error = _ensure_folders_loaded()
         folders = latest_folders
         if latest_error:
@@ -4825,12 +4830,20 @@ elif mode == "🔁 コピー：R-Cabi⇒R-Cabi":
                         api_file_name = row_data["_file_name"]
 
                         # filePath（URLのファイル名）: 拡張子付き、20バイト制限
-                        file_path_name = f"{row_data['_file_name']}.{ext}"
+                        # 旧実装は末尾から1文字ずつ削っていたため、巻数サフィックス（_1〜_12 等）の
+                        # 数字が落ちて kg-26azmy-00001_.jpg のように潰れ、別巻どうしが衝突→上書きしていた。
+                        # 修正: 末尾サフィックスは必ず保持する。20バイト超の場合は
+                        #   1) 商品コード先頭の年度コード "26"（kg-26azmy → kg-azmy）を1回だけ除去
+                        #   2) それでも収まらなければ拡張子(.jpg)を省いて全文を維持
+                        file_path_name = f"{api_file_name}.{ext}"
                         if len(file_path_name.encode("utf-8")) > 20:
-                            stem = row_data["_file_name"]
-                            while len(f"{stem}.{ext}".encode("utf-8")) > 20 and stem:
-                                stem = stem[:-1]
-                            file_path_name = f"{stem}.{ext}"
+                            stem = api_file_name.replace("26", "", 1)  # 先頭側の "26" を1回だけ除去
+                            if len(f"{stem}.{ext}".encode("utf-8")) <= 20:
+                                file_path_name = f"{stem}.{ext}"
+                            elif len(stem.encode("utf-8")) <= 20:
+                                file_path_name = stem            # 拡張子を省いてサフィックスを維持
+                            else:
+                                file_path_name = api_file_name   # 最終手段（fileNameと同一・拡張子なし）
 
                         # アップロード
                         result = upload_image(
@@ -5141,12 +5154,20 @@ elif mode == "☁️ コピー：Local⇒R-Cabi":
                         api_file_name = row_data["_file_name"]
 
                         # filePath（URLのファイル名）: 拡張子付き、20バイト制限
-                        file_path_name = f"{row_data['_file_name']}.{ext}"
+                        # 旧実装は末尾から1文字ずつ削っていたため、巻数サフィックス（_1〜_12 等）の
+                        # 数字が落ちて kg-26azmy-00001_.jpg のように潰れ、別巻どうしが衝突→上書きしていた。
+                        # 修正: 末尾サフィックスは必ず保持する。20バイト超の場合は
+                        #   1) 商品コード先頭の年度コード "26"（kg-26azmy → kg-azmy）を1回だけ除去
+                        #   2) それでも収まらなければ拡張子(.jpg)を省いて全文を維持
+                        file_path_name = f"{api_file_name}.{ext}"
                         if len(file_path_name.encode("utf-8")) > 20:
-                            stem = row_data["_file_name"]
-                            while len(f"{stem}.{ext}".encode("utf-8")) > 20 and stem:
-                                stem = stem[:-1]
-                            file_path_name = f"{stem}.{ext}"
+                            stem = api_file_name.replace("26", "", 1)  # 先頭側の "26" を1回だけ除去
+                            if len(f"{stem}.{ext}".encode("utf-8")) <= 20:
+                                file_path_name = f"{stem}.{ext}"
+                            elif len(stem.encode("utf-8")) <= 20:
+                                file_path_name = stem            # 拡張子を省いてサフィックスを維持
+                            else:
+                                file_path_name = api_file_name   # 最終手段（fileNameと同一・拡張子なし）
 
                         # アップロード
                         result = upload_image(
