@@ -4829,21 +4829,30 @@ elif mode == "🔁 コピー：R-Cabi⇒R-Cabi":
                         # fileName（画像名）: 拡張子なし
                         api_file_name = row_data["_file_name"]
 
-                        # filePath（URLのファイル名）: 拡張子付き、20バイト制限
-                        # 旧実装は末尾から1文字ずつ削っていたため、巻数サフィックス（_1〜_12 等）の
-                        # 数字が落ちて kg-26azmy-00001_.jpg のように潰れ、別巻どうしが衝突→上書きしていた。
-                        # 修正: 末尾サフィックスは必ず保持する。20バイト超の場合は
-                        #   1) 商品コード先頭の年度コード "26"（kg-26azmy → kg-azmy）を1回だけ除去
-                        #   2) それでも収まらなければ拡張子(.jpg)を省いて全文を維持
+                        # filePath（URLスラッグ）: 原則「画像名 + 拡張子」。
+                        # ただし R-Cabinet の filePath は 20バイト制限があり、画像名が長いと "画像名.jpg" が
+                        # 超過する。旧実装は末尾から1文字ずつ削っていたため巻数サフィックス(_1〜_12 等)の数字が
+                        # 落ち、別巻どうしが kg-...001_.jpg のように衝突→上書きしていた。
+                        # 修正方針: 巻数サフィックスは絶対に壊さない。20バイト超の場合は
+                        #   1) まず拡張子(.jpg)を外して画像名そのものを filePath にする
+                        #      （R-Cabinet は拡張子なしの filePath を許容。例: 92317 等の運用実績あり）
+                        #   2) 画像名自体が20バイトを超える場合のみ、_N サフィックスを維持したまま
+                        #      ベース部（_ の前）を末尾から短縮する
                         file_path_name = f"{api_file_name}.{ext}"
                         if len(file_path_name.encode("utf-8")) > 20:
-                            stem = api_file_name.replace("26", "", 1)  # 先頭側の "26" を1回だけ除去
-                            if len(f"{stem}.{ext}".encode("utf-8")) <= 20:
-                                file_path_name = f"{stem}.{ext}"
-                            elif len(stem.encode("utf-8")) <= 20:
-                                file_path_name = stem            # 拡張子を省いてサフィックスを維持
+                            if len(api_file_name.encode("utf-8")) <= 20:
+                                file_path_name = api_file_name          # 拡張子を外して全文維持
                             else:
-                                file_path_name = api_file_name   # 最終手段（fileNameと同一・拡張子なし）
+                                base, sep, suffix = api_file_name.rpartition("_")
+                                if sep:
+                                    while base and len(f"{base}_{suffix}".encode("utf-8")) > 20:
+                                        base = base[:-1]
+                                    file_path_name = f"{base}_{suffix}" if base else suffix
+                                else:
+                                    trimmed = api_file_name
+                                    while trimmed and len(trimmed.encode("utf-8")) > 20:
+                                        trimmed = trimmed[:-1]
+                                    file_path_name = trimmed
 
                         # アップロード
                         result = upload_image(
@@ -5153,21 +5162,30 @@ elif mode == "☁️ コピー：Local⇒R-Cabi":
                         # fileName（画像名）: 拡張子なし
                         api_file_name = row_data["_file_name"]
 
-                        # filePath（URLのファイル名）: 拡張子付き、20バイト制限
-                        # 旧実装は末尾から1文字ずつ削っていたため、巻数サフィックス（_1〜_12 等）の
-                        # 数字が落ちて kg-26azmy-00001_.jpg のように潰れ、別巻どうしが衝突→上書きしていた。
-                        # 修正: 末尾サフィックスは必ず保持する。20バイト超の場合は
-                        #   1) 商品コード先頭の年度コード "26"（kg-26azmy → kg-azmy）を1回だけ除去
-                        #   2) それでも収まらなければ拡張子(.jpg)を省いて全文を維持
+                        # filePath（URLスラッグ）: 原則「画像名 + 拡張子」。
+                        # ただし R-Cabinet の filePath は 20バイト制限があり、画像名が長いと "画像名.jpg" が
+                        # 超過する。旧実装は末尾から1文字ずつ削っていたため巻数サフィックス(_1〜_12 等)の数字が
+                        # 落ち、別巻どうしが kg-...001_.jpg のように衝突→上書きしていた。
+                        # 修正方針: 巻数サフィックスは絶対に壊さない。20バイト超の場合は
+                        #   1) まず拡張子(.jpg)を外して画像名そのものを filePath にする
+                        #      （R-Cabinet は拡張子なしの filePath を許容。例: 92317 等の運用実績あり）
+                        #   2) 画像名自体が20バイトを超える場合のみ、_N サフィックスを維持したまま
+                        #      ベース部（_ の前）を末尾から短縮する
                         file_path_name = f"{api_file_name}.{ext}"
                         if len(file_path_name.encode("utf-8")) > 20:
-                            stem = api_file_name.replace("26", "", 1)  # 先頭側の "26" を1回だけ除去
-                            if len(f"{stem}.{ext}".encode("utf-8")) <= 20:
-                                file_path_name = f"{stem}.{ext}"
-                            elif len(stem.encode("utf-8")) <= 20:
-                                file_path_name = stem            # 拡張子を省いてサフィックスを維持
+                            if len(api_file_name.encode("utf-8")) <= 20:
+                                file_path_name = api_file_name          # 拡張子を外して全文維持
                             else:
-                                file_path_name = api_file_name   # 最終手段（fileNameと同一・拡張子なし）
+                                base, sep, suffix = api_file_name.rpartition("_")
+                                if sep:
+                                    while base and len(f"{base}_{suffix}".encode("utf-8")) > 20:
+                                        base = base[:-1]
+                                    file_path_name = f"{base}_{suffix}" if base else suffix
+                                else:
+                                    trimmed = api_file_name
+                                    while trimmed and len(trimmed.encode("utf-8")) > 20:
+                                        trimmed = trimmed[:-1]
+                                    file_path_name = trimmed
 
                         # アップロード
                         result = upload_image(
