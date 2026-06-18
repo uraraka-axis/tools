@@ -5,9 +5,11 @@ import time
 import io
 import re
 import random
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
-from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from supabase import create_client
 
@@ -194,11 +196,33 @@ def db_load_price_history(jan_codes=None):
 db_load_shipping_params()
 
 # --- サイドバー: 検索設定 ---
+DEFAULT_EXCLUDE_KEYWORDS = "保証\n加入料\nまごころ\nあんしん\n安心保証\nワランティ\n延長\nサービス料\n設置料"
+
 with st.sidebar:
     st.header("検索設定")
     max_items = st.number_input("1商品あたりの最大取得件数", min_value=1, max_value=30, value=5)
     delay = st.number_input("リクエスト間隔（秒）", min_value=0.5, max_value=5.0, value=1.0, step=0.5)
 
+    st.markdown("---")
+    st.subheader("除外フィルタ")
+    exclude_keywords_text = st.text_area(
+        "除外キーワード（改行区切り）",
+        value=DEFAULT_EXCLUDE_KEYWORDS,
+        height=160,
+        help="商品名・キャッチ・商品説明のいずれかに含まれたら除外",
+    )
+    price_ratio_min = st.slider(
+        "上代に対する下限比率(%)", 0, 50, 20, 5,
+        help="上代×この比率未満の商品は別商品/保証品とみなして除外（0で無効）",
+    )
+    shop_blacklist_text = st.text_area(
+        "ショップ名ブラックリスト（改行区切り）",
+        value="ぐーみんラボ",
+        height=80,
+        help="ショップ名に部分一致したら除外",
+    )
+
+    st.markdown("---")
     # 送料パラメータキャッシュ状況
     cache_count = len(st.session_state.get("shipping_params_cache", {}))
     if cache_count > 0:
@@ -206,6 +230,37 @@ with st.sidebar:
         if st.button("キャッシュクリア", key="clear_cache"):
             st.session_state.pop("shipping_params_cache", None)
             st.rerun()
+
+
+def _parse_lines(text):
+    return [line.strip() for line in (text or "").splitlines() if line.strip()]
+
+
+def is_excluded_listing(row, exclude_keywords, ratio_min, shop_blacklist, list_price):
+    """除外対象かを判定。除外なら(True, 理由)を返す"""
+    shop = str(row.get("楽天ショップ名") or "")
+    for bl in shop_blacklist:
+        if bl and bl in shop:
+            return True, f"ショップ:{bl}"
+
+    text = " ".join([
+        str(row.get("楽天商品名") or ""),
+        str(row.get("キャッチコピー") or ""),
+        str(row.get("商品説明") or ""),
+    ])
+    for kw in exclude_keywords:
+        if kw and kw in text:
+            return True, f"キーワード:{kw}"
+
+    price = row.get("販売価格")
+    if ratio_min > 0 and list_price and price:
+        try:
+            if float(price) / float(list_price) < ratio_min / 100.0:
+                return True, f"価格比率<{ratio_min}%"
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+
+    return False, None
 
 # --- テンプレートダウンロード ---
 st.subheader("1. テンプレート")
@@ -241,48 +296,105 @@ st.download_button(
 st.subheader("2. 商品リストをアップロード")
 uploaded_file = st.file_uploader(
     "商品リスト(.xlsx)をアップロード",
-    type=["xls", "xlsx"],
+    type=["xlsx"],
+    help="旧形式 .xls はサポート対象外です。Excelで開いて .xlsx で保存しなおしてください。",
 )
 
 if not uploaded_file:
-    st.info("テンプレートに沿ったExcelファイルをアップロードしてください")
+    st.info("テンプレートに沿ったExcelファイル(.xlsx)をアップロードしてください")
+    st.stop()
+
+if not uploaded_file.name.lower().endswith(".xlsx"):
+    st.error(
+        "旧形式の .xls には対応していません。"
+        "Excelで一度開いて .xlsx 形式で保存しなおしてからアップロードしてください。"
+    )
     st.stop()
 
 
 # --- Excel読み込み ---
+def _normalize_header(s):
+    return re.sub(r"\s+", "", str(s)) if s is not None else ""
+
+
+def _detect_header_row(file_bytes, sheet_name, engine, max_scan=10):
+    """ヘッダー行を自動判別（JANコード/品番が含まれる行）"""
+    df_raw = pd.read_excel(
+        io.BytesIO(file_bytes), sheet_name=sheet_name, header=None, engine=engine, nrows=max_scan
+    )
+    target_keys = {"JANコード", "JAN", "品番", "上代", "下代", "ブランド", "定価"}
+    for idx, row in df_raw.iterrows():
+        normalized = {_normalize_header(v) for v in row.values}
+        if "JANコード" in normalized or "JAN" in normalized:
+            if "品番" in normalized:
+                return idx
+    return 0
+
+
 @st.cache_data
 def load_excel(file_bytes, file_name):
-    """商品リストを読み込む（テンプレート形式: No., ブランド, JANコード, 品番, 定価）"""
+    """商品リストを読み込む（東谷商品一覧 / テンプレート両対応）"""
     engine = "xlrd" if file_name.endswith(".xls") else "openpyxl"
-    df = pd.read_excel(io.BytesIO(file_bytes), header=0, engine=engine)
 
-    # カラム名を正規化
-    df.columns = [str(c).strip() for c in df.columns]
+    # 利用可能なシート名を確認
+    xl = pd.ExcelFile(io.BytesIO(file_bytes), engine=engine)
+    sheet_name = None
+    for cand in ["東谷商品一覧", "商品リスト"]:
+        if cand in xl.sheet_names:
+            sheet_name = cand
+            break
+    if sheet_name is None:
+        sheet_name = xl.sheet_names[0]
+
+    header_row = _detect_header_row(file_bytes, sheet_name, engine)
+    df = pd.read_excel(
+        io.BytesIO(file_bytes), sheet_name=sheet_name, header=header_row, engine=engine
+    )
+
+    # カラム名を正規化（空白除去、JAN表記揺れ吸収）
+    df.columns = [_normalize_header(c) for c in df.columns]
+    rename_map = {"JAN": "JANコード", "上代": "定価"}
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
     products = []
-    for _, row in df.iterrows():
-        jan = str(row.get("JANコード", "")).strip()
-        code = str(row.get("品番", "")).strip()
+    for excel_row_idx, (_, row) in enumerate(df.iterrows(), start=header_row + 2):
+        jan = str(row.get("JANコード", "")).strip() if pd.notna(row.get("JANコード")) else ""
+        # 数値で読まれたJANを文字列化（末尾の.0除去）
+        if jan.endswith(".0"):
+            jan = jan[:-2]
+        code = str(row.get("品番", "")).strip() if pd.notna(row.get("品番")) else ""
         if not jan and not code:
             continue
         brand = str(row.get("ブランド", "")).strip() if pd.notna(row.get("ブランド")) else ""
         price_raw = row.get("定価")
         price = int(float(price_raw)) if pd.notna(price_raw) and str(price_raw).strip() else 0
+        cost_raw = row.get("下代")
+        cost = int(float(cost_raw)) if pd.notna(cost_raw) and str(cost_raw).strip() else 0
 
         products.append({
             "ブランド": brand,
             "JANコード": jan,
             "品番": code,
             "定価": price,
+            "下代": cost,
+            "_excel_row": excel_row_idx,
         })
-    return pd.DataFrame(products)
+    result = pd.DataFrame(products)
+    return result, {"sheet_name": sheet_name, "header_row": header_row}
 
 
+uploaded_file.seek(0)
 file_bytes = uploaded_file.read()
-products_df = load_excel(file_bytes, uploaded_file.name)
+products_df, input_meta = load_excel(file_bytes, uploaded_file.name)
 
-st.write(f"読み込み結果: **{len(products_df)}商品**")
-st.dataframe(products_df, use_container_width=True)
+st.write(
+    f"読み込み結果: **{len(products_df)}商品** "
+    f"（シート: `{input_meta['sheet_name']}` / ヘッダー行: {input_meta['header_row'] + 1}）"
+)
+st.dataframe(
+    products_df.drop(columns=["_excel_row"], errors="ignore"),
+    use_container_width=True,
+)
 
 # --- フィルタリング ---
 st.markdown("---")
@@ -606,15 +718,21 @@ def scrape_shipping_cost(item_url, session=None):
     return "取得不可"
 
 
-def _run_search(filtered_df, app_id, access_key, max_items, delay, resume=False):
+def _run_search(filtered_df, app_id, access_key, max_items, delay,
+                exclude_keywords=None, ratio_min=0, shop_blacklist=None, resume=False):
     """検索を実行する（途中再開対応）"""
+    exclude_keywords = exclude_keywords or []
+    shop_blacklist = shop_blacklist or []
+
     # 処理済み品番セットを取得（再開時）
     if resume and "search_progress" in st.session_state:
         all_results = list(st.session_state["search_progress"]["results"])
         processed_jans = set(st.session_state["search_progress"]["processed_jans"])
+        excluded_log = list(st.session_state["search_progress"].get("excluded", []))
     else:
         all_results = []
         processed_jans = set()
+        excluded_log = []
         st.session_state.pop("search_progress", None)
 
     # 未処理の商品だけ対象にする
@@ -644,6 +762,29 @@ def _run_search(filtered_df, app_id, access_key, max_items, delay, resume=False)
             rows = extract_price_info(
                 result, row["ブランド"], row["JANコード"], row["品番"], row["定価"]
             )
+
+            # 除外フィルタ適用（出品なし行はそのまま残す）
+            kept_rows = []
+            for r in rows:
+                if r.get("販売価格") is None:
+                    kept_rows.append(r)
+                    continue
+                excluded, reason = is_excluded_listing(
+                    r, exclude_keywords, ratio_min, shop_blacklist, row["定価"]
+                )
+                if excluded:
+                    excluded_log.append({
+                        "品番": row["品番"],
+                        "JANコード": row["JANコード"],
+                        "楽天ショップ名": r.get("楽天ショップ名"),
+                        "楽天商品名": r.get("楽天商品名"),
+                        "販売価格": r.get("販売価格"),
+                        "除外理由": reason,
+                        "商品URL": r.get("商品URL"),
+                    })
+                else:
+                    kept_rows.append(r)
+            rows = kept_rows
 
             # 送料別の商品について送料を並列取得（最大3並列）
             betsu_rows = [r for r in rows if r["送料区分"] == "送料別" and r["商品URL"]]
@@ -706,6 +847,7 @@ def _run_search(filtered_df, app_id, access_key, max_items, delay, resume=False)
         st.session_state["search_progress"] = {
             "results": all_results,
             "processed_jans": processed_jans,
+            "excluded": excluded_log,
         }
 
         time.sleep(delay)
@@ -715,6 +857,7 @@ def _run_search(filtered_df, app_id, access_key, max_items, delay, resume=False)
 
     results_df = pd.DataFrame(all_results)
     st.session_state["results_df"] = results_df
+    st.session_state["excluded_df"] = pd.DataFrame(excluded_log)
     # 完了したら進捗データをクリア
     st.session_state.pop("search_progress", None)
 
@@ -738,18 +881,31 @@ if has_progress:
             if not app_id or not access_key:
                 st.error("secrets.tomlにrakuten_app_idとrakuten_access_keyを設定してください")
                 st.stop()
-            _run_search(filtered_df, app_id, access_key, max_items, delay, resume=True)
+            _run_search(
+                filtered_df, app_id, access_key, max_items, delay,
+                exclude_keywords=_parse_lines(exclude_keywords_text),
+                ratio_min=price_ratio_min,
+                shop_blacklist=_parse_lines(shop_blacklist_text),
+                resume=True,
+            )
     with col_btn2:
         if st.button("最初からやり直す"):
             st.session_state.pop("search_progress", None)
             st.session_state.pop("results_df", None)
+            st.session_state.pop("excluded_df", None)
             st.rerun()
 else:
     if st.button("競合価格を検索", type="primary"):
         if not app_id or not access_key:
             st.error("secrets.tomlにrakuten_app_idとrakuten_access_keyを設定してください")
             st.stop()
-        _run_search(filtered_df, app_id, access_key, max_items, delay, resume=False)
+        _run_search(
+            filtered_df, app_id, access_key, max_items, delay,
+            exclude_keywords=_parse_lines(exclude_keywords_text),
+            ratio_min=price_ratio_min,
+            shop_blacklist=_parse_lines(shop_blacklist_text),
+            resume=False,
+        )
 
 # 途中経過があれば部分結果も表示
 if has_progress and "results_df" not in st.session_state:
@@ -777,6 +933,12 @@ if "results_df" in st.session_state:
     col3.metric("出品なし", not_found)
     col4.metric("総出品件数", total_listings)
 
+    # 除外ログ
+    if "excluded_df" in st.session_state and not st.session_state["excluded_df"].empty:
+        excluded_df = st.session_state["excluded_df"]
+        with st.expander(f"除外された出品 {len(excluded_df)}件（クリックで詳細）"):
+            st.dataframe(excluded_df, use_container_width=True, height=300)
+
     # 結果テーブル（F〜I列は非表示）
     display_df = results_df.drop(columns=["楽天商品名", "キャッチコピー", "楽天商品コード", "商品説明"], errors="ignore")
     st.dataframe(
@@ -801,6 +963,9 @@ if "results_df" in st.session_state:
             min_total = int(g.loc[min_idx, "合計金額"])
             max_total = int(g.loc[max_idx, "合計金額"])
             avg_total = int(round(g["合計金額"].mean()))
+            avg_body = int(round(g["販売価格"].mean()))
+            shipping_vals = g["送料金額"].dropna()
+            avg_shipping = int(round(shipping_vals.mean())) if len(shipping_vals) > 0 else None
             list_price = g["定価"].iloc[0]
             return pd.Series({
                 "出品数": len(g),
@@ -812,6 +977,8 @@ if "results_df" in st.session_state:
                 "最高値_本体": int(g.loc[max_idx, "販売価格"]),
                 "最高値_送料": int(g.loc[max_idx, "送料金額"]) if pd.notna(g.loc[max_idx, "送料金額"]) else None,
                 "平均合計": avg_total,
+                "平均_本体": avg_body,
+                "平均_送料": avg_shipping,
                 "平均_定価比率": round(avg_total / list_price * 100, 1) if list_price > 0 else None,
                 "最安値_URL": g.loc[min_idx, "商品URL"],
                 "最高値_URL": g.loc[max_idx, "商品URL"],
@@ -840,29 +1007,206 @@ if "results_df" in st.session_state:
                 "最高値_本体": "¥{:,.0f}",
                 "最高値_送料": lambda x: f"¥{x:,.0f}" if pd.notna(x) else "不明",
                 "平均合計": "¥{:,.0f}",
+                "平均_本体": "¥{:,.0f}",
+                "平均_送料": lambda x: f"¥{x:,.0f}" if pd.notna(x) else "不明",
                 "平均_定価比率": lambda x: f"{x}%" if pd.notna(x) else "",
             }),
             use_container_width=True,
         )
 
-    # --- Excelダウンロード ---
+    # --- Excelダウンロード（インプットファイルに最安/最高/平均を書き戻し） ---
     st.subheader("ダウンロード")
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        results_df.to_excel(writer, sheet_name="全出品一覧", index=False)
-        ws1 = writer.sheets["全出品一覧"]
-        style_excel_sheet(ws1, col_widths=[14, 18, 16, 12, 24, 30, 30, 20, 40, 12, 10, 12, 12, 12, 12, 12, 40])
-        if not valid.empty:
-            summary.to_excel(writer, sheet_name="品番別サマリー", index=False)
-            ws2 = writer.sheets["品番別サマリー"]
-            style_excel_sheet(ws2)
-    output.seek(0)
-    st.download_button(
-        label="Excelでダウンロード",
-        data=output,
-        file_name="rakuten_price_check.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+
+    def write_back_to_input(file_bytes, sheet_name, header_row_zero_idx,
+                            products_df, summary_df, results_df, excluded_df):
+        """元の入力Excelを開き、東谷商品一覧シートのO-AF列に最安/最高/平均を書き込む。"""
+        wb = load_workbook(io.BytesIO(file_bytes))
+        if sheet_name not in wb.sheetnames:
+            sheet_name = wb.sheetnames[0]
+        ws = wb[sheet_name]
+
+        sub_header_row = header_row_zero_idx + 1  # 1-indexed
+        super_header_row = sub_header_row - 1     # 1-indexed
+
+        # 列グループ：(ラベル, 開始列番号)
+        groups = [
+            ("最安値", 15),  # O
+            ("最高値", 21),  # U
+            ("平均値", 27),  # AA
+        ]
+        sub_labels = ["製品+送料", "製品価格", "送料", "定価比率", "粗利", "粗利率"]
+
+        # スタイル
+        super_font = Font(name="Meiryo UI", bold=True, color="FFFFFF", size=10)
+        super_fills = {
+            "最安値": PatternFill(start_color="2E75B6", end_color="2E75B6", fill_type="solid"),
+            "最高値": PatternFill(start_color="C00000", end_color="C00000", fill_type="solid"),
+            "平均値": PatternFill(start_color="548235", end_color="548235", fill_type="solid"),
+        }
+        sub_font = Font(name="Meiryo UI", bold=True, color="FFFFFF", size=10)
+        sub_fill = PatternFill(start_color="305496", end_color="305496", fill_type="solid")
+        body_font = Font(name="Meiryo UI", size=10)
+        center = Alignment(horizontal="center", vertical="center")
+        thin = Side(border_style="thin", color="BFBFBF")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        # 上段ヘッダー（最安値/最高値/平均値）— ヘッダー行が1行目より上の場合はスキップ
+        if super_header_row >= 1:
+            for label, start_col in groups:
+                ws.cell(row=super_header_row, column=start_col, value=label)
+                # 既存マージとの競合を避けるためアンマージしてから再マージ
+                try:
+                    ws.merge_cells(
+                        start_row=super_header_row, start_column=start_col,
+                        end_row=super_header_row, end_column=start_col + 5,
+                    )
+                except Exception:
+                    pass
+                for off in range(6):
+                    cell = ws.cell(row=super_header_row, column=start_col + off)
+                    cell.font = super_font
+                    cell.fill = super_fills[label]
+                    cell.alignment = center
+                    cell.border = border
+
+        # 下段ヘッダー（製品+送料/製品価格/送料/定価比率/粗利/粗利率）
+        for _, start_col in groups:
+            for off, label in enumerate(sub_labels):
+                cell = ws.cell(row=sub_header_row, column=start_col + off, value=label)
+                cell.font = sub_font
+                cell.fill = sub_fill
+                cell.alignment = center
+                cell.border = border
+
+        # 列幅
+        for _, start_col in groups:
+            for off in range(6):
+                ws.column_dimensions[get_column_letter(start_col + off)].width = 13
+
+        # 行マッピング: (JANコード, 品番) -> _excel_row
+        excel_row_map = {}
+        for _, prow in products_df.iterrows():
+            key = (str(prow["JANコード"]), str(prow["品番"]))
+            excel_row_map[key] = int(prow["_excel_row"])
+
+        # データ書き込み
+        currency_fmt = "¥#,##0"
+        percent_fmt = "0.0%"
+
+        if summary_df is not None and not summary_df.empty:
+            for _, srow in summary_df.iterrows():
+                key = (str(srow["JANコード"]), str(srow["品番"]))
+                r = excel_row_map.get(key)
+                if r is None:
+                    continue
+
+                blocks = [
+                    # (start_col, total, body, shipping, ratio_letter_pair, profit_letters)
+                    (15, srow["最安値_合計"], srow["最安値_本体"], srow["最安値_送料"], "O", "S"),
+                    (21, srow["最高値_合計"], srow["最高値_本体"], srow["最高値_送料"], "U", "Y"),
+                    (27, srow["平均合計"], srow["平均_本体"], srow["平均_送料"], "AA", "AE"),
+                ]
+
+                for start_col, total, body, shipping, total_letter, profit_letter in blocks:
+                    # 製品+送料
+                    c = ws.cell(row=r, column=start_col, value=int(total) if pd.notna(total) else None)
+                    c.number_format = currency_fmt
+                    # 製品価格
+                    c = ws.cell(row=r, column=start_col + 1, value=int(body) if pd.notna(body) else None)
+                    c.number_format = currency_fmt
+                    # 送料
+                    c = ws.cell(row=r, column=start_col + 2,
+                                value=int(shipping) if pd.notna(shipping) else None)
+                    c.number_format = currency_fmt
+                    # 定価比率 = total/H
+                    c = ws.cell(row=r, column=start_col + 3,
+                                value=f'=IFERROR({total_letter}{r}/H{r},"")')
+                    c.number_format = percent_fmt
+                    # 粗利 = total - I
+                    c = ws.cell(row=r, column=start_col + 4,
+                                value=f'=IFERROR({total_letter}{r}-I{r},"")')
+                    c.number_format = currency_fmt
+                    # 粗利率 = profit / total
+                    c = ws.cell(row=r, column=start_col + 5,
+                                value=f'=IFERROR({profit_letter}{r}/{total_letter}{r},"")')
+                    c.number_format = percent_fmt
+
+        # データ範囲全体に罫線・フォントを一括適用（書込のない行も含めて整える）
+        if not products_df.empty:
+            data_first_row = sub_header_row + 1
+            data_last_row = int(products_df["_excel_row"].max())
+            right_align = Alignment(horizontal="right", vertical="center")
+            for r in range(data_first_row, data_last_row + 1):
+                for col in range(15, 33):  # O(15) - AF(32)
+                    cell = ws.cell(row=r, column=col)
+                    cell.font = body_font
+                    cell.border = border
+                    cell.alignment = right_align
+
+        # 別シートとして全出品一覧と除外ログを追加
+        if "全出品一覧" in wb.sheetnames:
+            del wb["全出品一覧"]
+        ws_all = wb.create_sheet("全出品一覧")
+        for col_idx, col_name in enumerate(results_df.columns, 1):
+            ws_all.cell(row=1, column=col_idx, value=col_name)
+        for r_idx, (_, drow) in enumerate(results_df.iterrows(), 2):
+            for col_idx, col_name in enumerate(results_df.columns, 1):
+                val = drow[col_name]
+                if pd.isna(val):
+                    val = None
+                ws_all.cell(row=r_idx, column=col_idx, value=val)
+        style_excel_sheet(ws_all, col_widths=[14, 18, 16, 12, 24, 30, 30, 20, 40, 12, 10, 12, 12, 12, 12, 12, 40])
+
+        if excluded_df is not None and not excluded_df.empty:
+            if "除外ログ" in wb.sheetnames:
+                del wb["除外ログ"]
+            ws_ex = wb.create_sheet("除外ログ")
+            for col_idx, col_name in enumerate(excluded_df.columns, 1):
+                ws_ex.cell(row=1, column=col_idx, value=col_name)
+            for r_idx, (_, drow) in enumerate(excluded_df.iterrows(), 2):
+                for col_idx, col_name in enumerate(excluded_df.columns, 1):
+                    val = drow[col_name]
+                    if pd.isna(val):
+                        val = None
+                    ws_ex.cell(row=r_idx, column=col_idx, value=val)
+            style_excel_sheet(ws_ex)
+
+        out = io.BytesIO()
+        wb.save(out)
+        out.seek(0)
+        return out
+
+    excluded_df_for_export = st.session_state.get("excluded_df", pd.DataFrame())
+
+    # 念のため uploaded_file からファイル内容を再取得
+    uploaded_file.seek(0)
+    fresh_file_bytes = uploaded_file.read()
+
+    if not fresh_file_bytes:
+        st.error(
+            "アップロードファイルの読み込みに失敗しました。ファイルを再アップロードしてください。"
+        )
+    else:
+        try:
+            output = write_back_to_input(
+                fresh_file_bytes,
+                input_meta["sheet_name"],
+                input_meta["header_row"],
+                products_df,
+                summary if not valid.empty else pd.DataFrame(),
+                results_df,
+                excluded_df_for_export,
+            )
+            base_name = uploaded_file.name.rsplit(".", 1)[0]
+            date_str = datetime.now().strftime("%Y%m%d")
+            st.download_button(
+                label="価格情報を追記してダウンロード",
+                data=output,
+                file_name=f"{base_name}_{date_str}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        except Exception as e:
+            st.error(f"書き戻し処理でエラーが発生しました: {e}")
 
 # --- 価格推移 ---
 if supabase is not None:
