@@ -51,6 +51,12 @@ output/
 *.pem
 *.key
 .streamlit/secrets.toml
+# どの階層の secrets.toml / 認証ファイルも除外（ネスト対策）
+secrets.toml
+**/.streamlit/secrets.toml
+credentials.json
+token.pickle
+token.json
 
 # Executables (keep source code only)
 *.exe
