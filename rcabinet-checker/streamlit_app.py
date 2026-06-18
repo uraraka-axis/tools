@@ -107,6 +107,29 @@ BASE_URL = "https://api.rms.rakuten.co.jp/es/1.0"
 SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
 SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "")
 
+# Yahoo!ショッピング接続情報（secrets.toml の [yahoo] セクション）
+# access_tokenは1時間で失効するため、refresh_tokenを保存し実行時に都度取得する
+_yahoo_secrets = st.secrets.get("yahoo", {})
+YAHOO_CLIENT_ID = _yahoo_secrets.get("client_id", "")
+YAHOO_CLIENT_SECRET = _yahoo_secrets.get("client_secret", "")
+YAHOO_REFRESH_TOKEN = _yahoo_secrets.get("refresh_token", "")
+YAHOO_SELLER_ID = _yahoo_secrets.get("seller_id", "haru-urarakana")
+YAHOO_TOKEN_URL = "https://auth.login.yahoo.co.jp/yconnect/v2/token"
+# 商品画像一括アップロード（メイン=商品コード.jpg / 追加=商品コード_1〜20.jpg）
+YAHOO_UPLOAD_URL = "https://circus.shopping.yahooapis.jp/ShoppingWebService/V1/uploadItemImagePack"
+
+# Google Sheets（楽天RMS画像フォルダ管理シートへの追記用）。secrets.toml の [google] セクション
+# access_token相当は保持せず、refresh_tokenから都度生成（ローカル/Cloud両対応・ブラウザ不要）
+_google_secrets = st.secrets.get("google", {})
+GOOGLE_CLIENT_ID = _google_secrets.get("client_id", "")
+GOOGLE_CLIENT_SECRET = _google_secrets.get("client_secret", "")
+GOOGLE_REFRESH_TOKEN = _google_secrets.get("refresh_token", "")
+FOLDER_MGMT_SPREADSHEET_ID = _google_secrets.get("spreadsheet_id", "1NJiJA-5e9QSKDXuBopIqH4eQqYCGT_PUl9M8BeXd0gs")
+GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
+# 種別 → 管理シートのタブ(gid) と カテゴリ２表記
+FOLDER_MGMT_GID = {"set": 1054713835, "tanpin": 1272877390, "yoyaku": 52499463}
+FOLDER_MGMT_CAT2 = {"set": "セット", "tanpin": "単品", "yoyaku": "予約"}
+
 # GitHub接続情報
 GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN", "")
 GITHUB_REPO = "uraraka-axis/tools"
@@ -492,6 +515,12 @@ def sync_images_to_db(images: list) -> dict:
             supabase.table("rcabinet_images").delete()\
                 .eq("folder_name", folder_name).eq("file_name", file_name).execute()
 
+        # DB更新したのでキャッシュを無効化（次回の存在チェックで最新を読む）
+        try:
+            load_images_from_db.clear()
+        except Exception:
+            pass
+
         return {
             "success": True,
             "new": new_count,
@@ -505,16 +534,24 @@ def sync_images_to_db(images: list) -> dict:
         return {"success": False, "error": str(e)}
 
 
+@st.cache_data(ttl=300, show_spinner=False)
 def load_images_from_db() -> tuple[list, str]:
-    """DBから画像一覧を読み込み（ページネーション対応）。
+    """DBから画像一覧を読み込み（ページネーション対応・5分キャッシュ）。
     1行 = 1(folder, file) なので JSON展開は不要。
+    存在チェックは件数に関わらず全件ロードする固定コストが大きいため、
+    キャッシュで2回目以降を高速化する（sync_images_to_db成功時にclearで無効化）。
     """
     supabase = get_supabase_client()
     if not supabase:
         return [], "Supabase未設定"
 
     try:
-        all_data = fetch_all_from_supabase(supabase, "rcabinet_images", "*")
+        # 存在チェックで使うカラムだけ取得してペイロードを削減
+        all_data = fetch_all_from_supabase(
+            supabase,
+            "rcabinet_images",
+            "folder_name,folder_path,file_name,file_url,file_size,file_timestamp",
+        )
         images = [
             {
                 "FolderName": row.get("folder_name", ""),
@@ -1677,6 +1714,11 @@ def process_workflow_images(missing_comics: list, is_list_content: str, comic_li
 def prepare_yahoo_zips(target_image_map: dict, excel_set_df, excel_tanpin_df, excel_yoyaku_df, additional_dir: str) -> dict:
     """ヤフー用にリネーム＋追加画像＋ZIP分割生成（検索対象の全量ベース）。
 
+    追加画像（_1=透明カバー / _2=セット表記）の付与は商品単位で出品シートの「不要欄」で制御:
+      - セット品/予約: AG列(32)=不要:透明カバー(_1) / AH列(33)=不要:セット表記(_2)
+      - 単品:          AB列(27)=不要:透明カバー(_1) / AC列(28)=不要:セット表記(_2)
+      不要欄に値（〇等）が入っていれば付けない／空なら付ける。
+
     Args:
         target_image_map: {comic_no(str): image_data(bytes)}。不足分（Step③取得）と
                           既存分（R-Cabinet URL取得）を統合済みの画像辞書。
@@ -1690,25 +1732,66 @@ def prepare_yahoo_zips(target_image_map: dict, excel_set_df, excel_tanpin_df, ex
 
     MAX_ZIP_SIZE = 25 * 1024 * 1024  # 25MB
 
-    # コミックNo → {code, type} のマッピングを出品シート（＝検索対象の全量）から構築
+    # コミックNo → {code, type, add_1, add_2} のマッピングを出品シート（＝検索対象の全量）から構築
     comic_to_product = {}
 
-    def _build_mapping(df, col_idx, type_label):
+    def _detect_skip_cols(df, default1, default2):
+        """不要欄の列をヘッダー名で自動検出（店舗ごとに列位置が違うため）。
+        「透明カバー」を含む列→_1制御、「セット表記」を含む列→_2制御。見つからなければデフォルト列。
+        """
+        skip1, skip2 = default1, default2
+        f1 = f2 = False
+        for i in range(min(3, len(df))):  # 先頭数行（ヘッダー行）を走査
+            for c in range(df.shape[1]):
+                try:
+                    v = str(df.iloc[i, c])
+                except Exception:
+                    continue
+                if not f1 and '透明カバー' in v:
+                    skip1, f1 = c, True
+                if not f2 and 'セット表記' in v:
+                    skip2, f2 = c, True
+            if f1 and f2:
+                break
+        return skip1, skip2
+
+    def _build_mapping(df, col_idx, type_label, default_skip1, default_skip2):
         if df is None:
             return
+        ncols = df.shape[1]
+        skip1_col, skip2_col = _detect_skip_cols(df, default_skip1, default_skip2)
+
+        def _has_mark(i, col):
+            """不要欄に値が入っているか（値あり=不要）。列が無ければ False（=付ける）。"""
+            if col is None or col >= ncols:
+                return False
+            try:
+                v = df.iloc[i, col]
+                if pd.isna(v):
+                    return False
+                return str(v).strip() not in ('', 'nan', 'None')
+            except Exception:
+                return False
+
         for i in range(len(df)):
             try:
                 product_code = str(df.iloc[i, 0]).strip()
                 comic_no = str(df.iloc[i, col_idx]).strip().replace('.0', '')
                 if product_code and comic_no and product_code != 'nan' and comic_no != 'nan':
-                    comic_to_product[comic_no] = {'code': product_code, 'type': type_label}
+                    comic_to_product[comic_no] = {
+                        'code': product_code,
+                        'type': type_label,
+                        'add_1': not _has_mark(i, skip1_col),  # 不要欄に値→付けない
+                        'add_2': not _has_mark(i, skip2_col),
+                    }
             except:
                 continue
 
-    # セット品=D列(3) / 単品=E列(4) / 予約=D列(3)
-    _build_mapping(excel_set_df, 3, 'set')
-    _build_mapping(excel_tanpin_df, 4, 'tanpin')
-    _build_mapping(excel_yoyaku_df, 3, 'yoyaku')
+    # 不要欄はヘッダー名で自動検出。検出できない場合のデフォルト列:
+    #   セット品/予約=AG(32)/AH(33) ／ 単品=AB(27)/AC(28)。コミックNoはセット/予約=D(3)・単品=E(4)
+    _build_mapping(excel_set_df, 3, 'set', 32, 33)
+    _build_mapping(excel_tanpin_df, 4, 'tanpin', 27, 28)
+    _build_mapping(excel_yoyaku_df, 3, 'yoyaku', 32, 33)
 
     # 追加画像読み込み
     additional_1_path = os.path.join(additional_dir, "additional_1.jpg")
@@ -1733,26 +1816,31 @@ def prepare_yahoo_zips(target_image_map: dict, excel_set_df, excel_tanpin_df, ex
         product_code = mapping['code']
         ctype = mapping['type']
 
+        type_jp = {'set': 'セット品', 'tanpin': '単品', 'yoyaku': '予約'}.get(ctype, ctype)
+
         image_data = target_image_map.get(comic_no)
         if not image_data:
-            no_image.append(comic_no)
+            no_image.append({'商品コード': product_code, 'コミックNo': comic_no, '種別': type_jp, '理由': '画像未取得'})
             logs.append(f"⚠️ {comic_no} → {product_code}: 画像が未取得のためスキップ")
             continue
 
         # メイン画像
         file_entries.append((f"{product_code}.jpg", image_data))
 
-        # セット品・予約は追加画像（_1 / _2）を付与。単品はメインのみ
-        with_additional = ctype in ('set', 'yoyaku')
-        if with_additional:
-            if additional_1_data:
-                file_entries.append((f"{product_code}_1.jpg", additional_1_data))
-            if additional_2_data:
-                file_entries.append((f"{product_code}_2.jpg", additional_2_data))
+        # 追加画像を商品単位で付与（出品シートの不要欄で制御）。連番は付与するものだけで繰り上げ
+        # 例: 透明カバー不要→セット表記が _1 になる（追加画像スロットに空きを作らない）
+        candidates = []
+        if mapping.get('add_1', True) and additional_1_data:
+            candidates.append(('透明カバー', additional_1_data))
+        if mapping.get('add_2', True) and additional_2_data:
+            candidates.append(('セット表記', additional_2_data))
+        added = []
+        for seq, (label, data) in enumerate(candidates, start=1):
+            file_entries.append((f"{product_code}_{seq}.jpg", data))
+            added.append(f"_{seq}({label})")
 
         mapped_count += 1
-        type_jp = {'set': 'セット品', 'tanpin': '単品', 'yoyaku': '予約'}.get(ctype, ctype)
-        suffix = '+追加画像' if with_additional else 'メインのみ'
+        suffix = ('+' + '/'.join(added)) if added else 'メインのみ'
         logs.append(f"✅ {comic_no} → {product_code} ({type_jp}・{suffix})")
 
     # ZIP分割生成
@@ -1793,7 +1881,7 @@ def prepare_yahoo_zips(target_image_map: dict, excel_set_df, excel_tanpin_df, ex
     }
 
 
-def prepare_rakuten_upload_plan(images: list, folders: list) -> dict:
+def prepare_rakuten_upload_plan(images: list, folders: list, existing_folder_by_comic: dict = None) -> dict:
     """種別ベースで楽天R-Cabinetへの振り分け計画を立てる。
 
     画像ごとに `type`（'set'/'tanpin'/'yoyaku'）から TYPE_FOLDER_CONFIG で親パス＋サブフォルダ名 prefix を引き、
@@ -1874,6 +1962,23 @@ def prepare_rakuten_upload_plan(images: list, folders: list) -> dict:
 
         for img in type_images:
             cno = str(img.get("comic_no", ""))
+
+            # 予約・最新刊取得など: 既存フォルダに同名上書きする対象は、packingせず既存フォルダへ
+            if existing_folder_by_comic:
+                _existing_folder = existing_folder_by_comic.get(normalize_jan_code(cno))
+                if _existing_folder:
+                    plan.append({
+                        "type": ctype,
+                        "comic_no": cno,
+                        "file_name": cno,
+                        "file_path_name": f"{cno}.jpg",
+                        "image_data": img.get("image_data"),
+                        "target_folder_name": _existing_folder,
+                        "parent_path": parent_path,
+                    })
+                    logs.append(f"♻️ {cno} → {parent_path}/{_existing_folder}（最新刊上書き）")
+                    continue
+
             # R-Cabinet: fileName=画像名（拡張子なし）, filePath=URLスラッグ（拡張子付き）
             api_file_name = cno
             api_file_path = f"{cno}.jpg"
@@ -2147,6 +2252,201 @@ def upload_image(file_data, file_name, folder_id, file_path_name=None, overwrite
     return {"success": True, "file_url": file_url, "file_id": file_id}
 
 
+def get_yahoo_access_token():
+    """Yahoo!ショッピングAPI: refresh_token から access_token を取得（約1時間有効）。"""
+    if not (YAHOO_CLIENT_ID and YAHOO_CLIENT_SECRET and YAHOO_REFRESH_TOKEN):
+        return {"success": False, "error": "Yahoo認証情報（secrets.toml の [yahoo]）が未設定です"}
+
+    credentials = f"{YAHOO_CLIENT_ID}:{YAHOO_CLIENT_SECRET}"
+    encoded = base64.b64encode(credentials.encode()).decode()
+    try:
+        response = requests.post(
+            YAHOO_TOKEN_URL,
+            headers={
+                "Authorization": f"Basic {encoded}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data={"grant_type": "refresh_token", "refresh_token": YAHOO_REFRESH_TOKEN},
+            timeout=30,
+        )
+    except requests.exceptions.RequestException as e:
+        return {"success": False, "error": f"接続エラー: {str(e)}"}
+
+    if response.status_code != 200:
+        return {"success": False, "error": f"トークン取得失敗 HTTP {response.status_code}: {response.text[:300]}"}
+
+    try:
+        return {"success": True, "access_token": response.json()["access_token"]}
+    except Exception as e:
+        return {"success": False, "error": f"トークンレスポンス解析エラー: {str(e)}"}
+
+
+def upload_to_yahoo_api(zip_data, access_token, zip_filename="images.zip"):
+    """Yahoo!ショッピング 商品画像一括アップロード（uploadItemImagePack）にZIPを送信。
+
+    ZIP内: メイン画像=商品コード.jpg / 追加画像=商品コード_1〜20.jpg。
+    1回25MB以下・個別2MB以下・GIF/PNG/JPEG。レスポンスはXML（Status=OK/NG）。
+    """
+    try:
+        response = requests.post(
+            YAHOO_UPLOAD_URL,
+            params={"seller_id": YAHOO_SELLER_ID},
+            headers={"Authorization": f"Bearer {access_token}"},
+            files={"file": (zip_filename, zip_data, "application/zip")},
+            timeout=180,
+        )
+    except requests.exceptions.RequestException as e:
+        return {"success": False, "error": f"接続エラー: {str(e)}"}
+
+    if response.status_code != 200:
+        return {"success": False, "error": f"HTTP {response.status_code}: {response.text[:500]}"}
+
+    try:
+        root = ET.fromstring(response.text)
+    except ET.ParseError as e:
+        return {"success": False, "error": f"XMLパースエラー: {str(e)} / {response.text[:300]}"}
+
+    status = root.findtext('.//Status', '')
+    if status != 'OK':
+        # 失敗時はエラーコード/メッセージが返る（im-xxxxx 等）。原文も添えて診断可能にする
+        code = root.findtext('.//Code', '') or root.findtext('.//ErrorCode', '')
+        msg = root.findtext('.//Message', '') or root.findtext('.//Description', '')
+        detail = " ".join(x for x in [f"Status={status or 'NG'}", code, msg] if x).strip()
+        return {"success": False, "error": f"APIエラー: {detail} / {response.text[:300]}"}
+
+    return {"success": True}
+
+
+def _get_sheets_service():
+    """refresh_token から Google Sheets APIサービスを生成。(service, error) を返す。"""
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN):
+        return None, "Google認証情報（secrets.toml の [google]）が未設定です"
+    try:
+        from google.oauth2.credentials import Credentials
+        from googleapiclient.discovery import build
+        creds = Credentials(
+            None,
+            refresh_token=GOOGLE_REFRESH_TOKEN,
+            token_uri=GOOGLE_TOKEN_URI,
+            client_id=GOOGLE_CLIENT_ID,
+            client_secret=GOOGLE_CLIENT_SECRET,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        )
+        service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+        return service, None
+    except Exception as e:
+        return None, f"Google API初期化エラー: {e}"
+
+
+def append_to_folder_mgmt_sheet(uploaded_rows):
+    """楽天RMS画像フォルダ管理シートの種別タブ末尾へ追記する。
+
+    uploaded_rows: [{'type': 'set'|'tanpin'|'yoyaku', 'comic_no': str, 'subfolder': str}]
+    追記列: A=No.(連番) / B=ファイル名(comic_no) / C=カテゴリ1「コミック」/ D=カテゴリ2 / E=カテゴリ3(サブフォルダ)
+    F〜H(ディレクトリ列)は直前データ行の数式をcopyPasteで複製（VLOOKUP参照を自動調整）。
+    ファイル名(B列)が既存のものはスキップ。
+    """
+    import re as _re
+
+    service, err = _get_sheets_service()
+    if err:
+        return {"success": False, "error": err, "added": 0, "logs": []}
+
+    try:
+        sheets = service.spreadsheets()
+        meta = sheets.get(spreadsheetId=FOLDER_MGMT_SPREADSHEET_ID).execute()
+        gid_to_title = {s['properties']['sheetId']: s['properties']['title'] for s in meta.get('sheets', [])}
+    except Exception as e:
+        return {"success": False, "error": f"スプレッドシート取得エラー: {e}", "added": 0, "logs": []}
+
+    logs = []
+    total_added = 0
+
+    by_type = {}
+    for r in uploaded_rows:
+        by_type.setdefault(r.get('type'), []).append(r)
+
+    for ctype, rows in by_type.items():
+        gid = FOLDER_MGMT_GID.get(ctype)
+        title = gid_to_title.get(gid)
+        if not title:
+            logs.append(f"⚠️ 種別 {ctype}: タブ(gid={gid})が見つからずスキップ")
+            continue
+        try:
+            # 既存ファイル名（B列）で重複排除
+            b_col = sheets.values().get(
+                spreadsheetId=FOLDER_MGMT_SPREADSHEET_ID, range=f"'{title}'!B:B"
+            ).execute().get('values', [])
+            existing_names = set(str(x[0]).strip() for x in b_col if x and str(x[0]).strip())
+            # A列の最大No.（数値）と最終データ行
+            a_col = sheets.values().get(
+                spreadsheetId=FOLDER_MGMT_SPREADSHEET_ID, range=f"'{title}'!A:A"
+            ).execute().get('values', [])
+            last_data_row = len(a_col)  # 1始まりの最終データ行（A列が連番で埋まっている前提）
+            max_no = 0
+            for x in a_col:
+                if x and str(x[0]).strip().isdigit():
+                    max_no = max(max_no, int(str(x[0]).strip()))
+
+            new_values = []
+            for r in rows:
+                cno = str(r.get('comic_no', '')).strip()
+                if not cno or cno in existing_names:
+                    if cno:
+                        logs.append(f"⏭️ {title}: {cno} は既存のためスキップ")
+                    continue
+                existing_names.add(cno)
+                max_no += 1
+                new_values.append([
+                    max_no,                               # A: No.
+                    cno,                                  # B: ファイル名
+                    "コミック",                            # C: カテゴリ1
+                    FOLDER_MGMT_CAT2.get(ctype, ctype),   # D: カテゴリ2
+                    str(r.get('subfolder', '')).strip(),  # E: カテゴリ3（サブフォルダ）
+                ])
+
+            if not new_values:
+                continue
+
+            # A:E を末尾追記
+            resp = sheets.values().append(
+                spreadsheetId=FOLDER_MGMT_SPREADSHEET_ID,
+                range=f"'{title}'!A:E",
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body={"values": new_values},
+            ).execute()
+
+            # 追記行範囲を解析（例: 'セット品'!A16877:E16880）し、F:H の数式を直前行から複製
+            updated_range = resp.get('updates', {}).get('updatedRange', '')
+            m = _re.search(r'![A-Z]+(\d+):[A-Z]+(\d+)$', updated_range)
+            if m and last_data_row >= 2:
+                dst_start0 = int(m.group(1)) - 1   # 0始まり
+                dst_end0 = int(m.group(2))         # exclusive
+                src_row0 = last_data_row - 1       # 直前データ行（数式複製元）
+                sheets.batchUpdate(
+                    spreadsheetId=FOLDER_MGMT_SPREADSHEET_ID,
+                    body={"requests": [{
+                        "copyPaste": {
+                            "source": {"sheetId": gid, "startRowIndex": src_row0, "endRowIndex": src_row0 + 1,
+                                       "startColumnIndex": 5, "endColumnIndex": 8},
+                            "destination": {"sheetId": gid, "startRowIndex": dst_start0, "endRowIndex": dst_end0,
+                                            "startColumnIndex": 5, "endColumnIndex": 8},
+                            "pasteType": "PASTE_FORMULA",
+                        }
+                    }]},
+                ).execute()
+            else:
+                logs.append(f"⚠️ {title}: ディレクトリ列(F:H)の数式複製をスキップ（追記範囲解析不可）")
+
+            total_added += len(new_values)
+            logs.append(f"✅ {title}: {len(new_values)}件追記")
+        except Exception as e:
+            logs.append(f"❌ {title}: 追記エラー: {e}")
+
+    return {"success": True, "added": total_added, "logs": logs}
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def get_folder_files(folder_id: int, max_retries: int = 3):
     """指定フォルダ内の画像一覧を取得（リトライ機能付き）"""
@@ -2376,7 +2676,7 @@ with st.sidebar:
 
     mode = st.radio(
         "機能を選択",
-        ["🎨 クリエイティブスタジオ", "🛰️ R-Cabi構成把握", "🏗️ R-Cabiフォルダ制作", "☁️ コピー：Local⇒R-Cabi", "💾 コピー：R-Cabi⇒Local", "🔁 コピー：R-Cabi⇒R-Cabi"],
+        ["🎨 クリエイティブスタジオ", "🛰️ R-Cabi構成把握", "🏗️ R-Cabiフォルダ制作", "🖌️ 商品画像加工", "☁️ コピー：Local⇒R-Cabi", "💾 コピー：R-Cabi⇒Local", "🔁 コピー：R-Cabi⇒R-Cabi"],
         label_visibility="collapsed"
     )
 
@@ -2793,6 +3093,8 @@ if mode == "🎨 クリエイティブスタジオ":
         )
 
         comic_numbers = []
+        # 予約「最新刊取得」モード（テキスト入力時のみ有効。Excelは常にOFF=不足特定）
+        yoyaku_force_latest_mode = False
 
         # 種別ごとのコミックNoリスト（ファイル間で集約、重複は後で除去）
         typed_comics_raw = {"セット品": [], "単品": [], "予約": []}
@@ -2885,6 +3187,16 @@ if mode == "🎨 クリエイティブスタジオ":
                         placeholder=placeholders[type_label],
                         key=f"step1_text_{type_label}",
                     )
+                    if type_label == "予約":
+                        yoyaku_force_latest_mode = st.checkbox(
+                            "🔄 最新刊取得（存在しても上書き）",
+                            key="step1_yoyaku_latest",
+                            help=(
+                                "ON: 入力した予約を存在チェックに関わらず全て対象にし、"
+                                "is_list.csvの最新巻表紙を取得して同名で上書きします（楽天は既存フォルダに上書き）。\n"
+                                "OFF: 今まで通り不足分のみ。"
+                            ),
+                        )
 
             # 種別ごとにユニーク化（順序保持）
             typed_comics_text = {"セット品": [], "単品": [], "予約": []}
@@ -2924,6 +3236,13 @@ if mode == "🎨 クリエイティブスタジオ":
 
                 if results:
                     st.session_state.workflow_data['check_results'] = results
+                    # 予約・最新刊取得モード: 対象の予約コミックNoを記録
+                    # （存在しても③で最新巻を取得し、④で同名上書きする対象）
+                    if yoyaku_force_latest_mode:
+                        _tc = st.session_state.workflow_data.get('typed_comics', {})
+                        st.session_state.workflow_data['yoyaku_force_latest'] = list(_tc.get('予約', []))
+                    else:
+                        st.session_state.workflow_data['yoyaku_force_latest'] = []
                     # 不足リストが更新されたので、下流のキャッシュ/アップロード済フラグを無効化
                     st.session_state.workflow_data['missing_uploaded'] = False
                     st.session_state.workflow_data.pop('missing_from_github', None)
@@ -3094,12 +3413,13 @@ if mode == "🎨 クリエイティブスタジオ":
                             st.success(", ".join(upload_results))
                             st.session_state.workflow_data['missing_uploaded'] = True
 
-                with col2:
-                    if st.button("次へ進む →", type="primary"):
-                        if 1 not in st.session_state.workflow_completed:
-                            st.session_state.workflow_completed.append(1)
-                        st.session_state.workflow_step = 2
-                        st.rerun()
+            # 次へ進む（不足ゼロでも進める：ヤフー全量出力・予約最新刊取得のため）
+            st.divider()
+            if st.button("次へ進む →", type="primary", key="step1_next_btn"):
+                if 1 not in st.session_state.workflow_completed:
+                    st.session_state.workflow_completed.append(1)
+                st.session_state.workflow_step = 2
+                st.rerun()
 
     # ============================================================
     # Step 2: JAN取得
@@ -3169,6 +3489,11 @@ if mode == "🎨 クリエイティブスタジオ":
             set_comics = [r['コミックNo'] for r in missing if r.get('種別') == 'セット品']
             tanpin_comics = [r['コミックNo'] for r in missing if r.get('種別') == '単品']
             yoyaku_comics = [r['コミックNo'] for r in missing if r.get('種別') == '予約']
+            # 予約・最新刊取得: 存在していてもJAN取得対象に含める（is_list.csvに最新巻を反映させる）
+            _existing_yoyaku = set(str(c) for c in yoyaku_comics)
+            for _yc in st.session_state.workflow_data.get('yoyaku_force_latest', []):
+                if str(_yc) not in _existing_yoyaku:
+                    yoyaku_comics.append(_yc)
             today = datetime.now(JST).strftime('%Y-%m-%d %H:%M')
             status_area.info(
                 f"📤 不足リストをGitHubにアップロード中... "
@@ -3323,6 +3648,12 @@ if mode == "🎨 クリエイティブスタジオ":
                 missing_yoyaku = list(gh.get('yoyaku', []))
             else:
                 missing_comics = list(gh)
+
+        # 予約・最新刊取得モード: 存在していても対象に含める（最新巻表紙を取得して上書き）
+        for _yc in st.session_state.workflow_data.get('yoyaku_force_latest', []):
+            _cno = normalize_jan_code(_yc)
+            if _cno and _cno not in missing_yoyaku:
+                missing_yoyaku.append(_cno)
 
         total_missing = len(missing_comics) + len(missing_yoyaku)
         col_s1, col_s2, col_s3 = st.columns(3)
@@ -3788,7 +4119,20 @@ if mode == "🎨 クリエイティブスタジオ":
 
                 if st.button("📋 振り分け計画を作成", type="primary", disabled=not folders_ready, key="rakuten_plan_btn"):
                     folders = st.session_state.workflow_data['rakuten_folders']
-                    plan_result = prepare_rakuten_upload_plan(images, folders)
+                    # 予約・最新刊取得対象で既にR-Cabinetに存在するものは、既存フォルダへ同名上書き
+                    _force_set = set(
+                        normalize_jan_code(c)
+                        for c in st.session_state.workflow_data.get('yoyaku_force_latest', [])
+                        if normalize_jan_code(c)
+                    )
+                    existing_folder_by_comic = {}
+                    if _force_set:
+                        for r in check_results_all:
+                            if r.get('種別') == '予約' and r.get('存在') == '✅ あり':
+                                _cno = normalize_jan_code(r.get('コミックNo'))
+                                if _cno in _force_set and r.get('フォルダ'):
+                                    existing_folder_by_comic[_cno] = r.get('フォルダ')
+                    plan_result = prepare_rakuten_upload_plan(images, folders, existing_folder_by_comic)
                     st.session_state.workflow_data['rakuten_plan'] = plan_result
                     # 既存のアップロード結果はクリア
                     st.session_state.workflow_data.pop('rakuten_upload_result', None)
@@ -3907,6 +4251,21 @@ if mode == "🎨 クリエイティブスタジオ":
                                     upload_failed.append({'comic_no': p['comic_no'], 'error': err_msg})
                                     log_lines.append(f"❌ {p['comic_no']}: {err_msg}")
 
+                            # 楽天RMS画像フォルダ管理シートへ追記（アップロード成功分のみ）
+                            sheet_result = None
+                            if GOOGLE_REFRESH_TOKEN:
+                                failed_cnos = set(f['comic_no'] for f in upload_failed)
+                                uploaded_rows = [
+                                    {'type': p['type'], 'comic_no': p['comic_no'], 'subfolder': p['target_folder_name']}
+                                    for p in plan_result['plan'] if p['comic_no'] not in failed_cnos
+                                ]
+                                if uploaded_rows:
+                                    status.text("📝 フォルダ管理シートに追記中...")
+                                    try:
+                                        sheet_result = append_to_folder_mgmt_sheet(uploaded_rows)
+                                    except Exception as e:
+                                        sheet_result = {"success": False, "error": str(e), "added": 0, "logs": []}
+
                             status.empty()
                             progress.empty()
 
@@ -3917,6 +4276,7 @@ if mode == "🎨 クリエイティブスタジオ":
                                 'upload_failed': upload_failed,
                                 'logs': log_lines,
                                 'total': total,
+                                'sheet_result': sheet_result,
                             }
                             # フォルダ状態が変わったのでキャッシュをクリア
                             try:
@@ -3938,6 +4298,21 @@ if mode == "🎨 クリエイティブスタジオ":
                         if upload_result['create_errors']:
                             st.error("失敗したフォルダ作成:")
                             st.dataframe(pd.DataFrame(upload_result['create_errors']), use_container_width=True, height=120)
+
+                        # フォルダ管理シート追記結果
+                        sheet_result = upload_result.get('sheet_result')
+                        if sheet_result is None:
+                            if not GOOGLE_REFRESH_TOKEN:
+                                st.caption("📝 フォルダ管理シート追記: secrets.toml の [google] 未設定のためスキップ")
+                        elif sheet_result.get('success'):
+                            st.success(f"📝 フォルダ管理シートに {sheet_result.get('added', 0)}件 追記しました")
+                            with st.expander("シート追記ログ", expanded=False):
+                                for log in sheet_result.get('logs', []):
+                                    st.text(log)
+                        else:
+                            st.error(f"📝 フォルダ管理シート追記エラー: {sheet_result.get('error', '不明')}")
+                            for log in sheet_result.get('logs', []):
+                                st.text(log)
 
                         with st.expander("実行ログ", expanded=False):
                             for log in upload_result['logs']:
@@ -4081,6 +4456,14 @@ if mode == "🎨 クリエイティブスタジオ":
                             f"検索対象の画像: 不足取得済 {len(missing_comic_nos)}件 / 既存取得可 {len(existing_available)}件"
                         )
 
+                # 追加画像（_1=透明カバー / _2=セット表記）は商品単位で出品シートの不要欄により制御
+                # （セット品/予約=AG/AH列, 単品=AB/AC列。不要欄に値があれば付けない／空なら付ける）
+                st.divider()
+                st.caption(
+                    "追加画像は商品単位で出品シートの不要欄で制御します"
+                    "（セット品/予約=AG・AH列、単品=AB・AC列。〇等の値があれば付けない／空なら付ける）。"
+                )
+
                 # ZIP生成ボタン
                 st.divider()
                 can_generate = (excel_set_df is not None or excel_tanpin_df is not None or excel_yoyaku_df is not None)
@@ -4114,7 +4497,9 @@ if mode == "🎨 クリエイティブスタジオ":
                         dl_progress.empty()
 
                     additional_dir = _os.path.join(_os.path.dirname(__file__), "images")
-                    result = prepare_yahoo_zips(target_image_map, excel_set_df, excel_tanpin_df, excel_yoyaku_df, additional_dir)
+                    result = prepare_yahoo_zips(
+                        target_image_map, excel_set_df, excel_tanpin_df, excel_yoyaku_df, additional_dir,
+                    )
                     # 既存DL失敗分のログを追記
                     if skipped_existing:
                         result.setdefault('logs', []).append(
@@ -4136,6 +4521,20 @@ if mode == "🎨 クリエイティブスタジオ":
                     col_m3.metric("既存DL失敗", len(result.get('skipped_existing', [])))
                     col_m4.metric("ZIP数", len(zips))
 
+                    # 画像未取得ログのダウンロード（未取得＝画像辞書になし／既存DL失敗）
+                    no_image_rows = list(result.get('no_image', []))
+                    for cno in result.get('skipped_existing', []):
+                        no_image_rows.append({'商品コード': '-', 'コミックNo': cno, '種別': '-', '理由': '既存DL失敗'})
+                    if no_image_rows:
+                        ni_df = pd.DataFrame(no_image_rows, columns=['商品コード', 'コミックNo', '種別', '理由'])
+                        st.download_button(
+                            label=f"📄 画像未取得ログをダウンロード（{len(no_image_rows)}件）",
+                            data=ni_df.to_csv(index=False).encode('utf-8-sig'),
+                            file_name="yahoo_no_image.csv",
+                            mime="text/csv",
+                            key="yahoo_no_image_dl",
+                        )
+
                     for i, zip_data in enumerate(zips):
                         size_mb = len(zip_data) / (1024 * 1024)
                         st.download_button(
@@ -4145,6 +4544,56 @@ if mode == "🎨 クリエイティブスタジオ":
                             mime="application/zip",
                             key=f"yahoo_zip_dl_{i}"
                         )
+
+                    # ── Yahoo!ショッピングへAPIで直接アップロード ──
+                    st.divider()
+                    st.markdown("#### 📤 Yahoo!ショッピングへAPIアップロード")
+                    yahoo_creds_ok = bool(YAHOO_CLIENT_ID and YAHOO_CLIENT_SECRET and YAHOO_REFRESH_TOKEN)
+                    if not yahoo_creds_ok:
+                        st.warning(
+                            "⚠️ secrets.toml の [yahoo]（client_id / client_secret / refresh_token）が未設定のため、"
+                            "APIアップロードは使えません。上のダウンロードボタンから手動アップロードしてください。"
+                        )
+                    elif not zips:
+                        st.info("アップロード対象のZIPがありません。")
+                    else:
+                        st.warning(
+                            f"⚠️ 本番ストア **{YAHOO_SELLER_ID}** の商品画像を実際に更新します。"
+                            "ZIP内の商品コードに一致する商品のメイン画像／追加画像が置き換わります（反映後、商品ページに反映）。"
+                        )
+                        confirm_yahoo = st.checkbox("内容を確認した（本番へのアップロードを許可）", key="yahoo_api_confirm")
+                        if st.button("📤 Yahoo APIへアップロード", type="primary", disabled=not confirm_yahoo, key="yahoo_api_upload_btn"):
+                            tok = get_yahoo_access_token()
+                            if not tok['success']:
+                                st.error(f"❌ アクセストークン取得失敗: {tok['error']}")
+                            else:
+                                access_token = tok['access_token']
+                                progress = st.progress(0.0)
+                                status = st.empty()
+                                upload_logs = []
+                                success_cnt = 0
+                                for i, zip_data in enumerate(zips):
+                                    fname = f"yahoo_upload_{i+1:03d}.zip"
+                                    status.text(f"Yahoo APIアップロード中... {fname} ({i+1}/{len(zips)})")
+                                    progress.progress((i + 1) / len(zips))
+                                    res = upload_to_yahoo_api(zip_data, access_token, fname)
+                                    if res['success']:
+                                        success_cnt += 1
+                                        upload_logs.append(f"✅ {fname}: 成功")
+                                    else:
+                                        upload_logs.append(f"❌ {fname}: {res['error']}")
+                                progress.empty()
+                                status.empty()
+                                if success_cnt == len(zips):
+                                    st.success(
+                                        f"✅ 全{len(zips)}件のZIPアップロード成功！ "
+                                        "ストアクリエイターPro > 反映管理 で確認してください。"
+                                    )
+                                else:
+                                    st.error(f"⚠️ {success_cnt}/{len(zips)}件成功。失敗があります（下記ログ参照）。")
+                                with st.expander("アップロード結果ログ", expanded=True):
+                                    for log in upload_logs:
+                                        st.text(log)
 
                     with st.expander("ログ", expanded=False):
                         for log in result['logs']:
@@ -4565,6 +5014,97 @@ elif mode == "🏗️ R-Cabiフォルダ制作":
                     use_container_width=True,
                     hide_index=True
                 )
+
+# ============================
+# 🖌️ 商品画像加工（アップロード画像を加工するだけ）
+# ============================
+elif mode == "🖌️ 商品画像加工":
+    import os as _imgproc_os
+
+    st.header("🖌️ 商品画像加工")
+    st.caption(
+        "画像ファイルをアップロードして、選んだ加工（600×600）を一括適用します。"
+        "JANコードからの取得は行いません（既にある画像を加工するだけ）。複数同時可・全画像に同じ処理。"
+    )
+
+    proc_type = st.radio(
+        "加工タイプ（アップロードした全画像に同じ処理を適用）",
+        [
+            "セット（送料無料バッジ＋左寄せ 600×600）",
+            "単品（中央配置 600×600・バッジなし）",
+            "予約（送料無料バッジ＋左寄せ 600×600）",
+        ],
+    )
+    if proc_type.startswith("単品"):
+        _center, _badge = True, False
+    else:  # セット / 予約（同じ処理）
+        _center, _badge = False, True
+
+    uploaded = st.file_uploader(
+        "画像ファイル（複数可・JPG / PNG / GIF）",
+        type=["jpg", "jpeg", "png", "gif"],
+        accept_multiple_files=True,
+        key="imgproc_files",
+    )
+
+    if uploaded and st.button("🎨 加工する", type="primary"):
+        badge_path = _imgproc_os.path.join(_imgproc_os.path.dirname(__file__), "images", "badge_free_shipping.jpg")
+        if _badge and not _imgproc_os.path.exists(badge_path):
+            st.error(f"送料無料バッジ画像が見つかりません: {badge_path}")
+        else:
+            proc_results = []  # [(filename, bytes)]
+            proc_errors = []
+            progress = st.progress(0.0)
+            for i, uf in enumerate(uploaded):
+                progress.progress((i + 1) / len(uploaded))
+                try:
+                    data = uf.read()
+                    img = resize_to_square(data, size=600, center=_center)
+                    if _badge:
+                        img = add_shipping_badge(img, badge_path)
+                    out_name = _imgproc_os.path.splitext(uf.name)[0] + ".jpg"
+                    proc_results.append((out_name, image_to_bytes(img)))
+                except Exception as e:
+                    proc_errors.append(f"{uf.name}: {e}")
+            progress.empty()
+            st.session_state['imgproc_results'] = proc_results
+            st.session_state['imgproc_errors'] = proc_errors
+
+    proc_results = st.session_state.get('imgproc_results', [])
+    proc_errors = st.session_state.get('imgproc_errors', [])
+
+    if proc_results:
+        st.success(f"✅ {len(proc_results)}件 加工完了" + (f" / {len(proc_errors)}件 失敗" if proc_errors else ""))
+
+        _zipfile = get_zipfile()
+        zbuf = BytesIO()
+        with _zipfile.ZipFile(zbuf, 'w', _zipfile.ZIP_DEFLATED) as zf:
+            for fn, fd in proc_results:
+                zf.writestr(fn, fd)
+        st.download_button(
+            label=f"📦 加工済み画像ZIP（{len(proc_results)}件）",
+            data=zbuf.getvalue(),
+            file_name="processed_images.zip",
+            mime="application/zip",
+            key="imgproc_zip_dl",
+        )
+
+        preview = proc_results[:9]
+        st.markdown(f"### プレビュー（{len(preview)}/{len(proc_results)}件）")
+        for row_start in range(0, len(preview), 3):
+            cols = st.columns(3)
+            for j, col in enumerate(cols):
+                idx = row_start + j
+                if idx < len(preview):
+                    fn, fd = preview[idx]
+                    with col:
+                        st.image(fd, width=200)
+                        st.caption(fn)
+
+    if proc_errors:
+        with st.expander(f"⚠️ 失敗 {len(proc_errors)}件", expanded=False):
+            for e in proc_errors:
+                st.text(e)
 
 # ============================
 # 🔁 コピー：R-Cabi⇒R-Cabi
