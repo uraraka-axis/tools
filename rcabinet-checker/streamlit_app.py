@@ -1777,7 +1777,9 @@ def prepare_yahoo_zips(target_image_map: dict, excel_set_df, excel_tanpin_df, ex
             try:
                 product_code = str(df.iloc[i, 0]).strip()
                 comic_no = str(df.iloc[i, col_idx]).strip().replace('.0', '')
-                if product_code and comic_no and product_code != 'nan' and comic_no != 'nan':
+                # コミックNoが数値（単品は _ 区切り可）の行だけ対象。ヘッダー行や空行・見出し文字は除外
+                if (product_code and comic_no and product_code != 'nan' and comic_no != 'nan'
+                        and comic_no.replace('_', '').isdigit()):
                     comic_to_product[comic_no] = {
                         'code': product_code,
                         'type': type_label,
@@ -4535,15 +4537,35 @@ if mode == "🎨 クリエイティブスタジオ":
                             key="yahoo_no_image_dl",
                         )
 
-                    for i, zip_data in enumerate(zips):
-                        size_mb = len(zip_data) / (1024 * 1024)
+                    # 全ZIPを1ファイルにまとめてダウンロード（中身は分割済みのyahoo_upload_NNN.zip）
+                    if zips:
+                        _zf_mod = get_zipfile()
+                        all_buf = BytesIO()
+                        with _zf_mod.ZipFile(all_buf, 'w', _zf_mod.ZIP_STORED) as zf:
+                            for i, zd in enumerate(zips):
+                                zf.writestr(f"yahoo_upload_{i+1:03d}.zip", zd)
+                        total_mb = sum(len(z) for z in zips) / (1024 * 1024)
                         st.download_button(
-                            label=f"📥 yahoo_upload_{i+1:03d}.zip ({size_mb:.1f}MB)",
-                            data=zip_data,
-                            file_name=f"yahoo_upload_{i+1:03d}.zip",
+                            label=f"📦 全{len(zips)}ZIPをまとめてダウンロード（{total_mb:.1f}MB）",
+                            data=all_buf.getvalue(),
+                            file_name="yahoo_upload_all.zip",
                             mime="application/zip",
-                            key=f"yahoo_zip_dl_{i}"
+                            type="primary",
+                            key="yahoo_zip_all_dl",
                         )
+                        st.caption("↑ 1ファイルに全分割ZIPを同梱。解凍すると yahoo_upload_001.zip … が出てきます。")
+
+                    # 個別ダウンロード（必要な場合のみ）
+                    with st.expander(f"個別にダウンロード（{len(zips)}件）", expanded=False):
+                        for i, zip_data in enumerate(zips):
+                            size_mb = len(zip_data) / (1024 * 1024)
+                            st.download_button(
+                                label=f"📥 yahoo_upload_{i+1:03d}.zip ({size_mb:.1f}MB)",
+                                data=zip_data,
+                                file_name=f"yahoo_upload_{i+1:03d}.zip",
+                                mime="application/zip",
+                                key=f"yahoo_zip_dl_{i}"
+                            )
 
                     # ── Yahoo!ショッピングへAPIで直接アップロード ──
                     st.divider()
