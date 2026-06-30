@@ -1711,7 +1711,7 @@ def process_workflow_images(missing_comics: list, is_list_content: str, comic_li
     return {'success': True, 'images': downloaded_images, 'stats': stats, 'logs': logs}
 
 
-def prepare_yahoo_zips(target_image_map: dict, excel_set_df, excel_tanpin_df, excel_yoyaku_df, additional_dir: str) -> dict:
+def prepare_yahoo_zips(get_image, excel_set_df, excel_tanpin_df, excel_yoyaku_df, additional_dir: str, out_dir: str, progress_cb=None) -> dict:
     """ヤフー用にリネーム＋追加画像＋ZIP分割生成（検索対象の全量ベース）。
 
     追加画像（_1=透明カバー / _2=セット表記）の付与は商品単位で出品シートの「不要欄」で制御:
@@ -1720,12 +1720,14 @@ def prepare_yahoo_zips(target_image_map: dict, excel_set_df, excel_tanpin_df, ex
       不要欄に値（〇等）が入っていれば付けない／空なら付ける。
 
     Args:
-        target_image_map: {comic_no(str): image_data(bytes)}。不足分（Step③取得）と
-                          既存分（R-Cabinet URL取得）を統合済みの画像辞書。
+        get_image:       comic_no(str) を受け取り画像bytes（無ければNone）を返す関数。
+                         呼ばれた時に遅延取得し、メモリにため込まない（OOM対策）。
         excel_set_df:    セット品シート（A列=商品コード / D列=コミックNo）
         excel_tanpin_df: 単品シート（A列=商品コード / E列=コミックNo）
         excel_yoyaku_df: 予約シート（A列=商品コード / D列=コミックNo）
         additional_dir:  追加画像（additional_1.jpg / additional_2.jpg）の格納ディレクトリ
+        out_dir:         生成ZIPの出力先ディレクトリ（ディスク）。バイト列を保持せずファイルで返す。
+        progress_cb:     progress_cb(done, total, comic_no) で進捗通知（任意）。
     """
     import os
     zipfile = get_zipfile()
@@ -1807,30 +1809,63 @@ def prepare_yahoo_zips(target_image_map: dict, excel_set_df, excel_tanpin_df, ex
         with open(additional_2_path, 'rb') as f:
             additional_2_data = f.read()
 
-    # ファイルリスト構築（出品シート全量を基準にループ）
-    file_entries = []  # [(filename, bytes)]
+    # ── ストリーミングZIP生成（メモリにため込まず、1枚ずつディスク上のZIPへ逐次書き出し） ──
+    # 画像は get_image() で都度取得し、書き込み後すぐ解放。メモリ使用は常時「現在のZIP1個＋画像1枚」程度。
+    os.makedirs(out_dir, exist_ok=True)
+
+    zip_paths = []
     mapped_count = 0
-    unmapped = []        # 商品コードはあるが画像が未取得
-    no_image = []        # 画像辞書に存在しない（不足取得漏れ／既存DL失敗など）
+    no_image = []        # 画像が取得できなかった（不足取得漏れ／既存DL失敗など）
+    total_files = 0
     logs = []
 
-    for comic_no, mapping in comic_to_product.items():
+    current_zf = None
+    current_path = None
+    current_size = 0
+    current_count = 0
+    zip_index = 0
+
+    def _open_new_zip():
+        nonlocal current_zf, current_path, current_size, current_count, zip_index
+        zip_index += 1
+        current_path = os.path.join(out_dir, f"yahoo_upload_{zip_index:03d}.zip")
+        current_zf = zipfile.ZipFile(current_path, 'w', zipfile.ZIP_DEFLATED)
+        current_size = 0
+        current_count = 0
+
+    def _close_current_zip():
+        nonlocal current_zf
+        if current_zf is None:
+            return
+        current_zf.close()
+        if current_count > 0:
+            zip_paths.append(current_path)
+        else:
+            # 中身ゼロのZIPは破棄
+            try:
+                os.remove(current_path)
+            except Exception:
+                pass
+        current_zf = None
+
+    total = len(comic_to_product)
+    for done, (comic_no, mapping) in enumerate(comic_to_product.items(), start=1):
+        if progress_cb:
+            progress_cb(done, total, comic_no)
+
         product_code = mapping['code']
         ctype = mapping['type']
-
         type_jp = {'set': 'セット品', 'tanpin': '単品', 'yoyaku': '予約'}.get(ctype, ctype)
 
-        image_data = target_image_map.get(comic_no)
+        image_data = get_image(comic_no)
         if not image_data:
             no_image.append({'商品コード': product_code, 'コミックNo': comic_no, '種別': type_jp, '理由': '画像未取得'})
             logs.append(f"⚠️ {comic_no} → {product_code}: 画像が未取得のためスキップ")
             continue
 
-        # メイン画像
-        file_entries.append((f"{product_code}.jpg", image_data))
-
-        # 追加画像を商品単位で付与（出品シートの不要欄で制御）。連番は付与するものだけで繰り上げ
-        # 例: 透明カバー不要→セット表記が _1 になる（追加画像スロットに空きを作らない）
+        # この商品の書き込みエントリ（メイン＋追加画像）。商品単位で同一ZIPに収める。
+        # 追加画像は出品シートの不要欄で制御。連番は付与するものだけで繰り上げ。
+        entries = [(f"{product_code}.jpg", image_data)]
         candidates = []
         if mapping.get('add_1', True) and additional_1_data:
             candidates.append(('透明カバー', additional_1_data))
@@ -1838,48 +1873,40 @@ def prepare_yahoo_zips(target_image_map: dict, excel_set_df, excel_tanpin_df, ex
             candidates.append(('セット表記', additional_2_data))
         added = []
         for seq, (label, data) in enumerate(candidates, start=1):
-            file_entries.append((f"{product_code}_{seq}.jpg", data))
+            entries.append((f"{product_code}_{seq}.jpg", data))
             added.append(f"_{seq}({label})")
+
+        product_size = sum(len(d) for _, d in entries)
+
+        # 25MB超でローテーション（商品単位は分割しない）
+        if current_zf is None:
+            _open_new_zip()
+        elif current_size + product_size > MAX_ZIP_SIZE and current_count > 0:
+            _close_current_zip()
+            _open_new_zip()
+
+        for fn, data in entries:
+            current_zf.writestr(fn, data)
+        current_size += product_size
+        current_count += len(entries)
+        total_files += len(entries)
 
         mapped_count += 1
         suffix = ('+' + '/'.join(added)) if added else 'メインのみ'
         logs.append(f"✅ {comic_no} → {product_code} ({type_jp}・{suffix})")
 
-    # ZIP分割生成
-    zip_buffers = []
-    current_files = []
-    current_size = 0
+        # メイン画像の生データを解放（追加画像は共有なので解放しない）
+        del image_data
 
-    for filename, data in file_entries:
-        file_size = len(data)
-        if current_size + file_size > MAX_ZIP_SIZE and current_files:
-            # 現在のZIPを保存
-            buf = BytesIO()
-            with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for fn, fd in current_files:
-                    zf.writestr(fn, fd)
-            zip_buffers.append(buf.getvalue())
-            current_files = []
-            current_size = 0
-
-        current_files.append((filename, data))
-        current_size += file_size
-
-    # 残りを保存
-    if current_files:
-        buf = BytesIO()
-        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for fn, fd in current_files:
-                zf.writestr(fn, fd)
-        zip_buffers.append(buf.getvalue())
+    _close_current_zip()
 
     return {
-        'zips': zip_buffers,
+        'zip_paths': zip_paths,
+        'out_dir': out_dir,
         'mapped': mapped_count,
-        'unmapped': unmapped,
         'no_image': no_image,
-        'total_files': len(file_entries),
-        'logs': logs
+        'total_files': total_files,
+        'logs': logs,
     }
 
 
@@ -4470,38 +4497,60 @@ if mode == "🎨 クリエイティブスタジオ":
                 st.divider()
                 can_generate = (excel_set_df is not None or excel_tanpin_df is not None or excel_yoyaku_df is not None)
                 if st.button("📦 ZIP生成", type="primary", disabled=not can_generate, key="yahoo_zip_btn"):
-                    # 画像辞書 target_image_map を構築（不足分＋既存分）
-                    target_image_map = {}
-                    skipped_existing = []
+                    import tempfile as _tempfile
+                    import shutil as _shutil
 
-                    # 不足分（Step③取得済の加工画像）
+                    # Step③取得済み（不足分）の加工画像のみマップ化（件数が少なく軽量）。
+                    # 既存分は get_image() で都度DLし、メモリにため込まない（OOM対策）。
+                    step3_map = {}
                     for img in images:
                         cno = str(img['comic_no']).strip()
                         if img.get('image_data'):
-                            target_image_map[cno] = img['image_data']
+                            step3_map[cno] = img['image_data']
 
-                    # 既存分（R-CabinetのURLから取得）
-                    if existing_available:
-                        dl_progress = st.progress(0, text="既存画像をR-Cabinetから取得中...")
-                        dl_session = requests.Session()
-                        total_existing = len(existing_available)
-                        for i, (cno, item) in enumerate(existing_available.items()):
-                            dl_progress.progress((i + 1) / total_existing, text=f"既存画像取得中... ({i+1}/{total_existing}) {cno}")
-                            url = item.get('URL', '')
-                            try:
-                                resp = dl_session.get(url, timeout=15)
-                                if resp.status_code == 200 and len(resp.content) > 100:
-                                    target_image_map[cno] = resp.content
-                                else:
-                                    skipped_existing.append(cno)
-                            except Exception:
-                                skipped_existing.append(cno)
-                        dl_progress.empty()
+                    skipped_existing = []
+                    _dl_session = requests.Session()
+
+                    def _get_image(cno):
+                        """comic_no の画像bytesを遅延取得（不足分→既存R-Cabinet）。失敗はNone。"""
+                        if cno in step3_map:
+                            return step3_map[cno]
+                        item = existing_available.get(cno)
+                        if not item:
+                            return None
+                        url = item.get('URL', '')
+                        if not url:
+                            return None
+                        try:
+                            resp = _dl_session.get(url, timeout=15)
+                            if resp.status_code == 200 and len(resp.content) > 100:
+                                return resp.content
+                        except Exception:
+                            pass
+                        skipped_existing.append(cno)
+                        return None
+
+                    # 出力先（ディスク）。前回の生成分は掃除しておく。
+                    _prev = st.session_state.workflow_data.get('yahoo_zips', {})
+                    if _prev.get('out_dir'):
+                        _shutil.rmtree(_prev['out_dir'], ignore_errors=True)
+                    out_dir = _tempfile.mkdtemp(prefix="yahoo_zips_")
+
+                    gen_progress = st.progress(0, text="ZIP生成準備中...")
+
+                    def _progress(done, total, cno):
+                        try:
+                            gen_progress.progress(done / total, text=f"画像取得＆ZIP生成中... ({done}/{total}) {cno}")
+                        except Exception:
+                            pass
 
                     additional_dir = _os.path.join(_os.path.dirname(__file__), "images")
                     result = prepare_yahoo_zips(
-                        target_image_map, excel_set_df, excel_tanpin_df, excel_yoyaku_df, additional_dir,
+                        _get_image, excel_set_df, excel_tanpin_df, excel_yoyaku_df,
+                        additional_dir, out_dir, progress_cb=_progress,
                     )
+                    gen_progress.empty()
+
                     # 既存DL失敗分のログを追記
                     if skipped_existing:
                         result.setdefault('logs', []).append(
@@ -4515,13 +4564,13 @@ if mode == "🎨 クリエイティブスタジオ":
                 # ZIP結果表示
                 if 'yahoo_zips' in st.session_state.workflow_data:
                     result = st.session_state.workflow_data['yahoo_zips']
-                    zips = result['zips']
+                    zip_paths = result.get('zip_paths', [])
 
                     col_m1, col_m2, col_m3, col_m4 = st.columns(4)
                     col_m1.metric("マッピング成功", result['mapped'])
                     col_m2.metric("画像未取得", len(result.get('no_image', [])))
                     col_m3.metric("既存DL失敗", len(result.get('skipped_existing', [])))
-                    col_m4.metric("ZIP数", len(zips))
+                    col_m4.metric("ZIP数", len(zip_paths))
 
                     # 画像未取得ログのダウンロード（未取得＝画像辞書になし／既存DL失敗）
                     no_image_rows = list(result.get('no_image', []))
@@ -4537,35 +4586,30 @@ if mode == "🎨 クリエイティブスタジオ":
                             key="yahoo_no_image_dl",
                         )
 
-                    # 全ZIPを1ファイルにまとめてダウンロード（中身は分割済みのyahoo_upload_NNN.zip）
-                    if zips:
-                        _zf_mod = get_zipfile()
-                        all_buf = BytesIO()
-                        with _zf_mod.ZipFile(all_buf, 'w', _zf_mod.ZIP_STORED) as zf:
-                            for i, zd in enumerate(zips):
-                                zf.writestr(f"yahoo_upload_{i+1:03d}.zip", zd)
-                        total_mb = sum(len(z) for z in zips) / (1024 * 1024)
-                        st.download_button(
-                            label=f"📦 全{len(zips)}ZIPをまとめてダウンロード（{total_mb:.1f}MB）",
-                            data=all_buf.getvalue(),
-                            file_name="yahoo_upload_all.zip",
-                            mime="application/zip",
-                            type="primary",
-                            key="yahoo_zip_all_dl",
+                    # ダウンロードは1個ずつ選択（選んだZIPだけメモリに載せる＝OOM回避）
+                    if zip_paths:
+                        st.markdown("##### 📥 ZIPダウンロード（1個ずつ）")
+                        _names = [_os.path.basename(p) for p in zip_paths]
+                        _sel = st.selectbox(
+                            f"ダウンロードするZIPを選択（全{len(zip_paths)}件）",
+                            _names, key="yahoo_zip_select",
                         )
-                        st.caption("↑ 1ファイルに全分割ZIPを同梱。解凍すると yahoo_upload_001.zip … が出てきます。")
-
-                    # 個別ダウンロード（必要な場合のみ）
-                    with st.expander(f"個別にダウンロード（{len(zips)}件）", expanded=False):
-                        for i, zip_data in enumerate(zips):
-                            size_mb = len(zip_data) / (1024 * 1024)
+                        _sel_path = zip_paths[_names.index(_sel)]
+                        try:
+                            with open(_sel_path, 'rb') as _f:
+                                _sel_bytes = _f.read()
+                            _size_mb = len(_sel_bytes) / (1024 * 1024)
                             st.download_button(
-                                label=f"📥 yahoo_upload_{i+1:03d}.zip ({size_mb:.1f}MB)",
-                                data=zip_data,
-                                file_name=f"yahoo_upload_{i+1:03d}.zip",
+                                label=f"📥 {_sel} をダウンロード（{_size_mb:.1f}MB）",
+                                data=_sel_bytes,
+                                file_name=_sel,
                                 mime="application/zip",
-                                key=f"yahoo_zip_dl_{i}"
+                                type="primary",
+                                key="yahoo_zip_dl_one",
                             )
+                        except FileNotFoundError:
+                            st.error("ZIPファイルが見つかりません（サーバー再起動等で消えた可能性）。再度「ZIP生成」してください。")
+                        st.caption("メモリ節約のため、選んだ1ファイルだけ読み込みます。大量件数は下の API直アップロードが安全・確実です。")
 
                     # ── Yahoo!ショッピングへAPIで直接アップロード ──
                     st.divider()
@@ -4576,7 +4620,7 @@ if mode == "🎨 クリエイティブスタジオ":
                             "⚠️ secrets.toml の [yahoo]（client_id / client_secret / refresh_token）が未設定のため、"
                             "APIアップロードは使えません。上のダウンロードボタンから手動アップロードしてください。"
                         )
-                    elif not zips:
+                    elif not zip_paths:
                         st.info("アップロード対象のZIPがありません。")
                     else:
                         st.warning(
@@ -4594,11 +4638,19 @@ if mode == "🎨 クリエイティブスタジオ":
                                 status = st.empty()
                                 upload_logs = []
                                 success_cnt = 0
-                                for i, zip_data in enumerate(zips):
-                                    fname = f"yahoo_upload_{i+1:03d}.zip"
-                                    status.text(f"Yahoo APIアップロード中... {fname} ({i+1}/{len(zips)})")
-                                    progress.progress((i + 1) / len(zips))
+                                _total_zip = len(zip_paths)
+                                for i, zpath in enumerate(zip_paths):
+                                    fname = _os.path.basename(zpath)
+                                    status.text(f"Yahoo APIアップロード中... {fname} ({i+1}/{_total_zip})")
+                                    progress.progress((i + 1) / _total_zip)
+                                    try:
+                                        with open(zpath, 'rb') as _zf_in:
+                                            zip_data = _zf_in.read()
+                                    except FileNotFoundError:
+                                        upload_logs.append(f"❌ {fname}: ファイルが見つかりません（再生成してください）")
+                                        continue
                                     res = upload_to_yahoo_api(zip_data, access_token, fname)
+                                    del zip_data
                                     if res['success']:
                                         success_cnt += 1
                                         upload_logs.append(f"✅ {fname}: 成功")
@@ -4606,13 +4658,13 @@ if mode == "🎨 クリエイティブスタジオ":
                                         upload_logs.append(f"❌ {fname}: {res['error']}")
                                 progress.empty()
                                 status.empty()
-                                if success_cnt == len(zips):
+                                if success_cnt == _total_zip:
                                     st.success(
-                                        f"✅ 全{len(zips)}件のZIPアップロード成功！ "
+                                        f"✅ 全{_total_zip}件のZIPアップロード成功！ "
                                         "ストアクリエイターPro > 反映管理 で確認してください。"
                                     )
                                 else:
-                                    st.error(f"⚠️ {success_cnt}/{len(zips)}件成功。失敗があります（下記ログ参照）。")
+                                    st.error(f"⚠️ {success_cnt}/{_total_zip}件成功。失敗があります（下記ログ参照）。")
                                 with st.expander("アップロード結果ログ", expanded=True):
                                     for log in upload_logs:
                                         st.text(log)
