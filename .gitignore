@@ -60,3 +60,8 @@ token.json
 
 # Executables (keep source code only)
 *.exe
+
+# manga-trend-radar runtime state
+manga-trend-radar/history.json
+manga-trend-radar/log.txt
+manga-trend-radar/cost_log.json
