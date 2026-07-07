@@ -16,6 +16,8 @@ import pandas as pd
 import time
 import json
 import re
+import unicodedata
+import difflib
 from io import BytesIO
 from datetime import datetime, timezone, timedelta
 
@@ -1081,8 +1083,55 @@ def add_folder_hierarchy_info(result_data, hierarchy_df):
     return result_data
 
 
-def get_bookoff_image(jan_code, session):
-    """ブックオフから画像URL取得"""
+# 装飾記号・空白（正規化で除去する文字。全角スペース含む）
+_TITLE_NORMALIZE_STRIP_CHARS = '　 \t\n。、・：:！!？?~〜ー－-()（）[]【】「」『』"\'　巻'
+
+
+def normalize_title_for_match(s):
+    """タイトル照合用の正規化文字列を作る
+
+    NFKC正規化→小文字化→空白・記号（。、・：:！!？?~〜-ー()（）[]【】巻など装飾）を除去する。
+    「センセ。」のような短いタイトルでも記号除去後に空文字にならない限りは機能する。
+    """
+    if not s:
+        return ''
+    normalized = unicodedata.normalize('NFKC', str(s)).lower()
+    for ch in _TITLE_NORMALIZE_STRIP_CHARS:
+        normalized = normalized.replace(ch, '')
+    return normalized.strip()
+
+
+def title_matches(expected_titles: list, candidate_title: str) -> bool:
+    """expected_titlesのいずれかがcandidate_titleと同一作品とみなせるか判定する
+
+    正規化後に部分一致（どちらかがどちらかを含む）、または
+    difflib.SequenceMatcher の ratio が 0.65 以上ならTrue。
+    expected_titles・candidate_titleが正規化後に空文字になる場合はFalse
+    （＝照合不能。呼び出し側で「未検証」扱いにするかは別途判断すること）。
+    """
+    candidate_norm = normalize_title_for_match(candidate_title)
+    if not candidate_norm:
+        return False
+
+    for expected in (expected_titles or []):
+        expected_norm = normalize_title_for_match(expected)
+        if not expected_norm:
+            continue
+        if expected_norm in candidate_norm or candidate_norm in expected_norm:
+            return True
+        ratio = difflib.SequenceMatcher(None, expected_norm, candidate_norm).ratio()
+        if ratio >= 0.65:
+            return True
+    return False
+
+
+def get_bookoff_image(jan_code, session, expected_titles: list = None):
+    """ブックオフから画像URL取得（商品タイトルとの照合付き）
+
+    戻り値: (image_url, matched_title) のタプル、見つからなければ None。
+    expected_titlesが空/Noneの場合は照合をスキップして最初の候補をそのまま採用する
+    （呼び出し側でexpected_titlesの有無によりスキップ判断すること）。
+    """
     url = f"https://shopping.bookoff.co.jp/search/keyword/{jan_code}"
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 
@@ -1094,13 +1143,34 @@ def get_bookoff_image(jan_code, session):
         response.raise_for_status()
 
         soup = BeautifulSoup(response.content, 'html.parser')
-        img_tag = soup.select_one('.productItem__image img, .js-gridImg')
+        items = soup.select('.productItem')
 
-        if img_tag and img_tag.get('src'):
+        candidates = []
+        for item in items:
+            img_tag = item.select_one('.productItem__image img, .js-gridImg')
+            if not img_tag or not img_tag.get('src'):
+                continue
             image_url = img_tag['src']
             if any(no_img in image_url.lower() for no_img in NO_IMAGE_PATTERNS):
-                return None
-            return image_url
+                continue
+            title_tag = item.select_one('.productItem__title')
+            title_text = title_tag.get_text(strip=True) if title_tag else ''
+            candidates.append((image_url, title_text))
+
+        if not candidates:
+            return None
+
+        if not expected_titles:
+            # expected_titlesが無い＝照合不能。無検証採用は事故の元なのでNoneを返す
+            # （呼び出し側は expected_titles が空の場合そもそもこの関数を呼ばない設計）
+            return None
+
+        for image_url, title_text in candidates:
+            if not title_text:
+                continue  # タイトル取得できない構造 → このアイテムは未検証扱いでスキップ
+            if title_matches(expected_titles, title_text):
+                return (image_url, title_text)
+
         return None
     except Exception:
         return None
@@ -1175,22 +1245,48 @@ def _warmup_amazon_session(session):
     session._amazon_warmed_up = True
 
 
-def get_amazon_image(jan_code, session):
-    """Amazonから画像URL取得（UAローテーション・Cookieウォームアップ・CAPTCHA検出・1回リトライ）"""
-    import re
+# Amazon「0件」検出用マーカー（スポンサー枠のみのフォールバックページを誤採用しないため）
+AMAZON_NO_RESULTS_MARKERS = [
+    '一致する結果はありません',
+    '該当する商品が見つかりませんでした',
+    'did not match any products',
+    'no results for',
+]
+
+# Amazonのスポンサー枠（広告）を検出するためのセレクタ・キーワード
+AMAZON_SPONSORED_SELECTORS = [
+    '.puis-sponsored-label-text',
+    '[data-component-type="sp-sponsored-result"]',
+    '.s-sponsored-label-info-icon',
+]
+
+
+def _amazon_result_is_sponsored(result_div) -> bool:
+    """検索結果1件がスポンサー（広告）枠かどうか判定"""
+    for selector in AMAZON_SPONSORED_SELECTORS:
+        if result_div.select_one(selector):
+            return True
+    if 'スポンサー' in result_div.get_text():
+        return True
+    return False
+
+
+def get_amazon_image(jan_code, session, expected_titles: list = None):
+    """Amazonから画像URL取得（UAローテーション・Cookieウォームアップ・CAPTCHA検出・1回リトライ）
+
+    - 検索結果を data-component-type="s-search-result" 単位でパースし、
+      スポンサー（広告）枠は除外、商品タイトルで expected_titles と照合する
+    - 「一致する結果はありません」等の0件ページは即Noneを返す
+      （＝0件ページのスポンサー広告を誤採用しない。過去の誤画像事故の原因）
+    - 無検証で任意のAmazon画像URLを拾う正規表現フォールバックは廃止
+
+    戻り値: (image_url, matched_title) のタプル、見つからなければ None。
+    """
     search_url = f"https://www.amazon.co.jp/s?k={jan_code}&i=stripbooks"
     random = get_random()
 
     _warmup_amazon_session(session)
 
-    SELECTORS = [
-        '.s-image',
-        'img[data-image-latency]',
-        '.s-product-image img',
-        '[data-component-type="s-product-image"] img',
-        '.s-result-item img[src*="images-na"]',
-        '.s-result-item img[src*="m.media-amazon"]',
-    ]
     BeautifulSoup = get_bs4()
 
     for attempt in range(2):  # 初回 + リトライ1回
@@ -1209,27 +1305,51 @@ def get_amazon_image(jan_code, session):
 
             soup = BeautifulSoup(response.content, 'html.parser')
 
-            # 複数のセレクタを順番に試す
-            for selector in SELECTORS:
-                img_tags = soup.select(selector)
-                for img_tag in img_tags:
-                    src = img_tag.get('src') or img_tag.get('data-src')
-                    if src and ('images-na' in src or 'm.media-amazon' in src or 'images-amazon' in src):
-                        if 'no-img' not in src.lower() and 'no_image' not in src.lower():
-                            if '_AC_' in src:
-                                src = src.split('._AC_')[0] + '._SY466_.jpg'
-                            elif '_SX' in src or '_SY' in src:
-                                src = re.sub(r'\._S[XY]\d+_', '._SY466_', src)
-                            return src
+            # 0件ページ検出（スポンサー枠しか無いページを誤採用しないため最優先でチェック）
+            page_text = soup.get_text()
+            if any(marker in page_text for marker in AMAZON_NO_RESULTS_MARKERS):
+                return None
 
-            # フォールバック: 正規表現でAmazon画像URLを探す
-            amazon_img_pattern = r'(https?://[^"\']+(?:images-na\.ssl-images-amazon|m\.media-amazon|images-amazon)[^"\'\s]+\.(?:jpg|jpeg|png))'
-            matches = re.findall(amazon_img_pattern, response.text)
-            for match in matches:
-                if 'no-img' not in match.lower() and 'no_image' not in match.lower() and 'sprite' not in match.lower():
-                    if '_AC_' in match:
-                        match = match.split('._AC_')[0] + '._SY466_.jpg'
-                    return match
+            results = soup.select('div[data-component-type="s-search-result"]')
+            if not results:
+                return None
+
+            candidates = []
+            for result_div in results:
+                if not result_div.get('data-asin'):
+                    continue
+                if _amazon_result_is_sponsored(result_div):
+                    continue  # スポンサー（広告）枠は候補にしない
+
+                title_el = result_div.select_one('h2 a span') or result_div.select_one('h2 span')
+                title_text = title_el.get_text(strip=True) if title_el else ''
+
+                img_tag = result_div.select_one('img.s-image')
+                src = img_tag.get('src') if img_tag else None
+                if not src:
+                    continue
+                if 'no-img' in src.lower() or 'no_image' in src.lower():
+                    continue
+
+                if '_AC_' in src:
+                    src = src.split('._AC_')[0] + '._SY466_.jpg'
+                elif '_SX' in src or '_SY' in src:
+                    src = re.sub(r'\._S[XY]\d+_', '._SY466_', src)
+
+                candidates.append((src, title_text))
+
+            if not candidates:
+                return None
+
+            if not expected_titles:
+                # expected_titlesが無い＝照合不能。無検証採用は事故の元なのでNoneを返す
+                return None
+
+            for image_url, title_text in candidates:
+                if not title_text:
+                    continue
+                if title_matches(expected_titles, title_text):
+                    return (image_url, title_text)
 
             return None
         except Exception:
@@ -1241,8 +1361,16 @@ def get_amazon_image(jan_code, session):
     return None
 
 
-def get_rakuten_image(jan_code, session):
-    """楽天ブックスから画像URL取得（Amazonのフォールバック）"""
+def get_rakuten_image(jan_code, session, expected_titles: list = None):
+    """楽天ブックスから画像URL取得（商品タイトルとの照合付き）
+
+    isbn= パラメータ検索だが、実際にヒットしない場合はISBN無視の一般書籍一覧が
+    返ってくることを確認済み（＝無検証採用だと全く関係ない本の画像を拾う事故になりうる）。
+    そのため「結果が1件であること」＋タイトル照合を必須とする。
+    （複数件＝フォールバック一覧。シリーズ名照合だけだと同シリーズ別巻を誤採用するため件数で弾く）
+
+    戻り値: (image_url, matched_title) のタプル、見つからなければ None。
+    """
     search_url = f"https://books.rakuten.co.jp/search?g=001&isbn={jan_code}"
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -1255,29 +1383,105 @@ def get_rakuten_image(jan_code, session):
 
         soup = BeautifulSoup(response.content, 'html.parser')
 
-        # 楽天ブックスの画像セレクタ
-        selectors = [
-            '.rbcomp__item-list__item__image img',
-            '.item-image img',
-            'img[src*="thumbnail.image.rakuten"]',
-        ]
+        items = soup.select('.rbcomp__item-list__item')
+        candidates = []
+        for item in items:
+            img_tag = item.select_one('.rbcomp__item-list__item__image img, .item-image img, img[src*="thumbnail.image.rakuten"], img[src*="r10s.jp"]')
+            if not img_tag:
+                continue
+            src = img_tag.get('src') or img_tag.get('data-src')
+            if not src or 'noimage' in src.lower():
+                continue
 
-        for selector in selectors:
-            img_tag = soup.select_one(selector)
-            if img_tag:
-                src = img_tag.get('src') or img_tag.get('data-src')
-                if src and 'noimage' not in src.lower():
-                    # 大きいサイズに変換
-                    src = src.replace('_ex=64x64', '_ex=200x200').replace('_ex=100x100', '_ex=200x200')
-                    return src
+            # 大きいサイズに変換（新形式: tshop.r10s.jp/...?downsize=130:* / 旧形式: _ex=64x64）
+            if 'downsize=' in src:
+                src = re.sub(r'downsize=\d+:\*', 'downsize=600:*', src)
+            else:
+                src = src.replace('_ex=64x64', '_ex=200x200').replace('_ex=100x100', '_ex=200x200')
+
+            title_tag = item.select_one('.rbcomp__item-list__item__title')
+            title_text = title_tag.get_text(strip=True) if title_tag else ''
+            candidates.append((src, title_text))
+
+        if not candidates:
+            return None
+
+        # ISBN完全一致でヒットした場合、検索結果は1件のはず。
+        # 複数件＝ISBN無視のフォールバック一覧（同シリーズ別巻の画像を誤採用する事故になる）
+        if len(candidates) != 1:
+            return None
+
+        if not expected_titles:
+            # expected_titlesが無い＝照合不能。無検証採用は事故の元なのでNoneを返す
+            return None
+
+        image_url, title_text = candidates[0]
+        if title_text and title_matches(expected_titles, title_text):
+            return (image_url, title_text)
 
         return None
     except Exception:
         return None
 
 
-def get_image_with_gemini_ai(jan_code, session, source_name="amazon"):
-    """Gemini AIを使って画像URLを抽出（セルフヒーリング機能）"""
+def get_openbd_info(jan_code, session) -> dict:
+    """openBD APIから書誌情報（タイトル・表紙URL）を取得（ISBN完全一致）
+
+    https://api.openbd.jp/v1/get?isbn={jan} をGETし、
+    summary.title / summary.cover を返す。ISBN未登録・エラー時は空dict。
+    """
+    try:
+        url = f"https://api.openbd.jp/v1/get?isbn={jan_code}"
+        response = session.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+        if not data or not data[0]:
+            return {}
+
+        summary = data[0].get('summary') or {}
+        return {
+            'title': summary.get('title') or '',
+            'cover': summary.get('cover') or '',
+        }
+    except Exception:
+        return {}
+
+
+def get_ndl_thumbnail(jan_code, session):
+    """国立国会図書館サーチのサムネイルAPIから表紙画像URLを取得（ISBN完全一致）
+
+    https://ndlsearch.ndl.go.jp/thumbnail/{jan}.jpg にGETし、
+    status 200 かつ Content-Type が image かつ サイズ>5KB ならそのURLを返す。
+    （Refererヘッダが無いと403を返すため付与すること）
+    """
+    url = f"https://ndlsearch.ndl.go.jp/thumbnail/{jan_code}.jpg"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://ndlsearch.ndl.go.jp/',
+    }
+    try:
+        response = session.get(url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            return None
+        content_type = response.headers.get('Content-Type', '')
+        if 'image' not in content_type.lower():
+            return None
+        if len(response.content) <= 5000:
+            return None
+        return url
+    except Exception:
+        return None
+
+
+def get_image_with_gemini_ai(jan_code, session, source_name="amazon", expected_titles: list = None):
+    """Gemini AIを使って画像URLと商品タイトルを抽出（セルフヒーリング機能）
+
+    プロンプトで表紙画像URLと商品タイトルの両方をJSONで返させ、
+    expected_titlesとtitle_matchesで照合してから採用する（スポンサー・別商品の誤採用防止）。
+
+    戻り値: (image_url, matched_title) のタプル、見つからなければ None。
+    """
     # Geminiモデルを遅延読み込み
     model = get_gemini_model()
     if not model:
@@ -1317,28 +1521,50 @@ def get_image_with_gemini_ai(jan_code, session, source_name="amazon"):
         else:
             html_snippet = str(soup)[:8000]
 
-        prompt = f"""以下のHTMLから、JANコード「{jan_code}」の本の表紙画像URLを1つだけ抽出してください。
+        expected_title_str = '／'.join([t for t in (expected_titles or []) if t]) or '不明'
+
+        prompt = f"""以下のHTMLから、JANコード「{jan_code}」・想定タイトル「{expected_title_str}」の本の
+表紙画像URLと、その商品のタイトルを抽出してください。
 
 条件:
-- 画像URLのみを返してください（説明不要）
+- 必ずJSON形式 {{"url": "...", "title": "..."}} で返してください（説明不要、JSON以外の文字列は出力しない）
+- スポンサー・広告枠や、想定タイトルと明らかに異なる別商品の画像は除外してください
 - NO IMAGE、noimage、placeholder等のダミー画像は除外
-- https://で始まる完全なURLで返してください
-- 見つからない場合は「NOT_FOUND」とだけ返してください
+- urlは https://で始まる完全なURLにしてください
+- 確信が持てない・見つからない場合は {{"url": "NOT_FOUND", "title": ""}} と返してください
 
 HTML:
 {html_snippet}"""
 
         response = model.generate_content(prompt)
-        result = response.text.strip()
+        result_text = response.text.strip()
 
-        # 結果を検証
-        if result and result != "NOT_FOUND" and result.startswith("http"):
-            # NO IMAGE系を最終チェック
-            no_image_patterns = ['no_image', 'noimage', 'no-image', 'dummy', 'blank', 'spacer', 'placeholder']
-            if not any(p in result.lower() for p in no_image_patterns):
-                return result
+        # コードブロック記法（```json ... ```）が付く場合を除去
+        result_text = re.sub(r'^```(?:json)?\s*|\s*```$', '', result_text.strip())
 
-        return None
+        try:
+            parsed = json.loads(result_text)
+        except Exception:
+            return None
+
+        result_url = (parsed.get('url') or '').strip()
+        result_title = (parsed.get('title') or '').strip()
+
+        if not result_url or result_url == "NOT_FOUND" or not result_url.startswith("http"):
+            return None
+
+        # NO IMAGE系を最終チェック
+        no_image_patterns = ['no_image', 'noimage', 'no-image', 'dummy', 'blank', 'spacer', 'placeholder']
+        if any(p in result_url.lower() for p in no_image_patterns):
+            return None
+
+        # タイトル照合（expected_titlesが無ければ照合不能＝不採用）
+        if not expected_titles:
+            return None
+        if not title_matches(expected_titles, result_title):
+            return None
+
+        return (result_url, result_title)
 
     except Exception as e:
         # エラーログ（デバッグ用）
@@ -1348,8 +1574,16 @@ HTML:
 
 def download_image(image_url, session):
     """画像をダウンロードしてバイトデータを返す（NO IMAGE検出付き）"""
+    headers = None
+    if 'ndlsearch.ndl.go.jp' in image_url:
+        # NDLサムネイルはRefererヘッダが無いと403になるため付与
+        # （get_ndl_thumbnailで一度取得したURLをここで再取得する際に必要）
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Referer': 'https://ndlsearch.ndl.go.jp/',
+        }
     try:
-        response = session.get(image_url, timeout=10)
+        response = session.get(image_url, headers=headers, timeout=10)
         response.raise_for_status()
         content = response.content
 
@@ -1596,7 +1830,18 @@ def _workflow_prepare_target_data(missing_comics: list, is_list_content: str, co
 
 
 def _workflow_process_one_image(data: dict, session, badge_path: str, obi_path: str = '', use_obi_frame: bool = False):
-    """1件分の画像取得＋加工。結果dict(success/comic_no/jan_code/log/source/image)を返す"""
+    """1件分の画像取得＋加工。結果dict(success/comic_no/jan_code/log/source/image)を返す
+
+    取得フロー（誤画像事故対策）:
+      1. expected_titles = CSVの title/series（空でないもの）
+      2. openBDでISBN引き当て → タイトルが取れれば expected_titles に追加（正解データとして最有力）
+      3. bookoff → amazon → rakuten の順にスクレイピング。各ソースで商品タイトルを
+         expected_titles と照合し、一致した候補のみ採用（スポンサー広告・別作品の誤採用防止）
+      4. openBD cover / NDLサムネイル はISBN直引きのため照合不要
+      5. Gemini AI はタイトル照合つきで最終フォールバック
+      6. expected_titlesが1つも無い場合（CSVタイトル空＋openBD未登録）は検索系ソースを
+         スキップし、ISBN直引き系（openBD cover / NDL）のみ試す
+    """
     import os
     random = get_random()
     comic_no = str(data.get('comic_no', '')).strip()
@@ -1606,29 +1851,68 @@ def _workflow_process_one_image(data: dict, session, badge_path: str, obi_path: 
         return {'success': False, 'comic_no': comic_no, 'jan_code': '',
                 'log': f"⚠️ {comic_no}: JANコードなし - スキップ", 'source': None, 'image': None}
 
-    image_url = get_bookoff_image(jan_code, session)
-    source = 'bookoff'
+    expected_titles = [t for t in (data.get('title', ''), data.get('series', '')) if t]
 
+    # openBDでISBN引き当て（正解データとしてexpected_titlesに追加）
+    openbd_info = get_openbd_info(jan_code, session)
+    if openbd_info.get('title'):
+        expected_titles.append(openbd_info['title'])
+
+    image_url = None
+    matched_title = None
+    source = None
+
+    if not expected_titles:
+        # タイトル照合不能 → スクレイパー系（bookoff/amazon/rakuten）は誤採用リスクが高いためスキップ
+        pass
+    else:
+        bookoff_result = get_bookoff_image(jan_code, session, expected_titles)
+        if bookoff_result:
+            image_url, matched_title = bookoff_result
+            source = 'bookoff'
+
+        if not image_url:
+            time.sleep(random.uniform(1.5, 3.0))
+            amazon_result = get_amazon_image(jan_code, session, expected_titles)
+            if amazon_result:
+                image_url, matched_title = amazon_result
+                source = 'amazon'
+
+        if not image_url:
+            time.sleep(random.uniform(0.3, 0.6))
+            rakuten_result = get_rakuten_image(jan_code, session, expected_titles)
+            if rakuten_result:
+                image_url, matched_title = rakuten_result
+                source = 'rakuten'
+
+    # openBD cover（ISBN直引き・照合不要）
+    if not image_url and openbd_info.get('cover'):
+        image_url = openbd_info['cover']
+        matched_title = openbd_info.get('title', '')
+        source = 'openbd'
+
+    # NDLサムネイル（ISBN直引き・照合不要）
     if not image_url:
-        time.sleep(random.uniform(1.5, 3.0))
-        image_url = get_amazon_image(jan_code, session)
-        source = 'amazon'
+        ndl_url = get_ndl_thumbnail(jan_code, session)
+        if ndl_url:
+            image_url = ndl_url
+            matched_title = ''
+            source = 'ndl'
 
-    if not image_url:
-        time.sleep(random.uniform(0.3, 0.6))
-        image_url = get_rakuten_image(jan_code, session)
-        source = 'rakuten'
-
-    if not image_url and GEMINI_API_KEY:
+    if not image_url and GEMINI_API_KEY and expected_titles:
         time.sleep(random.uniform(0.5, 1.0))
-        ai_result = get_image_with_gemini_ai(jan_code, session, "amazon")
+        ai_result = get_image_with_gemini_ai(jan_code, session, "amazon", expected_titles)
         if ai_result:
-            image_url = ai_result
+            image_url, matched_title = ai_result
             source = 'gemini_ai'
 
     if not image_url:
+        if not expected_titles:
+            note = "⚠️ タイトル照合不能のため検索系ソースをスキップ - "
+        else:
+            note = ""
         return {'success': False, 'comic_no': comic_no, 'jan_code': jan_code,
-                'log': f"❌ {comic_no} (JAN: {jan_code}): 画像が見つかりません", 'source': None, 'image': None}
+                'log': f"❌ {comic_no} (JAN: {jan_code}): {note}画像が見つかりません", 'source': None, 'image': None}
 
     image_data = download_image(image_url, session)
     if not image_data:
@@ -1673,8 +1957,15 @@ def _workflow_process_one_image(data: dict, session, badge_path: str, obi_path: 
         'series': data.get('series', ''),
         'title': data.get('title', ''),
     }
+    if source in ('openbd', 'ndl'):
+        match_note = "ISBN直引き"
+    elif matched_title:
+        match_note = f"照合OK『{matched_title}』"
+    else:
+        match_note = "照合OK"
+
     return {'success': True, 'comic_no': comic_no, 'jan_code': jan_code,
-            'log': f"✅ {comic_no} (JAN: {jan_code}): {source} - {badge_status}",
+            'log': f"✅ {comic_no} (JAN: {jan_code}): {source} - {match_note} - {badge_status}",
             'source': source, 'image': image_dict}
 
 
@@ -1687,7 +1978,7 @@ def process_workflow_images(missing_comics: list, is_list_content: str, comic_li
     session = requests.Session()
     random = get_random()
     downloaded_images = []
-    stats = {'total': len(target_data), 'success': 0, 'failed': 0, 'bookoff': 0, 'amazon': 0, 'rakuten': 0, 'gemini_ai': 0}
+    stats = {'total': len(target_data), 'success': 0, 'failed': 0, 'bookoff': 0, 'amazon': 0, 'rakuten': 0, 'openbd': 0, 'ndl': 0, 'gemini_ai': 0}
     logs = []
 
     for i, data in enumerate(target_data):
@@ -3921,7 +4212,7 @@ if mode == "🎨 クリエイティブスタジオ":
                 st.session_state.wf_img_downloaded = []
                 st.session_state.wf_img_stats = {
                     'total': len(target_data), 'success': 0, 'failed': 0,
-                    'bookoff': 0, 'amazon': 0, 'rakuten': 0, 'gemini_ai': 0,
+                    'bookoff': 0, 'amazon': 0, 'rakuten': 0, 'openbd': 0, 'ndl': 0, 'gemini_ai': 0,
                 }
                 st.session_state.wf_img_logs = []
                 st.session_state.wf_img_badge_path = badge_path
@@ -4007,13 +4298,15 @@ if mode == "🎨 クリエイティブスタジオ":
             st.markdown("### 取得結果")
 
             # 統計
-            stat_cols = st.columns(6)
+            stat_cols = st.columns(8)
             stat_cols[0].metric("対象", stats.get('total', 0))
             stat_cols[1].metric("成功", stats.get('success', 0))
             stat_cols[2].metric("失敗", stats.get('failed', 0))
             stat_cols[3].metric("ブックオフ", stats.get('bookoff', 0))
             stat_cols[4].metric("Amazon", stats.get('amazon', 0))
-            stat_cols[5].metric("楽天/AI", f"{stats.get('rakuten', 0)}/{stats.get('gemini_ai', 0)}")
+            stat_cols[5].metric("楽天", stats.get('rakuten', 0))
+            stat_cols[6].metric("openBD/NDL", f"{stats.get('openbd', 0)}/{stats.get('ndl', 0)}")
+            stat_cols[7].metric("AI", stats.get('gemini_ai', 0))
 
             # 画像プレビュー（3列グリッド、最大6件）
             if images:
