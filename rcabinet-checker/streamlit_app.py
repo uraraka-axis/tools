@@ -2666,8 +2666,6 @@ def append_to_folder_mgmt_sheet(uploaded_rows):
     F〜H(ディレクトリ列)は直前データ行の数式をcopyPasteで複製（VLOOKUP参照を自動調整）。
     ファイル名(B列)が既存のものはスキップ。
     """
-    import re as _re
-
     service, err = _get_sheets_service()
     if err:
         return {"success": False, "error": err, "added": 0, "logs": []}
@@ -2694,21 +2692,18 @@ def append_to_folder_mgmt_sheet(uploaded_rows):
             continue
         try:
             # 既存ファイル名（B列）で重複排除
+            # 【重要】書込位置はB列（ファイル名）の実データ末尾を基準にする。
+            # このシートはA列のNo.だけ実データより下まで先埋めされているタブがあり
+            # （例: 単品タブはB列5.4万行に対しA列7万行）、A列基準やappend APIだと
+            # 転記が実データから大きく離れた行に飛んでしまうため。
             b_col = sheets.values().get(
                 spreadsheetId=FOLDER_MGMT_SPREADSHEET_ID, range=f"'{title}'!B:B"
             ).execute().get('values', [])
             existing_names = set(str(x[0]).strip() for x in b_col if x and str(x[0]).strip())
-            # A列の最大No.（数値）と最終データ行
-            a_col = sheets.values().get(
-                spreadsheetId=FOLDER_MGMT_SPREADSHEET_ID, range=f"'{title}'!A:A"
-            ).execute().get('values', [])
-            last_data_row = len(a_col)  # 1始まりの最終データ行（A列が連番で埋まっている前提）
-            max_no = 0
-            for x in a_col:
-                if x and str(x[0]).strip().isdigit():
-                    max_no = max(max_no, int(str(x[0]).strip()))
+            b_end = len(b_col)               # B列実データの最終行（1始まり。行1=ヘッダー）
 
             new_values = []
+            next_no = b_end                  # No.は「行番号-1」の連番（行2=No.1）
             for r in rows:
                 cno = str(r.get('comic_no', '')).strip()
                 if not cno or cno in existing_names:
@@ -2716,48 +2711,44 @@ def append_to_folder_mgmt_sheet(uploaded_rows):
                         logs.append(f"⏭️ {title}: {cno} は既存のためスキップ")
                     continue
                 existing_names.add(cno)
-                max_no += 1
                 new_values.append([
-                    max_no,                               # A: No.
+                    next_no,                              # A: No.
                     cno,                                  # B: ファイル名
                     "コミック",                            # C: カテゴリ1
                     FOLDER_MGMT_CAT2.get(ctype, ctype),   # D: カテゴリ2
                     str(r.get('subfolder', '')).strip(),  # E: カテゴリ3（サブフォルダ）
                 ])
+                next_no += 1
 
             if not new_values:
                 continue
 
-            # A:E を末尾追記
-            resp = sheets.values().append(
+            # B列実データ末尾の直下へ書き込む（A列先埋め領域は同じ連番で上書きされるだけなので無害）
+            dst_start_row = b_end + 1                         # 1始まり
+            dst_end_row = dst_start_row + len(new_values) - 1
+            sheets.values().update(
                 spreadsheetId=FOLDER_MGMT_SPREADSHEET_ID,
-                range=f"'{title}'!A:E",
+                range=f"'{title}'!A{dst_start_row}:E{dst_end_row}",
                 valueInputOption="USER_ENTERED",
-                insertDataOption="INSERT_ROWS",
                 body={"values": new_values},
             ).execute()
 
-            # 追記行範囲を解析（例: 'セット品'!A16877:E16880）し、F:H の数式を直前行から複製
-            updated_range = resp.get('updates', {}).get('updatedRange', '')
-            m = _re.search(r'![A-Z]+(\d+):[A-Z]+(\d+)$', updated_range)
-            if m and last_data_row >= 2:
-                dst_start0 = int(m.group(1)) - 1   # 0始まり
-                dst_end0 = int(m.group(2))         # exclusive
-                src_row0 = last_data_row - 1       # 直前データ行（数式複製元）
+            # F:H の数式を直前の実データ行から複製（VLOOKUP参照を自動調整）
+            if b_end >= 2:
                 sheets.batchUpdate(
                     spreadsheetId=FOLDER_MGMT_SPREADSHEET_ID,
                     body={"requests": [{
                         "copyPaste": {
-                            "source": {"sheetId": gid, "startRowIndex": src_row0, "endRowIndex": src_row0 + 1,
+                            "source": {"sheetId": gid, "startRowIndex": b_end - 1, "endRowIndex": b_end,
                                        "startColumnIndex": 5, "endColumnIndex": 8},
-                            "destination": {"sheetId": gid, "startRowIndex": dst_start0, "endRowIndex": dst_end0,
+                            "destination": {"sheetId": gid, "startRowIndex": dst_start_row - 1, "endRowIndex": dst_end_row,
                                             "startColumnIndex": 5, "endColumnIndex": 8},
                             "pasteType": "PASTE_FORMULA",
                         }
                     }]},
                 ).execute()
             else:
-                logs.append(f"⚠️ {title}: ディレクトリ列(F:H)の数式複製をスキップ（追記範囲解析不可）")
+                logs.append(f"⚠️ {title}: ディレクトリ列(F:H)の数式複製をスキップ（複製元データ行なし）")
 
             total_added += len(new_values)
             logs.append(f"✅ {title}: {len(new_values)}件追記")
