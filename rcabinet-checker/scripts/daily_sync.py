@@ -149,6 +149,22 @@ def get_folder_files(folder_id: int):
     return all_files
 
 
+def _exec_with_retry(fn, what: str, tries: int = 3, delay: int = 5):
+    """Supabase呼び出しのリトライ。
+
+    HTTP/2接続がサーバ側で切断された場合（ConnectionTerminated等）、httpxは
+    次のリクエストで新しい接続を張り直すため、単純リトライで回復できる。
+    """
+    for attempt in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt == tries - 1:
+                raise
+            print(f"  {what} 失敗({attempt + 1}/{tries}): {e} → {delay}秒後リトライ")
+            time.sleep(delay)
+
+
 def fetch_all_from_supabase(supabase: Client, table: str, columns: str = "*") -> list:
     """Supabaseから全件取得（ページネーション対応）"""
     all_data = []
@@ -227,14 +243,32 @@ def sync_images_to_db(supabase: Client, images: list) -> dict:
         # upsert（100件ずつ、複合キー指定）
         for i in range(0, len(records_to_upsert), 100):
             batch = records_to_upsert[i:i + 100]
-            supabase.table("rcabinet_images").upsert(
-                batch, on_conflict="folder_name,file_name"
-            ).execute()
+            _exec_with_retry(
+                lambda b=batch: supabase.table("rcabinet_images").upsert(
+                    b, on_conflict="folder_name,file_name"
+                ).execute(),
+                what=f"upsert({i}〜)",
+            )
 
-        # 削除実行
+        # 削除実行（フォルダ単位でまとめ削除）
+        # 【2026-07-10障害の教訓】1件ずつ削除すると大量削除時（家具フォルダ整理で
+        # 2.1万件）にリクエスト数がHTTP/2接続の上限（約1万ストリーム）を超え、
+        # Supabase側にConnectionTerminatedで切断されてクラッシュする。
+        # フォルダごとにIN句で200件ずつまとめ、リクエスト数を約1/200に抑える。
+        if deleted_count:
+            print(f"  Deleting {deleted_count} rows (batched)...")
+        deletes_by_folder = {}
         for folder_name, file_name in deleted_keys:
-            supabase.table("rcabinet_images").delete()\
-                .eq("folder_name", folder_name).eq("file_name", file_name).execute()
+            deletes_by_folder.setdefault(folder_name, []).append(file_name)
+        DELETE_CHUNK = 200
+        for folder_name, names in deletes_by_folder.items():
+            for i in range(0, len(names), DELETE_CHUNK):
+                chunk = names[i:i + DELETE_CHUNK]
+                _exec_with_retry(
+                    lambda f=folder_name, c=chunk: supabase.table("rcabinet_images").delete()
+                    .eq("folder_name", f).in_("file_name", c).execute(),
+                    what=f"delete({folder_name} {i}〜)",
+                )
 
         return {
             "success": True,
