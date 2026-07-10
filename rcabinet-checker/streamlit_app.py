@@ -5551,6 +5551,12 @@ elif mode == "🔁 コピー：R-Cabi⇒R-Cabi":
 
     st.divider()
 
+    # フォルダ一覧は10分キャッシュされるため、新規作成直後のフォルダが
+    # 「フォルダID不正」になる場合はここで再取得する
+    if st.button("🔄 フォルダ一覧を再取得（作成直後のフォルダがID不正になる場合）", key="csv_copy_refresh_folders"):
+        get_all_folders.clear()
+        st.success("フォルダ一覧のキャッシュをクリアしました。ファイルを選択（再選択）してください。")
+
     # ファイルアップロード（CSV/Excel対応）
     upload_file = st.file_uploader("CSV / Excelファイルを選択", type=["csv", "xlsx"], key="csv_image_copy")
 
@@ -5877,6 +5883,12 @@ elif mode == "☁️ コピー：Local⇒R-Cabi":
     st.divider()
 
     st.warning("⚠ この機能はローカル実行時のみ使用できます（Streamlit Cloudではファイルパスにアクセスできません）")
+
+    # フォルダ一覧は10分キャッシュされるため、新規作成直後のフォルダが
+    # 「フォルダID不正」になる場合はここで再取得する
+    if st.button("🔄 フォルダ一覧を再取得（作成直後のフォルダがID不正になる場合）", key="local_up2_refresh_folders"):
+        get_all_folders.clear()
+        st.success("フォルダ一覧のキャッシュをクリアしました。ファイルを選択（再選択）してください。")
 
     # ファイルアップロード（CSV/Excel対応）
     upload_file = st.file_uploader("CSV / Excelファイルを選択", type=["csv", "xlsx"], key="local_image_upload")
