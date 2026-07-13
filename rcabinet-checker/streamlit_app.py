@@ -595,6 +595,51 @@ def get_db_stats() -> dict:
         return {}
 
 
+def upsert_uploaded_images_to_mirror(uploaded: list) -> dict:
+    """アップロード直後にミラーDB（rcabinet_images）へ即時反映する（さきがけ登録）。
+
+    出品コックピットの「画像あり」判定は本ミラーを参照しており、従来は翌日の
+    Daily R-Cabinet Syncまで新規アップ分が「なし」と出る時差があった。その解消用。
+    file_url / file_size / file_timestamp は仮値で入れ、次回の日次同期
+    （sync_images_to_db。timestamp差分で必ず上書き対象になる）が正しい値に直す。
+
+    uploaded: [{"folder_name":..., "file_name":..., "folder_path":...}, ...]
+    失敗しても呼び出し元の処理は止めないこと（戻り値dictで結果を返すのみ）。
+    """
+    supabase = get_supabase_client()
+    if not supabase:
+        return {"success": False, "error": "Supabase未設定", "upserted": 0}
+    try:
+        ts = datetime.now(JST).strftime("%Y-%m-%dT%H:%M:%S+09:00")
+        records = []
+        seen = set()
+        for u in uploaded:
+            folder_name = (u.get("folder_name") or "").strip()
+            file_name = (u.get("file_name") or "").strip()
+            if not folder_name or not file_name or (folder_name, file_name) in seen:
+                continue
+            seen.add((folder_name, file_name))
+            records.append({
+                "folder_name": folder_name,
+                "file_name": file_name,
+                "folder_path": u.get("folder_path", ""),
+                "file_url": "",
+                "file_size": 0,
+                "file_timestamp": ts,
+            })
+        for i in range(0, len(records), 100):
+            supabase.table("rcabinet_images").upsert(
+                records[i:i + 100], on_conflict="folder_name,file_name"
+            ).execute()
+        try:
+            load_images_from_db.clear()
+        except Exception:
+            pass
+        return {"success": True, "upserted": len(records)}
+    except Exception as e:
+        return {"success": False, "error": str(e), "upserted": 0}
+
+
 def load_images_from_db_by_folder(folder_name: str) -> list:
     """DBから特定フォルダの画像を読み込み（ページネーション対応）"""
     supabase = get_supabase_client()
@@ -4563,6 +4608,22 @@ if mode == "🎨 クリエイティブスタジオ":
                                     err_msg = res.get('error', '不明なエラー')
                                     upload_failed.append({'comic_no': p['comic_no'], 'error': err_msg})
                                     log_lines.append(f"❌ {p['comic_no']}: {err_msg}")
+
+                            # ミラーDB（rcabinet_images）へ即時反映（アップロード成功分のみ）。
+                            # 出品コックピットの「画像あり」判定が翌日の日次同期を待たずに緑になる
+                            _mirror_failed = set(f['comic_no'] for f in upload_failed)
+                            _mirror_rows = [
+                                {"folder_name": p['target_folder_name'],
+                                 "file_name": p['file_name'],
+                                 "folder_path": f"{p['parent_path']}/{p['target_folder_name']}"}
+                                for p in plan_result['plan'] if p['comic_no'] not in _mirror_failed
+                            ]
+                            if _mirror_rows:
+                                _mirror_result = upsert_uploaded_images_to_mirror(_mirror_rows)
+                                if _mirror_result.get("success"):
+                                    log_lines.append(f"🪞 ミラーDB即時反映: {_mirror_result['upserted']}件（出品コックピットの画像判定に即時反映）")
+                                else:
+                                    log_lines.append(f"⚠️ ミラーDB即時反映に失敗（翌日の日次同期で反映されます）: {_mirror_result.get('error', '')}")
 
                             # 楽天RMS画像フォルダ管理シートへ追記（アップロード成功分のみ）
                             sheet_result = None
