@@ -49,8 +49,10 @@ def log(msg: str):
         pass
 
 
-def collect_with_retry(tries: int = 4, wait: int = 30) -> list:
-    """収集が0件（=起動直後などでネット未接続の可能性）ならリトライする。"""
+def collect_with_retry(tries: int = 10, wait: int = 60) -> list:
+    """収集が0件（=起動直後などでネット未接続の可能性）ならリトライする。
+    2026-07-28: 30秒×4回では朝のWi-Fi復帰に間に合わず通知漏れ（07/06・07/28の2回発生）
+    したため、60秒×10回（約10分粘る）に延長。"""
     for i in range(1, tries + 1):
         items = collector.collect()
         if items:
