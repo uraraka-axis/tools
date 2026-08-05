@@ -1170,55 +1170,117 @@ def title_matches(expected_titles: list, candidate_title: str) -> bool:
     return False
 
 
-def get_bookoff_image(jan_code, session, expected_titles: list = None):
-    """ブックオフから画像URL取得（商品タイトルとの照合付き）
+def extract_volume_from_title(title: str):
+    """商品タイトルから巻数を抽出する（単品の巻数照合用）。読み取れなければNone
+
+    対応パターン: 「(5)」「（００５）」「第5巻」「5巻」「Vol.5」「タイトル 5」など。
+    「ワイルド7」のようにシリーズ名自体に数字が付く場合は誤抽出しないよう、
+    数字の前後が区切り（括弧・空白・巻）である場合のみ抽出する。
+    """
+    if not title:
+        return None
+    t = unicodedata.normalize('NFKC', str(title))
+    # 括弧内の数字は巻数表記の可能性が最も高い（末尾側を優先: 「ワイルド7(ヒットC)(5)」対策）
+    m = re.findall(r'[(（]\s*(\d{1,3})\s*[)）]', t)
+    if m:
+        return int(m[-1])
+    m = re.search(r'第\s*(\d{1,3})\s*巻', t)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'(\d{1,3})\s*巻', t)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'[Vv]ol\.?\s*(\d{1,3})', t)
+    if m:
+        return int(m.group(1))
+    # 空白で区切られた独立数字（「ふしぎ遊戯 11」「ワイルド7 5 (ヒットコミックス)」の後者）
+    m = re.findall(r'(?:^|[\s　])(\d{1,3})(?:[\s　]|$)', t)
+    if m:
+        return int(m[-1])
+    return None
+
+
+def candidate_volume_ok(expected_volume, candidate_title: str) -> bool:
+    """単品の巻数照合: 候補タイトルの巻数が期待巻と矛盾しないか判定する
+
+    - expected_volume が None（セット・予約など巻指定なし）→ 常にTrue
+    - 候補タイトルから巻数が読み取れない → True（緩め設計: 取得成功率を維持）
+    - 読み取れた巻数が期待巻と不一致 → False（別巻の誤採用を防止）
+    """
+    if expected_volume is None:
+        return True
+    vol = extract_volume_from_title(candidate_title)
+    if vol is None:
+        return True
+    return vol == int(expected_volume)
+
+
+def get_bookoff_image(jan_code, session, expected_titles: list = None, expected_volume=None):
+    """ブックオフから画像URL取得（商品タイトルとの照合付き・429リトライ付き）
 
     戻り値: (image_url, matched_title) のタプル、見つからなければ None。
     expected_titlesが空/Noneの場合は照合をスキップして最初の候補をそのまま採用する
     （呼び出し側でexpected_titlesの有無によりスキップ判断すること）。
+    expected_volume指定時（単品）は候補タイトルの巻数も照合する。
+
+    レート制限対策: リクエスト前に短いsleep、429応答時は数秒待って1回だけリトライ。
+    （429で即Noneを返すと信頼性の低いAmazonフォールバックに流れて誤画像リスクが上がるため）
     """
     url = f"https://shopping.bookoff.co.jp/search/keyword/{jan_code}"
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 
     NO_IMAGE_PATTERNS = ['item_ll', 'no_image', 'noimage', 'no-image', 'dummy', 'blank', 'spacer', 'placeholder']
     BeautifulSoup = get_bs4()
+    random = get_random()
 
-    try:
-        response = session.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
+    for attempt in range(2):  # 初回 + 429時リトライ1回
+        try:
+            time.sleep(random.uniform(0.4, 0.8))  # 連続アクセスによる429予防
+            response = session.get(url, headers=headers, timeout=10)
+            if response.status_code == 429:
+                if attempt == 0:
+                    time.sleep(random.uniform(3.0, 6.0))
+                    continue
+                return None
+            response.raise_for_status()
 
-        soup = BeautifulSoup(response.content, 'html.parser')
-        items = soup.select('.productItem')
+            soup = BeautifulSoup(response.content, 'html.parser')
+            items = soup.select('.productItem')
 
-        candidates = []
-        for item in items:
-            img_tag = item.select_one('.productItem__image img, .js-gridImg')
-            if not img_tag or not img_tag.get('src'):
-                continue
-            image_url = img_tag['src']
-            if any(no_img in image_url.lower() for no_img in NO_IMAGE_PATTERNS):
-                continue
-            title_tag = item.select_one('.productItem__title')
-            title_text = title_tag.get_text(strip=True) if title_tag else ''
-            candidates.append((image_url, title_text))
+            candidates = []
+            for item in items:
+                img_tag = item.select_one('.productItem__image img, .js-gridImg')
+                if not img_tag or not img_tag.get('src'):
+                    continue
+                image_url = img_tag['src']
+                if any(no_img in image_url.lower() for no_img in NO_IMAGE_PATTERNS):
+                    continue
+                title_tag = item.select_one('.productItem__title')
+                title_text = title_tag.get_text(strip=True) if title_tag else ''
+                candidates.append((image_url, title_text))
 
-        if not candidates:
-            return None
+            if not candidates:
+                return None
 
-        if not expected_titles:
-            # expected_titlesが無い＝照合不能。無検証採用は事故の元なのでNoneを返す
-            # （呼び出し側は expected_titles が空の場合そもそもこの関数を呼ばない設計）
-            return None
+            if not expected_titles:
+                # expected_titlesが無い＝照合不能。無検証採用は事故の元なのでNoneを返す
+                # （呼び出し側は expected_titles が空の場合そもそもこの関数を呼ばない設計）
+                return None
 
-        for image_url, title_text in candidates:
-            if not title_text:
-                continue  # タイトル取得できない構造 → このアイテムは未検証扱いでスキップ
-            if title_matches(expected_titles, title_text):
+            for image_url, title_text in candidates:
+                if not title_text:
+                    continue  # タイトル取得できない構造 → このアイテムは未検証扱いでスキップ
+                if not title_matches(expected_titles, title_text):
+                    continue
+                if not candidate_volume_ok(expected_volume, title_text):
+                    continue  # 単品: 別巻の候補は不採用
                 return (image_url, title_text)
 
-        return None
-    except Exception:
-        return None
+            return None
+        except Exception:
+            return None
+
+    return None
 
 
 # Amazon用 User-Agent プール（ローテーションでBot判定回避）
@@ -1291,8 +1353,13 @@ def _warmup_amazon_session(session):
 
 
 # Amazon「0件」検出用マーカー（スポンサー枠のみのフォールバックページを誤採用しないため）
+# 注意: Amazonは文言を変える（2026年に「一致する結果は〜」→「一致する結果が〜」に変更され
+# 検出が無効化されていた実績あり）。は/が両対応＋結果/商品の揺れも網羅する。
 AMAZON_NO_RESULTS_MARKERS = [
     '一致する結果はありません',
+    '一致する結果がありません',
+    '一致する商品はありません',
+    '一致する商品がありません',
     '該当する商品が見つかりませんでした',
     'did not match any products',
     'no results for',
@@ -1316,7 +1383,7 @@ def _amazon_result_is_sponsored(result_div) -> bool:
     return False
 
 
-def get_amazon_image(jan_code, session, expected_titles: list = None):
+def get_amazon_image(jan_code, session, expected_titles: list = None, expected_volume=None):
     """Amazonから画像URL取得（UAローテーション・Cookieウォームアップ・CAPTCHA検出・1回リトライ）
 
     - 検索結果を data-component-type="s-search-result" 単位でパースし、
@@ -1324,6 +1391,7 @@ def get_amazon_image(jan_code, session, expected_titles: list = None):
     - 「一致する結果はありません」等の0件ページは即Noneを返す
       （＝0件ページのスポンサー広告を誤採用しない。過去の誤画像事故の原因）
     - 無検証で任意のAmazon画像URLを拾う正規表現フォールバックは廃止
+    - expected_volume指定時（単品）は候補タイトルの巻数も照合する
 
     戻り値: (image_url, matched_title) のタプル、見つからなければ None。
     """
@@ -1393,8 +1461,11 @@ def get_amazon_image(jan_code, session, expected_titles: list = None):
             for image_url, title_text in candidates:
                 if not title_text:
                     continue
-                if title_matches(expected_titles, title_text):
-                    return (image_url, title_text)
+                if not title_matches(expected_titles, title_text):
+                    continue
+                if not candidate_volume_ok(expected_volume, title_text):
+                    continue  # 単品: 別巻の候補は不採用
+                return (image_url, title_text)
 
             return None
         except Exception:
@@ -1406,7 +1477,7 @@ def get_amazon_image(jan_code, session, expected_titles: list = None):
     return None
 
 
-def get_rakuten_image(jan_code, session, expected_titles: list = None):
+def get_rakuten_image(jan_code, session, expected_titles: list = None, expected_volume=None):
     """楽天ブックスから画像URL取得（商品タイトルとの照合付き）
 
     isbn= パラメータ検索だが、実際にヒットしない場合はISBN無視の一般書籍一覧が
@@ -1461,7 +1532,8 @@ def get_rakuten_image(jan_code, session, expected_titles: list = None):
             return None
 
         image_url, title_text = candidates[0]
-        if title_text and title_matches(expected_titles, title_text):
+        if title_text and title_matches(expected_titles, title_text) \
+                and candidate_volume_ok(expected_volume, title_text):
             return (image_url, title_text)
 
         return None
@@ -1519,7 +1591,7 @@ def get_ndl_thumbnail(jan_code, session):
         return None
 
 
-def get_image_with_gemini_ai(jan_code, session, source_name="amazon", expected_titles: list = None):
+def get_image_with_gemini_ai(jan_code, session, source_name="amazon", expected_titles: list = None, expected_volume=None):
     """Gemini AIを使って画像URLと商品タイトルを抽出（セルフヒーリング機能）
 
     プロンプトで表紙画像URLと商品タイトルの両方をJSONで返させ、
@@ -1608,6 +1680,8 @@ HTML:
             return None
         if not title_matches(expected_titles, result_title):
             return None
+        if not candidate_volume_ok(expected_volume, result_title):
+            return None  # 単品: 別巻の候補は不採用
 
         return (result_url, result_title)
 
@@ -1615,6 +1689,49 @@ HTML:
         # エラーログ（デバッグ用）
         print(f"Gemini AI error: {e}")
         return None
+
+
+def is_placeholder_cover_image(image_data: bytes) -> bool:
+    """Amazonの「COVER COMING SOON」プレースホルダー画像かどうかを内容から判定する
+
+    Amazonのカバー未登録出品は、紺色（RGB≒40,56,104）一色＋下部白帯の
+    標準テンプレート画像を返す。URLは通常の画像URLなのでURLパターンでは
+    検出できない（2026年4月にワイルド7 5・6巻で実際に誤アップロードされた事故の原因）。
+
+    判定条件（実画像34枚との比較で校正済み）:
+      1. 50x50縮小＋16階調量子化での最頻色が「暗い紺色」（R<80, G<90, 70<=B<=150,
+         B-R>=40, B-G>=30）かつ占有率35%以上
+      2. 上部70%が暗く（平均輝度<100）、下部が明るい（下部-上部>=40）＝白帯構造
+    両方を満たす場合のみプレースホルダーと判定（誤検出防止のためAND条件）。
+    """
+    try:
+        Image = get_pil()
+        img = Image.open(BytesIO(image_data)).convert('RGB')
+        small = img.resize((50, 50))
+        pixels = list(small.getdata())
+
+        # 条件1: 最頻色が暗い紺色で占有率35%以上
+        from collections import Counter
+        quantized = [(r // 16, g // 16, b // 16) for r, g, b in pixels]
+        (qr, qg, qb), count = Counter(quantized).most_common(1)[0]
+        share = count / len(quantized)
+        r, g, b = qr * 16 + 8, qg * 16 + 8, qb * 16 + 8
+        is_navy_dominant = (
+            share >= 0.35
+            and r < 80 and g < 90 and 70 <= b <= 150
+            and (b - r) >= 40 and (b - g) >= 30
+        )
+        if not is_navy_dominant:
+            return False
+
+        # 条件2: 上部暗＋下部白帯の構造
+        gray = small.convert('L')
+        gp = list(gray.getdata())
+        top_mean = sum(gp[:50 * 35]) / (50 * 35)          # 上部70%
+        bottom_mean = sum(gp[50 * 40:]) / (50 * 10)       # 下部20%
+        return top_mean < 100 and (bottom_mean - top_mean) >= 40
+    except Exception:
+        return False  # 判定不能時は弾かない（取得成功率を優先）
 
 
 def download_image(image_url, session):
@@ -1813,6 +1930,7 @@ def _workflow_prepare_target_data(missing_comics: list, is_list_content: str, co
 
     # 単品（'_'あり）
     tanpin_comics = [c for c in missing_comics if '_' in str(c)]
+    tanpin_unresolved = []  # is_list.csvに該当巻がなくJAN引き当てに失敗した単品コミックNo
     for tc in tanpin_comics:
         parts = str(tc).split('_')
         base_no = parts[0]
@@ -1830,6 +1948,20 @@ def _workflow_prepare_target_data(missing_comics: list, is_list_content: str, co
                 'series': base_info.get('series', ''),
                 'title': base_info.get('title', ''),
             })
+        else:
+            tanpin_unresolved.append(str(tc))
+
+    if tanpin_unresolved:
+        # 従来はここで黙ってスキップされ「特定の巻だけ画像が来ない」原因が分からなかった
+        try:
+            st.warning(
+                "単品コミックNoがis_list.csvに該当巻なしでJANを引き当てできませんでした: "
+                + ", ".join(tanpin_unresolved)
+                + "\n（is_list.csvにその巻の行が無い＝Step ② のJAN取得結果に含まれていません。"
+                "上流DBに該当巻の登録が無い可能性があります）"
+            )
+        except Exception:
+            pass
 
     # 予約（'_'なし、最新巻のJANを引き当て）
     yoyaku_unresolved = []  # is_list.csvに該当なしでJAN引き当て失敗した予約コミックNo
@@ -1898,10 +2030,31 @@ def _workflow_process_one_image(data: dict, session, badge_path: str, obi_path: 
 
     expected_titles = [t for t in (data.get('title', ''), data.get('series', '')) if t]
 
+    # 単品（comic_no が「12345_3」形式）は期待巻数を抽出して候補タイトルと照合する
+    # （同シリーズ別巻の誤採用防止。セット・予約は None のまま＝照合なし）
+    expected_volume = None
+    if '_' in comic_no:
+        try:
+            expected_volume = int(comic_no.split('_')[1])
+        except (ValueError, IndexError):
+            pass
+
     # openBDでISBN引き当て（正解データとしてexpected_titlesに追加）
     openbd_info = get_openbd_info(jan_code, session)
     if openbd_info.get('title'):
         expected_titles.append(openbd_info['title'])
+
+    # 単品: JAN自体が別巻を指していないかopenBD書誌で検証する
+    # （is_list.csvのJANが誤っている場合、全ソースが「正しくJANどおりの別巻表紙」を
+    #   返してしまい巻数照合でも防げないため、ここで止めてログに残す）
+    if expected_volume is not None and openbd_info.get('title'):
+        openbd_vol = extract_volume_from_title(openbd_info['title'])
+        if openbd_vol is not None and openbd_vol != expected_volume:
+            return {'success': False, 'comic_no': comic_no, 'jan_code': jan_code,
+                    'log': (f"⚠️ {comic_no} (JAN: {jan_code}): JANが別巻を指している疑いのためスキップ"
+                            f"（期待: {expected_volume}巻 / openBD書誌: 『{openbd_info['title']}』）"
+                            "→ is_list.csvのJANを確認してください"),
+                    'source': None, 'image': None}
 
     image_url = None
     matched_title = None
@@ -1911,21 +2064,21 @@ def _workflow_process_one_image(data: dict, session, badge_path: str, obi_path: 
         # タイトル照合不能 → スクレイパー系（bookoff/amazon/rakuten）は誤採用リスクが高いためスキップ
         pass
     else:
-        bookoff_result = get_bookoff_image(jan_code, session, expected_titles)
+        bookoff_result = get_bookoff_image(jan_code, session, expected_titles, expected_volume)
         if bookoff_result:
             image_url, matched_title = bookoff_result
             source = 'bookoff'
 
         if not image_url:
             time.sleep(random.uniform(1.5, 3.0))
-            amazon_result = get_amazon_image(jan_code, session, expected_titles)
+            amazon_result = get_amazon_image(jan_code, session, expected_titles, expected_volume)
             if amazon_result:
                 image_url, matched_title = amazon_result
                 source = 'amazon'
 
         if not image_url:
             time.sleep(random.uniform(0.3, 0.6))
-            rakuten_result = get_rakuten_image(jan_code, session, expected_titles)
+            rakuten_result = get_rakuten_image(jan_code, session, expected_titles, expected_volume)
             if rakuten_result:
                 image_url, matched_title = rakuten_result
                 source = 'rakuten'
@@ -1946,7 +2099,7 @@ def _workflow_process_one_image(data: dict, session, badge_path: str, obi_path: 
 
     if not image_url and GEMINI_API_KEY and expected_titles:
         time.sleep(random.uniform(0.5, 1.0))
-        ai_result = get_image_with_gemini_ai(jan_code, session, "amazon", expected_titles)
+        ai_result = get_image_with_gemini_ai(jan_code, session, "amazon", expected_titles, expected_volume)
         if ai_result:
             image_url, matched_title = ai_result
             source = 'gemini_ai'
@@ -1963,6 +2116,13 @@ def _workflow_process_one_image(data: dict, session, badge_path: str, obi_path: 
     if not image_data:
         return {'success': False, 'comic_no': comic_no, 'jan_code': jan_code,
                 'log': f"❌ {comic_no}: ダウンロード失敗 ({source})", 'source': source, 'image': None}
+
+    # プレースホルダー画像（AmazonのCOVER COMING SOON等）は誤アップ防止のため不採用にする
+    # （誤った表紙が公開されるより取得失敗のほうが安全。ログで判別できるようにする）
+    if is_placeholder_cover_image(image_data):
+        return {'success': False, 'comic_no': comic_no, 'jan_code': jan_code,
+                'log': f"⚠️ {comic_no} (JAN: {jan_code}): プレースホルダー画像（表紙未登録ダミー）のため不採用 ({source})",
+                'source': source, 'image': None}
 
     ctype = data.get('type') or ('tanpin' if data.get('is_tanpin') else 'set')
     is_tanpin = (ctype == 'tanpin')
