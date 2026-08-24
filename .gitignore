@@ -65,3 +65,9 @@ token.json
 manga-trend-radar/history.json
 manga-trend-radar/log.txt
 manga-trend-radar/cost_log.json
+
+# ops-watch: 生きたWebhook+APIキーを含むためコミットしない（config.example.jsonを参照）
+ops-watch/config.json
+
+# morning-startup: Windows固有のショートカットバックアップ（機械依存ゴミ）
+morning-startup/*.lnk.bak
