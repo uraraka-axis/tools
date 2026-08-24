@@ -115,10 +115,24 @@ _yahoo_secrets = st.secrets.get("yahoo", {})
 YAHOO_CLIENT_ID = _yahoo_secrets.get("client_id", "")
 YAHOO_CLIENT_SECRET = _yahoo_secrets.get("client_secret", "")
 YAHOO_REFRESH_TOKEN = _yahoo_secrets.get("refresh_token", "")
-YAHOO_SELLER_ID = _yahoo_secrets.get("seller_id", "haru-urarakana")
+YAHOO_SELLER_ID = _yahoo_secrets.get("seller_id", "hachimitsu-syoten")
 YAHOO_TOKEN_URL = "https://auth.login.yahoo.co.jp/yconnect/v2/token"
 # 商品画像一括アップロード（メイン=商品コード.jpg / 追加=商品コード_1〜20.jpg）
 YAHOO_UPLOAD_URL = "https://circus.shopping.yahooapis.jp/ShoppingWebService/V1/uploadItemImagePack"
+
+# au PAY マーケット Wow! manager 接続情報（secrets.toml の [wowma] セクション）
+# 画像のアップロードAPIは存在しない。FTPが投入口で、モール側バッチが取り込むと
+# FTP上から消え https://image.wowma.jp/{shopId}/{ファイル名} で公開される。
+# API（画像検索/容量/削除）はAPIキーBearer認証＋接続元グローバルIPの事前登録が必要。
+# APIキー・FTPパスワードとも有効期限90日（期限10日前に基本メールアドレスへ通知）。
+_wowma_secrets = st.secrets.get("wowma", {})
+WOWMA_SHOP_ID = _wowma_secrets.get("shop_id", "95395131")
+WOWMA_API_KEY = _wowma_secrets.get("api_key", "")
+WOWMA_FTP_HOST = _wowma_secrets.get("ftp_host", "img.manager.wowma.jp")
+WOWMA_FTP_USER = _wowma_secrets.get("ftp_user", "")
+WOWMA_FTP_PASSWORD = _wowma_secrets.get("ftp_password", "")
+WOWMA_API_BASE = "https://api.manager.wowma.jp/wmshopapi"
+WOWMA_IMAGE_BASE_URL = f"https://image.wowma.jp/{WOWMA_SHOP_ID}"
 
 # Google Sheets（楽天RMS画像フォルダ管理シートへの追記用）。secrets.toml の [google] セクション
 # access_token相当は保持せず、refresh_tokenから都度生成（ローカル/Cloud両対応・ブラウザ不要）
@@ -1865,6 +1879,56 @@ def image_to_bytes(image, quality: int = 95) -> bytes:
     return buf.getvalue()
 
 
+def normalize_and_badge_main(image_data: bytes, band_path: str = None, badge_overlay_path: str = None) -> bytes:
+    """加工済みメイン画像（セット/予約）の表紙を抽出→右寄せ再配置→バッジを付け直す。
+
+    元画像は表紙の縦横比の違い＋左75%領域への中央寄せ配置により、表紙とバッジの
+    間隔が商品ごとにバラつく。表紙を高さ90%に統一し、バッジ領域から一定間隔(2%)で
+    右寄せすることで統一感を出す。新規取得分・既存R-Cabinet取得分のどちらにも使える。
+    - band_path:          右端25%に縦帯を貼る（はちみつ書店 free_shipping.png）
+    - badge_overlay_path: 白透過オーバーレイ方式のバッジを重ね直す（春うららか badge_free_shipping.jpg）
+    旧バッジ（右側約27%・x>=73.3%）は表紙抽出後に白紙キャンバスへ再配置するため自然に消える。
+    表紙が検出できない場合は元画像の左側をそのまま使うフォールバック。
+    """
+    Image = get_pil()
+    import numpy as np
+
+    base = Image.open(BytesIO(image_data)).convert("RGB")
+    w, h = base.size
+    old_badge_left = int(w * 0.733)   # 旧バッジ領域の左端（実測 x=73.4%〜）
+    gap = int(w * 0.02)
+    badge_left = (w - int(w * 0.25)) if band_path else old_badge_left
+
+    # 表紙のbboxを検出（旧バッジ領域より左の非白ピクセル。JPEG劣化を考慮し閾値245）
+    left_arr = np.array(base.crop((0, 0, old_badge_left, h)))
+    mask = ~((left_arr[:, :, 0] > 245) & (left_arr[:, :, 1] > 245) & (left_arr[:, :, 2] > 245))
+    ys, xs = np.where(mask)
+
+    canvas = Image.new("RGB", (w, h), (255, 255, 255))
+    if len(xs) > 0:
+        cover = base.crop((int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1))
+        # 高さ90%に統一（縦横比維持）。幅が入り切らない場合のみ幅基準で縮小
+        ratio = (h * 0.90) / cover.height
+        max_w = badge_left - 2 * gap
+        if cover.width * ratio > max_w:
+            ratio = max_w / cover.width
+        nw = max(1, int(cover.width * ratio))
+        nh = max(1, int(cover.height * ratio))
+        cover = cover.resize((nw, nh), Image.LANCZOS)
+        # バッジ左端から一定間隔で右寄せ・上下中央
+        canvas.paste(cover, (badge_left - gap - nw, (h - nh) // 2))
+    else:
+        canvas.paste(base.crop((0, 0, old_badge_left, h)), (0, 0))
+
+    if band_path:
+        band = Image.open(band_path).convert("RGB").resize((w - badge_left, h), Image.LANCZOS)
+        canvas.paste(band, (badge_left, 0))
+        return image_to_bytes(canvas)
+    if badge_overlay_path and os.path.exists(badge_overlay_path):
+        return image_to_bytes(add_shipping_badge(canvas, badge_overlay_path))
+    return image_to_bytes(canvas)
+
+
 def _workflow_prepare_target_data(missing_comics: list, is_list_content: str, comic_list_content: str, missing_yoyaku: list = None):
     """画像取得対象(target_data)を構築する（CSV読み込み・マージ・単品/予約JAN引き当て）
 
@@ -2207,7 +2271,7 @@ def process_workflow_images(missing_comics: list, is_list_content: str, comic_li
     return {'success': True, 'images': downloaded_images, 'stats': stats, 'logs': logs}
 
 
-def prepare_yahoo_zips(get_image, excel_set_df, excel_tanpin_df, excel_yoyaku_df, additional_dir: str, out_dir: str, progress_cb=None) -> dict:
+def prepare_yahoo_zips(get_image, excel_set_df, excel_tanpin_df, excel_yoyaku_df, additional_dir: str, out_dir: str, progress_cb=None, profiles=None) -> dict:
     """ヤフー用にリネーム＋追加画像＋ZIP分割生成（検索対象の全量ベース）。
 
     追加画像（_1=透明カバー / _2=セット表記）の付与は商品単位で出品シートの「不要欄」で制御:
@@ -2224,6 +2288,15 @@ def prepare_yahoo_zips(get_image, excel_set_df, excel_tanpin_df, excel_yoyaku_df
         additional_dir:  追加画像（additional_1.jpg / additional_2.jpg）の格納ディレクトリ
         out_dir:         生成ZIPの出力先ディレクトリ（ディスク）。バイト列を保持せずファイルで返す。
         progress_cb:     progress_cb(done, total, comic_no) で進捗通知（任意）。
+        profiles:        店舗プロファイルのリスト。1回の走査で店舗ごとのZIPセットを同時生成する
+                         （ヤフー=はちみつ書店素材 / au PAY=春うららか素材、のように出し分ける）。
+                         [{'key','prefix','band_path','additional_1','additional_2'}, ...]
+                         band_path があればセット/予約のメイン画像右端に帯を合成（add_right_band）。
+                         省略時は従来動作（additional_dir の additional_1/2.jpg・帯合成なし）。
+
+    Returns:
+        従来キー（zip_paths等。zip_pathsは先頭プロファイルのもの）に加え、
+        2つ目以降のプロファイルは '<key>_zip_paths' で返す。
     """
     import os
     zipfile = get_zipfile()
@@ -2293,56 +2366,66 @@ def prepare_yahoo_zips(get_image, excel_set_df, excel_tanpin_df, excel_yoyaku_df
     _build_mapping(excel_tanpin_df, 4, 'tanpin', 27, 28)
     _build_mapping(excel_yoyaku_df, 3, 'yoyaku', 32, 33)
 
-    # 追加画像読み込み
-    additional_1_path = os.path.join(additional_dir, "additional_1.jpg")
-    additional_2_path = os.path.join(additional_dir, "additional_2.jpg")
-    additional_1_data = None
-    additional_2_data = None
-    if os.path.exists(additional_1_path):
-        with open(additional_1_path, 'rb') as f:
-            additional_1_data = f.read()
-    if os.path.exists(additional_2_path):
-        with open(additional_2_path, 'rb') as f:
-            additional_2_data = f.read()
+    # 店舗プロファイル（省略時は従来動作＝1プロファイル）
+    if profiles is None:
+        profiles = [{
+            'key': 'yahoo',
+            'prefix': 'yahoo_upload',
+            'band_path': None,
+            'additional_1': os.path.join(additional_dir, "additional_1.jpg"),
+            'additional_2': os.path.join(additional_dir, "additional_2.jpg"),
+        }]
+
+    def _load_additional(path):
+        """追加画像を読み込む。ZIP内は必ず .jpg 名になるため、PNG等はJPEGへ変換して返す。"""
+        if not path or not os.path.exists(path):
+            return None
+        with open(path, 'rb') as f:
+            data = f.read()
+        if not path.lower().endswith(('.jpg', '.jpeg')):
+            Image = get_pil()
+            data = image_to_bytes(Image.open(BytesIO(data)).convert("RGB"))
+        return data
+
+    for p in profiles:
+        p['add1_data'] = _load_additional(p.get('additional_1'))
+        p['add2_data'] = _load_additional(p.get('additional_2'))
+        p['zip_paths'] = []
+        p['zf'] = None
+        p['path'] = None
+        p['size'] = 0
+        p['count'] = 0
+        p['index'] = 0
 
     # ── ストリーミングZIP生成（メモリにため込まず、1枚ずつディスク上のZIPへ逐次書き出し） ──
-    # 画像は get_image() で都度取得し、書き込み後すぐ解放。メモリ使用は常時「現在のZIP1個＋画像1枚」程度。
+    # 画像は get_image() で都度取得し、書き込み後すぐ解放。メモリ使用は常時「プロファイル数分のZIP＋画像1枚」程度。
     os.makedirs(out_dir, exist_ok=True)
 
-    zip_paths = []
     mapped_count = 0
     no_image = []        # 画像が取得できなかった（不足取得漏れ／既存DL失敗など）
     total_files = 0
     logs = []
 
-    current_zf = None
-    current_path = None
-    current_size = 0
-    current_count = 0
-    zip_index = 0
+    def _open_new_zip(p):
+        p['index'] += 1
+        p['path'] = os.path.join(out_dir, f"{p['prefix']}_{p['index']:03d}.zip")
+        p['zf'] = zipfile.ZipFile(p['path'], 'w', zipfile.ZIP_DEFLATED)
+        p['size'] = 0
+        p['count'] = 0
 
-    def _open_new_zip():
-        nonlocal current_zf, current_path, current_size, current_count, zip_index
-        zip_index += 1
-        current_path = os.path.join(out_dir, f"yahoo_upload_{zip_index:03d}.zip")
-        current_zf = zipfile.ZipFile(current_path, 'w', zipfile.ZIP_DEFLATED)
-        current_size = 0
-        current_count = 0
-
-    def _close_current_zip():
-        nonlocal current_zf
-        if current_zf is None:
+    def _close_current_zip(p):
+        if p['zf'] is None:
             return
-        current_zf.close()
-        if current_count > 0:
-            zip_paths.append(current_path)
+        p['zf'].close()
+        if p['count'] > 0:
+            p['zip_paths'].append(p['path'])
         else:
             # 中身ゼロのZIPは破棄
             try:
-                os.remove(current_path)
+                os.remove(p['path'])
             except Exception:
                 pass
-        current_zf = None
+        p['zf'] = None
 
     total = len(comic_to_product)
     for done, (comic_no, mapping) in enumerate(comic_to_product.items(), start=1):
@@ -2359,33 +2442,44 @@ def prepare_yahoo_zips(get_image, excel_set_df, excel_tanpin_df, excel_yoyaku_df
             logs.append(f"⚠️ {comic_no} → {product_code}: 画像が未取得のためスキップ")
             continue
 
-        # この商品の書き込みエントリ（メイン＋追加画像）。商品単位で同一ZIPに収める。
+        # 各プロファイルへ書き込み（メイン＋追加画像）。商品単位で同一ZIPに収める。
         # 追加画像は出品シートの不要欄で制御。連番は付与するものだけで繰り上げ。
-        entries = [(f"{product_code}.jpg", image_data)]
-        candidates = []
-        if mapping.get('add_1', True) and additional_1_data:
-            candidates.append(('透明カバー', additional_1_data))
-        if mapping.get('add_2', True) and additional_2_data:
-            candidates.append(('セット表記', additional_2_data))
         added = []
-        for seq, (label, data) in enumerate(candidates, start=1):
-            entries.append((f"{product_code}_{seq}.jpg", data))
-            added.append(f"_{seq}({label})")
+        for p in profiles:
+            # メイン画像: セット/予約のみ表紙右寄せ＋バッジ付け直し（単品は中央配置のため対象外）
+            main_data = image_data
+            if ctype in ('set', 'yoyaku') and (p.get('band_path') or p.get('badge_overlay_path')):
+                try:
+                    main_data = normalize_and_badge_main(image_data, p.get('band_path'), p.get('badge_overlay_path'))
+                except Exception as e:
+                    logs.append(f"⚠️ {comic_no} → {product_code}: バッジ合成失敗・元画像のまま格納 ({p['key']}): {e}")
 
-        product_size = sum(len(d) for _, d in entries)
+            entries = [(f"{product_code}.jpg", main_data)]
+            candidates = []
+            if mapping.get('add_1', True) and p['add1_data']:
+                candidates.append(('透明カバー', p['add1_data']))
+            if mapping.get('add_2', True) and p['add2_data']:
+                candidates.append(('セット表記', p['add2_data']))
+            added = []
+            for seq, (label, data) in enumerate(candidates, start=1):
+                entries.append((f"{product_code}_{seq}.jpg", data))
+                added.append(f"_{seq}({label})")
 
-        # 25MB超でローテーション（商品単位は分割しない）
-        if current_zf is None:
-            _open_new_zip()
-        elif current_size + product_size > MAX_ZIP_SIZE and current_count > 0:
-            _close_current_zip()
-            _open_new_zip()
+            product_size = sum(len(d) for _, d in entries)
 
-        for fn, data in entries:
-            current_zf.writestr(fn, data)
-        current_size += product_size
-        current_count += len(entries)
-        total_files += len(entries)
+            # 25MB超でローテーション（商品単位は分割しない）
+            if p['zf'] is None:
+                _open_new_zip(p)
+            elif p['size'] + product_size > MAX_ZIP_SIZE and p['count'] > 0:
+                _close_current_zip(p)
+                _open_new_zip(p)
+
+            for fn, data in entries:
+                p['zf'].writestr(fn, data)
+            p['size'] += product_size
+            p['count'] += len(entries)
+            total_files += len(entries)
+            del main_data
 
         mapped_count += 1
         suffix = ('+' + '/'.join(added)) if added else 'メインのみ'
@@ -2394,16 +2488,21 @@ def prepare_yahoo_zips(get_image, excel_set_df, excel_tanpin_df, excel_yoyaku_df
         # メイン画像の生データを解放（追加画像は共有なので解放しない）
         del image_data
 
-    _close_current_zip()
+    for p in profiles:
+        _close_current_zip(p)
 
-    return {
-        'zip_paths': zip_paths,
+    result = {
+        'zip_paths': profiles[0]['zip_paths'],
         'out_dir': out_dir,
         'mapped': mapped_count,
         'no_image': no_image,
         'total_files': total_files,
         'logs': logs,
     }
+    # 2つ目以降のプロファイルは '<key>_zip_paths' で返す（例: aupay_zip_paths）
+    for p in profiles[1:]:
+        result[f"{p['key']}_zip_paths"] = p['zip_paths']
+    return result
 
 
 def prepare_rakuten_upload_plan(images: list, folders: list, existing_folder_by_comic: dict = None) -> dict:
@@ -2840,6 +2939,134 @@ def upload_to_yahoo_api(zip_data, access_token, zip_filename="images.zip"):
         return {"success": False, "error": f"APIエラー: {detail} / {response.text[:300]}"}
 
     return {"success": True}
+
+
+# ── au PAY マーケット（Wow! manager）画像連携 ──
+
+def wowma_api_get(path: str, params: dict) -> dict:
+    """Wow! manager API（GET系）を呼び、パース済みXMLルートを返す。
+
+    Content-Type: application/x-www-form-urlencoded を付けないと CME8039 で弾かれる。
+    401（0002 認証失敗）は接続元グローバルIPの未登録／変更が主因（APIキー誤りより先に疑う）。
+    """
+    if not WOWMA_API_KEY:
+        return {"success": False, "error": "secrets.toml の [wowma] api_key が未設定です"}
+    try:
+        response = requests.get(
+            f"{WOWMA_API_BASE}/{path}",
+            params=params,
+            headers={
+                "Authorization": f"Bearer {WOWMA_API_KEY}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            timeout=30,
+        )
+    except requests.exceptions.RequestException as e:
+        return {"success": False, "error": f"接続エラー: {e}"}
+    if response.status_code != 200:
+        return {"success": False, "error": f"HTTP {response.status_code}: {response.text[:300]}"}
+    try:
+        root = ET.fromstring(response.content)
+    except ET.ParseError as e:
+        return {"success": False, "error": f"XMLパースエラー: {e} / {response.text[:300]}"}
+    if root.findtext('.//status', '') != '0':
+        code = root.findtext('.//error/code', '')
+        msg = root.findtext('.//error/message', '')
+        return {"success": False, "error": f"APIエラー: {code} {msg}".strip()}
+    return {"success": True, "root": root}
+
+
+def wowma_search_images(file_name: str) -> dict:
+    """画像検索API（fileName部分一致）。取込済み画像の imgUrl リストを返す。"""
+    res = wowma_api_get("searchImgInfos", {"shopId": WOWMA_SHOP_ID, "fileName": file_name})
+    if not res["success"]:
+        return res
+    urls = [e.text for e in res["root"].findall('.//imgInfo/imgUrl') if e.text]
+    return {"success": True, "urls": urls}
+
+
+def wowma_get_capacity() -> dict:
+    """画像容量取得API。使用中/契約の容量（GB文字列）を返す。"""
+    res = wowma_api_get("searchImgCapacity", {"shopId": WOWMA_SHOP_ID})
+    if not res["success"]:
+        return res
+    info = res["root"].find('.//imgCapacityInfo')
+    return {
+        "success": True,
+        "use": info.findtext('useCapacity', '-') if info is not None else '-',
+        "contract": info.findtext('contractCapacity', '-') if info is not None else '-',
+    }
+
+
+def upload_zips_to_wowma_ftp(zip_paths: list, progress_cb=None) -> dict:
+    """ヤフー用ZIP内の画像を1枚ずつ au PAY 画像FTPサーバへ送信する（ZIPは解凍して中身だけ送る）。
+
+    ファイル名はヤフーと共通（商品コード.jpg / 商品コード_1.jpg / _2.jpg）なので、
+    取込後のURLは WOWMA_IMAGE_BASE_URL/ファイル名 に確定する。
+    切断時は1回だけ再接続して同ファイルをリトライする。
+    """
+    import ftplib
+    zipfile = get_zipfile()
+
+    uploaded = []   # 送信成功したファイル名
+    failed = []     # {'name': ..., 'error': ...}
+    logs = []
+
+    def _connect():
+        ftp = ftplib.FTP(WOWMA_FTP_HOST, timeout=60)
+        ftp.login(WOWMA_FTP_USER, WOWMA_FTP_PASSWORD)
+        return ftp
+
+    try:
+        ftp = _connect()
+    except Exception as e:
+        return {"success": False, "error": f"FTP接続失敗: {e}", "uploaded": [], "failed": [], "logs": []}
+
+    total = 0
+    for zpath in zip_paths:
+        try:
+            with zipfile.ZipFile(zpath) as zf:
+                total += sum(1 for n in zf.namelist() if not n.endswith('/'))
+        except Exception:
+            pass
+
+    done = 0
+    for zpath in zip_paths:
+        try:
+            zf = zipfile.ZipFile(zpath)
+        except Exception as e:
+            logs.append(f"❌ {os.path.basename(zpath)}: ZIPが開けません: {e}")
+            continue
+        with zf:
+            for name in zf.namelist():
+                if name.endswith('/'):
+                    continue
+                data = zf.read(name)
+                try:
+                    ftp.storbinary(f"STOR {name}", BytesIO(data))
+                    uploaded.append(name)
+                except Exception:
+                    # 切断・タイムアウト等は再接続して1回だけリトライ
+                    try:
+                        try:
+                            ftp.quit()
+                        except Exception:
+                            pass
+                        ftp = _connect()
+                        ftp.storbinary(f"STOR {name}", BytesIO(data))
+                        uploaded.append(name)
+                    except Exception as e2:
+                        failed.append({'name': name, 'error': str(e2)})
+                del data
+                done += 1
+                if progress_cb:
+                    progress_cb(done, total, name)
+    try:
+        ftp.quit()
+    except Exception:
+        pass
+
+    return {"success": True, "uploaded": uploaded, "failed": failed, "logs": logs}
 
 
 def _get_sheets_service():
@@ -3608,6 +3835,21 @@ if mode == "🎨 クリエイティブスタジオ":
             horizontal=True
         )
 
+        # 既存も再取得モード（全種別・両入力モード共通）
+        # はちみつ書店移行で帯・追加画像を差し替えるため、存在チェックが「存在あり」でも
+        # 入力した全コミックNoを画像取得＋加工の対象にする。ON時は不足0件でもStep③のボタンが押せる。
+        force_regen_mode = st.checkbox(
+            "🔄 既存も再取得（存在ありも全種別を対象にする）",
+            key="step1_force_regen",
+            help=(
+                "ON: 入力した全コミックNo（セット・単品・予約）を、存在チェックの結果に関わらず"
+                "画像取得＋加工の対象にします。全部『存在あり』でもStep③『画像取得開始』が押せます。"
+                "はちみつ書店向けに帯・追加画像を差し替えてYahoo ZIPを作り直す用途。\n"
+                "OFF: 今まで通り『存在なし（不足）』のみ対象。\n"
+                "※ トグルを変えたら『チェック実行』を押し直してください（実行時点の設定が反映されます）。"
+            ),
+        )
+
         comic_numbers = []
         # 予約「最新刊取得」モード（テキスト入力時のみ有効。Excelは常にOFF=不足特定）
         yoyaku_force_latest_mode = False
@@ -3759,6 +4001,17 @@ if mode == "🎨 クリエイティブスタジオ":
                         st.session_state.workflow_data['yoyaku_force_latest'] = list(_tc.get('予約', []))
                     else:
                         st.session_state.workflow_data['yoyaku_force_latest'] = []
+                    # 既存も再取得モード: ONなら入力した全種別のコミックNoを force_regen に記録
+                    # （存在ありでもStep②のアップロード／Step③の画像取得対象に含める）
+                    if force_regen_mode:
+                        _tc = st.session_state.workflow_data.get('typed_comics', {}) or {}
+                        st.session_state.workflow_data['force_regen'] = {
+                            'set': list(_tc.get('セット品', [])),
+                            'tanpin': list(_tc.get('単品', [])),
+                            'yoyaku': list(_tc.get('予約', [])),
+                        }
+                    else:
+                        st.session_state.workflow_data['force_regen'] = {'set': [], 'tanpin': [], 'yoyaku': []}
                     # 不足リストが更新されたので、下流のキャッシュ/アップロード済フラグを無効化
                     st.session_state.workflow_data['missing_uploaded'] = False
                     st.session_state.workflow_data.pop('missing_from_github', None)
@@ -4010,6 +4263,23 @@ if mode == "🎨 クリエイティブスタジオ":
             for _yc in st.session_state.workflow_data.get('yoyaku_force_latest', []):
                 if str(_yc) not in _existing_yoyaku:
                     yoyaku_comics.append(_yc)
+                    _existing_yoyaku.add(str(_yc))
+            # 既存も再取得: 存在ありも全種別JAN取得対象に含める（is_list/comic_list生成に反映）
+            _fr = st.session_state.workflow_data.get('force_regen', {}) or {}
+            _existing_set = set(str(c) for c in set_comics)
+            for _c in _fr.get('set', []):
+                if str(_c) not in _existing_set:
+                    set_comics.append(_c)
+                    _existing_set.add(str(_c))
+            _existing_tanpin = set(str(c) for c in tanpin_comics)
+            for _c in _fr.get('tanpin', []):
+                if str(_c) not in _existing_tanpin:
+                    tanpin_comics.append(_c)
+                    _existing_tanpin.add(str(_c))
+            for _c in _fr.get('yoyaku', []):
+                if str(_c) not in _existing_yoyaku:
+                    yoyaku_comics.append(_c)
+                    _existing_yoyaku.add(str(_c))
             today = datetime.now(JST).strftime('%Y-%m-%d %H:%M')
             status_area.info(
                 f"📤 不足リストをGitHubにアップロード中... "
@@ -4170,6 +4440,21 @@ if mode == "🎨 クリエイティブスタジオ":
             _cno = normalize_jan_code(_yc)
             if _cno and _cno not in missing_yoyaku:
                 missing_yoyaku.append(_cno)
+
+        # 既存も再取得モード: 存在ありも含めて全種別を対象に加える（はちみつ書店向け再作成）
+        _fr = st.session_state.workflow_data.get('force_regen', {}) or {}
+        _seen_st = set(str(c) for c in missing_comics)
+        for _c in list(_fr.get('set', [])) + list(_fr.get('tanpin', [])):
+            _cno = normalize_jan_code(_c)
+            if _cno and _cno not in _seen_st:
+                missing_comics.append(_cno)
+                _seen_st.add(_cno)
+        _seen_yy = set(str(c) for c in missing_yoyaku)
+        for _c in _fr.get('yoyaku', []):
+            _cno = normalize_jan_code(_c)
+            if _cno and _cno not in _seen_yy:
+                missing_yoyaku.append(_cno)
+                _seen_yy.add(_cno)
 
         total_missing = len(missing_comics) + len(missing_yoyaku)
         col_s1, col_s2, col_s3 = st.columns(3)
@@ -4593,7 +4878,7 @@ if mode == "🎨 クリエイティブスタジオ":
             if not images:
                 st.caption("※ 不足画像は0件です。楽天タブはアップロード対象なし、ヤフータブは既存画像のみで全量ZIPを生成します。")
 
-            tab_rakuten, tab_yahoo = st.tabs(["🏪 楽天アップロード", "🛒 ヤフー準備"])
+            tab_rakuten, tab_yahoo, tab_aupay = st.tabs(["🏪 楽天アップロード", "🛒 ヤフー準備", "📮 au PAY送信"])
 
             # ============================================
             # 楽天タブ（API直接アップロード）
@@ -4865,6 +5150,7 @@ if mode == "🎨 クリエイティブスタジオ":
                 st.caption(
                     "ヤフーZIPは **検索対象の全量**（不足画像＋既存R-Cabinet画像）を対象にします。"
                     "既存画像はR-CabinetのURLから取得し、取得できないもの（RECフォルダのみ／URL無し）はスキップします。"
+                    "ZIP生成時に **ヤフー用（はちみつ書店素材）** と **au PAY用（春うららか素材）** を同時に作り分けます。"
                 )
 
                 excel_set_df = None
@@ -5050,9 +5336,22 @@ if mode == "🎨 クリエイティブスタジオ":
                             pass
 
                     additional_dir = _os.path.join(_os.path.dirname(__file__), "images")
+                    # ヤフー=はちみつ書店素材 / au PAY=春うららか素材 を1回の走査で同時生成
+                    hachimitsu_dir = _os.path.join(additional_dir, "hachimitsu")
+                    store_profiles = [
+                        {'key': 'yahoo', 'prefix': 'yahoo_upload',
+                         'band_path': _os.path.join(hachimitsu_dir, "free_shipping.png"),
+                         'additional_1': _os.path.join(hachimitsu_dir, "crea_cover.png"),
+                         'additional_2': _os.path.join(hachimitsu_dir, "zenkanset_bnr_02.jpg")},
+                        {'key': 'aupay', 'prefix': 'aupay_upload',
+                         'band_path': None,
+                         'badge_overlay_path': _os.path.join(additional_dir, "badge_free_shipping.jpg"),
+                         'additional_1': _os.path.join(additional_dir, "additional_1.jpg"),
+                         'additional_2': _os.path.join(additional_dir, "additional_2.jpg")},
+                    ]
                     result = prepare_yahoo_zips(
                         _get_image, excel_set_df, excel_tanpin_df, excel_yoyaku_df,
-                        additional_dir, out_dir, progress_cb=_progress,
+                        additional_dir, out_dir, progress_cb=_progress, profiles=store_profiles,
                     )
                     gen_progress.empty()
 
@@ -5177,6 +5476,143 @@ if mode == "🎨 クリエイティブスタジオ":
                     with st.expander("ログ", expanded=False):
                         for log in result['logs']:
                             st.text(log)
+
+            with tab_aupay:
+                st.markdown("### au PAY マーケットへFTP送信")
+                st.caption(
+                    "「🛒 ヤフー準備」のZIP生成時に同時に作られる **au PAY用ZIP（春うららか素材）** の中身"
+                    "（商品コード.jpg / _1=透明カバー / _2=セット表記）を au PAY の画像FTPサーバへ1枚ずつ送信します。"
+                    "ヤフーZIP（はちみつ書店素材）とはバッジ・追加画像が異なります。"
+                )
+
+                wowma_creds_ok = bool(WOWMA_FTP_USER and WOWMA_FTP_PASSWORD)
+                aupay_zip_result = st.session_state.workflow_data.get('yahoo_zips', {})
+                aupay_zip_paths = aupay_zip_result.get('aupay_zip_paths', [])
+
+                if not wowma_creds_ok:
+                    st.warning(
+                        "⚠️ secrets.toml の [wowma]（ftp_user / ftp_password）が未設定のため、FTP送信は使えません。"
+                    )
+                elif not aupay_zip_paths:
+                    st.info(
+                        "送信対象のau PAY用ZIPがありません。先に「🛒 ヤフー準備」タブで「📦 ZIP生成」してください"
+                        "（改修前に生成した結果にはau PAY用ZIPが含まれないため、再生成が必要です）。"
+                    )
+                else:
+                    # 送信前の中身確認用ダウンロード（1個ずつ）
+                    with st.expander(f"📥 au PAY用ZIPの確認ダウンロード（全{len(aupay_zip_paths)}件）", expanded=False):
+                        st.caption("春うららか素材（送料無料バッジ・additional_1/2）で生成されたau PAY用の画像です。")
+                        _anames = [os.path.basename(pth) for pth in aupay_zip_paths]
+                        _asel = st.selectbox("ダウンロードするZIPを選択", _anames, key="aupay_zip_select")
+                        _asel_path = aupay_zip_paths[_anames.index(_asel)]
+                        try:
+                            with open(_asel_path, 'rb') as _f:
+                                _abytes = _f.read()
+                            st.download_button(
+                                label=f"📥 {_asel} をダウンロード（{len(_abytes) / (1024 * 1024):.1f}MB）",
+                                data=_abytes,
+                                file_name=_asel,
+                                mime="application/zip",
+                                key="aupay_zip_dl_one",
+                            )
+                        except FileNotFoundError:
+                            st.error("ZIPファイルが見つかりません（再起動等で消えた可能性）。再度「ZIP生成」してください。")
+
+                    st.warning(
+                        f"⚠️ 本番ストア **{WOWMA_SHOP_ID}** の画像サーバへアップロードします。"
+                        "同名ファイルは上書きされます。モール側のバッチ取込後、"
+                        f"`{WOWMA_IMAGE_BASE_URL}/商品コード.jpg` のURLで公開されます。"
+                    )
+                    confirm_aupay = st.checkbox("内容を確認した（本番へのアップロードを許可）", key="aupay_ftp_confirm")
+                    if st.button("📮 au PAYへFTP送信", type="primary", disabled=not confirm_aupay, key="aupay_ftp_upload_btn"):
+                        progress = st.progress(0.0)
+                        status = st.empty()
+
+                        def _ftp_progress(done, total, name):
+                            try:
+                                status.text(f"FTP送信中... ({done}/{total}) {name}")
+                                progress.progress(done / max(total, 1))
+                            except Exception:
+                                pass
+
+                        res = upload_zips_to_wowma_ftp(aupay_zip_paths, progress_cb=_ftp_progress)
+                        progress.empty()
+                        status.empty()
+
+                        if not res['success']:
+                            st.error(f"❌ {res['error']}")
+                        else:
+                            st.session_state.workflow_data['wowma_uploaded'] = res['uploaded']
+                            st.session_state.workflow_data['wowma_failed'] = res['failed']
+                            st.session_state.workflow_data['wowma_ftp_logs'] = res['logs']
+                            st.rerun()
+
+                # 送信結果（rerun後も表示）
+                if 'wowma_uploaded' in st.session_state.workflow_data:
+                    uploaded_names = st.session_state.workflow_data.get('wowma_uploaded', [])
+                    failed_items = st.session_state.workflow_data.get('wowma_failed', [])
+                    ftp_logs = st.session_state.workflow_data.get('wowma_ftp_logs', [])
+
+                    col_a1, col_a2 = st.columns(2)
+                    col_a1.metric("送信成功", len(uploaded_names))
+                    col_a2.metric("送信失敗", len(failed_items))
+
+                    if failed_items:
+                        st.error("送信失敗があります。再度「FTP送信」を実行すると全件送り直します（上書きされるだけで害はありません）。")
+                        with st.expander("失敗ログ", expanded=True):
+                            for f in failed_items:
+                                st.text(f"❌ {f['name']}: {f['error']}")
+                    if ftp_logs:
+                        with st.expander("ZIP読み込みログ", expanded=False):
+                            for log in ftp_logs:
+                                st.text(log)
+
+                    # タテンポ設定用：商品コード→画像URLの一覧CSV
+                    if uploaded_names:
+                        url_rows = []
+                        for name in uploaded_names:
+                            code = os.path.splitext(name)[0]
+                            url_rows.append({
+                                'ファイル名': name,
+                                '商品コード': re.sub(r'_\d+$', '', code),
+                                '画像URL': f"{WOWMA_IMAGE_BASE_URL}/{name}",
+                            })
+                        url_df = pd.DataFrame(url_rows, columns=['ファイル名', '商品コード', '画像URL'])
+                        st.download_button(
+                            label=f"📄 画像URL一覧CSVをダウンロード（{len(url_rows)}件・タテンポ設定用）",
+                            data=url_df.to_csv(index=False).encode('utf-8-sig'),
+                            file_name="aupay_image_urls.csv",
+                            mime="text/csv",
+                            key="aupay_url_csv_dl",
+                        )
+
+                    # 取込確認（バッチ取込までタイムラグあり）
+                    st.divider()
+                    st.markdown("#### 🔎 取込確認（Wow! manager API）")
+                    st.caption(
+                        "FTPは投入口のため、送信直後はまだ商品ページで使えません。"
+                        "モール側のバッチが取り込むとFTP上から消え、image.wowma.jp のURLで公開されます。"
+                        "時間をおいて下のボタンで確認してください。"
+                    )
+                    if st.button("🔎 取込状況を確認", key="aupay_ingest_check_btn"):
+                        cap = wowma_get_capacity()
+                        if cap['success']:
+                            st.caption(f"画像容量: {cap['use']} GB / {cap['contract']} GB")
+                        sample = uploaded_names[:10]
+                        ingested = 0
+                        check_rows = []
+                        for name in sample:
+                            base = os.path.splitext(name)[0]
+                            sr = wowma_search_images(base)
+                            hit = sr['success'] and any(u.endswith('/' + name) for u in sr['urls'])
+                            if hit:
+                                ingested += 1
+                            check_rows.append({'ファイル名': name, '取込': '✅ 済' if hit else '⏳ 未'})
+                        st.dataframe(pd.DataFrame(check_rows), use_container_width=True, height=250)
+                        if ingested == len(sample):
+                            st.success(f"✅ 確認した{len(sample)}件すべて取込済みです。タテンポ側で画像URLを設定できます。")
+                        else:
+                            st.info(f"⏳ {ingested}/{len(sample)}件取込済み。未取込分は時間をおいて再確認してください。")
 
             # ナビゲーション
             st.divider()
