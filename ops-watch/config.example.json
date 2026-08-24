@@ -1,0 +1,69 @@
+{
+  "webhook_url": "https://chat.googleapis.com/v1/spaces/XXXXXXXXX/messages?key=YOUR_KEY&token=YOUR_TOKEN",
+  "default_error_patterns": ["[ERROR]", "[error]", "Traceback", "CRITICAL", "Exception"],
+  "targets": [
+    {
+      "task": "YahooSalesSyncReminder",
+      "desc": "Yahoo売上 12:00リマインド",
+      "max_age_days": 4
+    },
+    {
+      "task": "YahooSalesSync",
+      "desc": "Yahoo売上 13:00取込",
+      "max_age_days": 4,
+      "log_dir": "C:\\作業ログ\\ツール\\Yahoo売上取得ツール\\logs"
+    },
+    {
+      "task": "AmazonMasterUpdate_MWF",
+      "desc": "Amazonマスタ更新 月水金17:00",
+      "max_age_days": 5,
+      "log_dir": "C:\\作業ログ\\ツール\\要件・システム仕様\\000_マスタ更新運用\\logs",
+      "success_patterns": ["オーケストレーション完了"]
+    },
+    {
+      "task": "SalesDbSync_Daily",
+      "desc": "販売実績DB+出品シート取込+コックピット搬入 10:00日次",
+      "max_age_days": 4,
+      "log_dir": "C:\\作業ログ\\ツール\\要件・システム仕様\\000_マスタ更新運用\\logs_salesdb",
+      "success_patterns": ["販売実績DB更新完了", "出品シート取込OK", "MariaDB搬入OK"]
+    },
+    {
+      "task": "PendingWatcher",
+      "desc": "WP承認待ち監視 8:55/17:30",
+      "max_age_days": 4,
+      "log_file": "C:\\Users\\ssasa\\pending-watcher\\pending_watcher.log",
+      "success_patterns": ["Pending監視 終了"]
+    },
+    {
+      "task": "CockpitDailyReport",
+      "desc": "出品コックピット日報 10:30日次（旧DailySalesReportを2026-08-18に置き換え）",
+      "max_age_days": 4,
+      "log_dir": "C:\\作業ログ\\ツール\\要件・システム仕様\\000_マスタ更新運用\\logs_morning",
+      "success_patterns": ["Chat通知: 200"]
+    },
+    {
+      "task": "MangaTrendRadar",
+      "desc": "マンガトレンド収集 9:10",
+      "max_age_days": 4,
+      "log_file": "C:\\Users\\ssasa\\tools\\manga-trend-radar\\log.txt",
+      "success_patterns": ["実行完了"]
+    },
+    {
+      "task": "EssenceMallStockSync",
+      "desc": "エッセンスモール在庫同期 8:50",
+      "max_age_days": 4,
+      "log_dir": "C:\\作業ログ\\ツール\\エッセンスモール在庫同期\\logs",
+      "success_patterns": ["[INFO] 完了"]
+    },
+    {
+      "task": "Recoru_At0853",
+      "desc": "レコル打刻 8:53",
+      "max_age_days": 4
+    },
+    {
+      "task": "Recoru_At1800",
+      "desc": "レコル打刻 18:00",
+      "max_age_days": 4
+    }
+  ]
+}
