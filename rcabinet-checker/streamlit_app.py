@@ -119,6 +119,9 @@ YAHOO_SELLER_ID = _yahoo_secrets.get("seller_id", "hachimitsu-syoten")
 YAHOO_TOKEN_URL = "https://auth.login.yahoo.co.jp/yconnect/v2/token"
 # 商品画像一括アップロード（メイン=商品コード.jpg / 追加=商品コード_1〜20.jpg）
 YAHOO_UPLOAD_URL = "https://circus.shopping.yahooapis.jp/ShoppingWebService/V1/uploadItemImagePack"
+YAHOO_PUBLISH_URL = "https://circus.shopping.yahooapis.jp/ShoppingWebService/V1/reservePublish"  # 全反映予約API
+YAHOO_IMAGES_PER_HOUR = 10000   # uploadItemImagePack 仕様: 画像アップロード上限 10,000枚/1時間（超過で429/503）
+YAHOO_IMAGES_PER_HOUR_SAFE = 9500
 
 # au PAY マーケット Wow! manager 接続情報（secrets.toml の [wowma] セクション）
 # 画像のアップロードAPIは存在しない。FTPが投入口で、モール側バッチが取り込むと
@@ -2351,12 +2354,16 @@ def prepare_yahoo_zips(get_image, excel_set_df, excel_tanpin_df, excel_yoyaku_df
                 # コミックNoが数値（単品は _ 区切り可）の行だけ対象。ヘッダー行や空行・見出し文字は除外
                 if (product_code and comic_no and product_code != 'nan' and comic_no != 'nan'
                         and comic_no.replace('_', '').isdigit()):
-                    comic_to_product[comic_no] = {
+                    # 同一コミックNoを持つ商品コードは複数ある（同タイトルの別在庫・別巻数セットなど）。
+                    # 以前は dict[comic_no] = 1商品 で上書きしていたため、コミックNoごとに最後の1商品しか
+                    # ZIPに入らず（例: セット46,335商品→11,352商品）、残りがYahooで非表示のままになる事故が
+                    # 起きた（2026-08-29）。画像はコミックNo単位で1回取得し、紐づく全商品コード分を書き出す。
+                    comic_to_product.setdefault(comic_no, []).append({
                         'code': product_code,
                         'type': type_label,
                         'add_1': not _has_mark(i, skip1_col),  # 不要欄に値→付けない
                         'add_2': not _has_mark(i, skip2_col),
-                    }
+                    })
             except:
                 continue
 
@@ -2427,65 +2434,78 @@ def prepare_yahoo_zips(get_image, excel_set_df, excel_tanpin_df, excel_yoyaku_df
                 pass
         p['zf'] = None
 
+    TYPE_JP = {'set': 'セット品', 'tanpin': '単品', 'yoyaku': '予約'}
     total = len(comic_to_product)
-    for done, (comic_no, mapping) in enumerate(comic_to_product.items(), start=1):
+    for done, (comic_no, products) in enumerate(comic_to_product.items(), start=1):
         if progress_cb:
             progress_cb(done, total, comic_no)
 
-        product_code = mapping['code']
-        ctype = mapping['type']
-        type_jp = {'set': 'セット品', 'tanpin': '単品', 'yoyaku': '予約'}.get(ctype, ctype)
-
         image_data = get_image(comic_no)
         if not image_data:
-            no_image.append({'商品コード': product_code, 'コミックNo': comic_no, '種別': type_jp, '理由': '画像未取得'})
-            logs.append(f"⚠️ {comic_no} → {product_code}: 画像が未取得のためスキップ")
+            for mapping in products:
+                no_image.append({'商品コード': mapping['code'], 'コミックNo': comic_no,
+                                 '種別': TYPE_JP.get(mapping['type'], mapping['type']), '理由': '画像未取得'})
+            logs.append(f"⚠️ {comic_no} → {', '.join(m['code'] for m in products)}: 画像が未取得のためスキップ")
             continue
 
-        # 各プロファイルへ書き込み（メイン＋追加画像）。商品単位で同一ZIPに収める。
-        # 追加画像は出品シートの不要欄で制御。連番は付与するものだけで繰り上げ。
-        added = []
-        for p in profiles:
-            # メイン画像: セット/予約のみ表紙右寄せ＋バッジ付け直し（単品は中央配置のため対象外）
-            main_data = image_data
-            if ctype in ('set', 'yoyaku') and (p.get('band_path') or p.get('badge_overlay_path')):
-                try:
-                    main_data = normalize_and_badge_main(image_data, p.get('band_path'), p.get('badge_overlay_path'))
-                except Exception as e:
-                    logs.append(f"⚠️ {comic_no} → {product_code}: バッジ合成失敗・元画像のまま格納 ({p['key']}): {e}")
+        # メイン画像の加工（帯/バッジ）はプロファイル×種別ごとに1回だけ行い、同コミックNoの全商品で共有する
+        main_cache = {}
 
-            entries = [(f"{product_code}.jpg", main_data)]
-            candidates = []
-            if mapping.get('add_1', True) and p['add1_data']:
-                candidates.append(('透明カバー', p['add1_data']))
-            if mapping.get('add_2', True) and p['add2_data']:
-                candidates.append(('セット表記', p['add2_data']))
+        def _main_for(p, ctype):
+            key = (p['key'], ctype)
+            if key not in main_cache:
+                data = image_data
+                # メイン画像: セット/予約のみ表紙右寄せ＋バッジ付け直し（単品は中央配置のため対象外）
+                if ctype in ('set', 'yoyaku') and (p.get('band_path') or p.get('badge_overlay_path')):
+                    try:
+                        data = normalize_and_badge_main(image_data, p.get('band_path'), p.get('badge_overlay_path'))
+                    except Exception as e:
+                        logs.append(f"⚠️ {comic_no}: バッジ合成失敗・元画像のまま格納 ({p['key']}/{ctype}): {e}")
+                main_cache[key] = data
+            return main_cache[key]
+
+        # 同一コミックNoに紐づく全商品コードへ、商品単位で（メイン＋追加画像）を書き出す
+        for mapping in products:
+            product_code = mapping['code']
+            ctype = mapping['type']
+            type_jp = TYPE_JP.get(ctype, ctype)
+
+            # 追加画像は出品シートの不要欄で制御。連番は付与するものだけで繰り上げ。
             added = []
-            for seq, (label, data) in enumerate(candidates, start=1):
-                entries.append((f"{product_code}_{seq}.jpg", data))
-                added.append(f"_{seq}({label})")
+            for p in profiles:
+                main_data = _main_for(p, ctype)
+                entries = [(f"{product_code}.jpg", main_data)]
+                candidates = []
+                if mapping.get('add_1', True) and p['add1_data']:
+                    candidates.append(('透明カバー', p['add1_data']))
+                if mapping.get('add_2', True) and p['add2_data']:
+                    candidates.append(('セット表記', p['add2_data']))
+                added = []
+                for seq, (label, data) in enumerate(candidates, start=1):
+                    entries.append((f"{product_code}_{seq}.jpg", data))
+                    added.append(f"_{seq}({label})")
 
-            product_size = sum(len(d) for _, d in entries)
+                product_size = sum(len(d) for _, d in entries)
 
-            # 25MB超でローテーション（商品単位は分割しない）
-            if p['zf'] is None:
-                _open_new_zip(p)
-            elif p['size'] + product_size > MAX_ZIP_SIZE and p['count'] > 0:
-                _close_current_zip(p)
-                _open_new_zip(p)
+                # 25MB超でローテーション（商品単位は分割しない）
+                if p['zf'] is None:
+                    _open_new_zip(p)
+                elif p['size'] + product_size > MAX_ZIP_SIZE and p['count'] > 0:
+                    _close_current_zip(p)
+                    _open_new_zip(p)
 
-            for fn, data in entries:
-                p['zf'].writestr(fn, data)
-            p['size'] += product_size
-            p['count'] += len(entries)
-            total_files += len(entries)
-            del main_data
+                for fn, data in entries:
+                    p['zf'].writestr(fn, data)
+                p['size'] += product_size
+                p['count'] += len(entries)
+                total_files += len(entries)
 
-        mapped_count += 1
-        suffix = ('+' + '/'.join(added)) if added else 'メインのみ'
-        logs.append(f"✅ {comic_no} → {product_code} ({type_jp}・{suffix})")
+            mapped_count += 1
+            suffix = ('+' + '/'.join(added)) if added else 'メインのみ'
+            logs.append(f"✅ {comic_no} → {product_code} ({type_jp}・{suffix})")
 
         # メイン画像の生データを解放（追加画像は共有なので解放しない）
+        main_cache.clear()
         del image_data
 
     for p in profiles:
@@ -2939,6 +2959,67 @@ def upload_to_yahoo_api(zip_data, access_token, zip_filename="images.zip"):
         return {"success": False, "error": f"APIエラー: {detail} / {response.text[:300]}"}
 
     return {"success": True}
+
+
+def upload_to_yahoo_api_with_retry(zip_data, access_token, zip_filename="images.zip"):
+    """upload_to_yahoo_api() に自動リトライを付与したラッパー。
+
+    2026-08-24の140件アップロードで判明した2つの一過性障害に対応:
+    - ed-00006「反映またはアップロード中のため更新ができません」: 直前ZIPの反映待ち。
+      待てば通ることが多いので待機して再試行。
+    - 接続エラー(SSLEOFError等): #90以降が連続で全滅した実績あり。無間隔の連射で
+      Yahoo APIゲートウェイ側のレート制限/接続遮断を誘発したとみられるため、
+      短い再試行では復帰しない前提で長めに待つ。
+
+    2026-08-29追記: ed-00006 は直前ZIPの反映（＋ストア全体の「反映」処理中）が終わるまで続くため、
+    1回10秒では足りなかった（#19が取りこぼし）。15秒×最大8回（約2分）粘る。接続エラーは30秒×最大3回。
+    """
+    RETRY_PLAN = [
+        (15, 8, lambda err: 'ed-00006' in err),               # 反映中ロック: 15秒待って最大8回
+        (30, 3, lambda err: '接続エラー' in err or 'SSLError' in err or 'SSLEOFError' in err),  # 遮断疑い: 30秒待って最大3回
+    ]
+    result = upload_to_yahoo_api(zip_data, access_token, zip_filename)
+    if result['success']:
+        return result
+    for wait_sec, max_tries, matches in RETRY_PLAN:
+        if matches(result.get('error', '')):
+            for _ in range(max_tries):
+                time.sleep(wait_sec)
+                result = upload_to_yahoo_api(zip_data, access_token, zip_filename)
+                if result['success'] or not matches(result.get('error', '')):
+                    break
+            break
+    return result
+
+
+def reserve_publish_yahoo(access_token):
+    """Yahoo!ショッピング 全反映予約API（reservePublish）で「今すぐ反映」を予約する。
+
+    uploadItemImagePack は画像を登録するだけで商品ページはフロントに出ない（仕様書「フロント反映はしません。
+    別途反映処理が必要です」）。ストアクリエイターPro > 反映管理 で「はい」を押すのと同じことをAPIで行う。
+    mode=1・reserve_time省略=現在時刻で予約（システムが空いていれば即反映、混雑時は遅延）。
+    未反映項目が無い場合は pm-05001 が返るが、反映不要なので成功扱いにする。
+    """
+    try:
+        response = requests.post(
+            YAHOO_PUBLISH_URL,
+            headers={"Authorization": f"Bearer {access_token}"},
+            data={"seller_id": YAHOO_SELLER_ID, "mode": "1"},
+            timeout=60,
+        )
+    except requests.exceptions.RequestException as e:
+        return {"success": False, "error": f"接続エラー: {str(e)}"}
+    if 'pm-05001' in response.text:
+        return {"success": True, "reserve_time": "", "note": "未反映項目なし"}
+    if response.status_code != 200:
+        return {"success": False, "error": f"HTTP {response.status_code}: {response.text[:300]}"}
+    try:
+        root = ET.fromstring(response.text)
+    except ET.ParseError as e:
+        return {"success": False, "error": f"XMLパースエラー: {str(e)} / {response.text[:300]}"}
+    if root.findtext('.//Status', '') != 'OK':
+        return {"success": False, "error": f"反映予約NG: {response.text[:300]}"}
+    return {"success": True, "reserve_time": root.findtext('.//ReserveTime', '') or root.findtext('.//reserveTime', '')}
 
 
 # ── au PAY マーケット（Wow! manager）画像連携 ──
@@ -5432,40 +5513,95 @@ if mode == "🎨 クリエイティブスタジオ":
                             "ZIP内の商品コードに一致する商品のメイン画像／追加画像が置き換わります（反映後、商品ページに反映）。"
                         )
                         confirm_yahoo = st.checkbox("内容を確認した（本番へのアップロードを許可）", key="yahoo_api_confirm")
-                        if st.button("📤 Yahoo APIへアップロード", type="primary", disabled=not confirm_yahoo, key="yahoo_api_upload_btn"):
+
+                        # 失敗分だけの再送信（前回失敗があれば表示）。成功済み分は再送しない。
+                        _failed_paths = st.session_state.get('yahoo_upload_failed_paths', [])
+                        retry_failed_only = False
+                        if _failed_paths:
+                            st.warning(f"前回の失敗分が {len(_failed_paths)}件 残っています。")
+                            retry_failed_only = st.checkbox(
+                                f"❌ 失敗した{len(_failed_paths)}件だけ再送信する（成功済み分は送らない）",
+                                key="yahoo_retry_failed_only",
+                            )
+
+                        upload_clicked = st.button(
+                            "📤 Yahoo APIへアップロード", type="primary",
+                            disabled=not confirm_yahoo, key="yahoo_api_upload_btn",
+                        )
+                        if upload_clicked:
                             tok = get_yahoo_access_token()
                             if not tok['success']:
                                 st.error(f"❌ アクセストークン取得失敗: {tok['error']}")
                             else:
                                 access_token = tok['access_token']
+                                target_paths = _failed_paths if retry_failed_only else zip_paths
                                 progress = st.progress(0.0)
                                 status = st.empty()
                                 upload_logs = []
                                 success_cnt = 0
-                                _total_zip = len(zip_paths)
-                                for i, zpath in enumerate(zip_paths):
+                                newly_failed_paths = []
+                                _total_zip = len(target_paths)
+                                _zipmod = get_zipfile()
+                                # レート制限: 画像 10,000枚/1時間（仕様）。直近1時間の送信枚数を持ち、超えそうなら
+                                # 古い送信が窓から外れるまで待つ（1ZIP≒80商品×3枚=240枚 → 実効 約40ZIP/時）。
+                                # 加えてZIP間は最低1秒空ける（無間隔連射がAPI側の接続遮断を誘発した実績）。
+                                _sent_window = []  # (送信時刻, 画像枚数)
+                                PUBLISH_EVERY = 30  # 成功30ZIPごとに全反映予約（反映しないと商品ページが出ない）
+                                for i, zpath in enumerate(target_paths):
+                                    if i > 0:
+                                        time.sleep(1.0)
                                     fname = _os.path.basename(zpath)
-                                    status.text(f"Yahoo APIアップロード中... {fname} ({i+1}/{_total_zip})")
-                                    progress.progress((i + 1) / _total_zip)
                                     try:
                                         with open(zpath, 'rb') as _zf_in:
                                             zip_data = _zf_in.read()
+                                        with _zipmod.ZipFile(zpath) as _zchk:
+                                            n_images = len(_zchk.namelist())
                                     except FileNotFoundError:
                                         upload_logs.append(f"❌ {fname}: ファイルが見つかりません（再生成してください）")
+                                        newly_failed_paths.append(zpath)
                                         continue
-                                    res = upload_to_yahoo_api(zip_data, access_token, fname)
+                                    while True:
+                                        _now = time.monotonic()
+                                        _sent_window = [(t, n) for t, n in _sent_window if _now - t < 3600]
+                                        _in_window = sum(n for _, n in _sent_window)
+                                        if _in_window + n_images <= YAHOO_IMAGES_PER_HOUR_SAFE or not _sent_window:
+                                            break
+                                        _wait = int(3600 - (_now - _sent_window[0][0])) + 1
+                                        status.text(f"上限(画像{YAHOO_IMAGES_PER_HOUR:,}枚/時)待ち... 直近1時間 {_in_window:,}枚 → {_wait}秒待機 ({fname})")
+                                        time.sleep(min(_wait, 60))
+                                    status.text(f"Yahoo APIアップロード中... {fname} ({i+1}/{_total_zip})")
+                                    progress.progress((i + 1) / _total_zip)
+                                    res = upload_to_yahoo_api_with_retry(zip_data, access_token, fname)
                                     del zip_data
                                     if res['success']:
                                         success_cnt += 1
+                                        _sent_window.append((time.monotonic(), n_images))
                                         upload_logs.append(f"✅ {fname}: 成功")
+                                        if success_cnt % PUBLISH_EVERY == 0:
+                                            _pub = reserve_publish_yahoo(access_token)
+                                            upload_logs.append(
+                                                f"🔄 全反映予約({success_cnt}件時点): "
+                                                + (f"OK {_pub.get('reserve_time') or _pub.get('note', '')}" if _pub['success'] else f"NG {_pub['error']}")
+                                            )
                                     else:
                                         upload_logs.append(f"❌ {fname}: {res['error']}")
+                                        newly_failed_paths.append(zpath)
                                 progress.empty()
                                 status.empty()
+                                st.session_state['yahoo_upload_failed_paths'] = newly_failed_paths
+                                # 画像アップロードだけでは商品ページがフロントに出ないため、最後に全反映予約を掛ける
+                                _pub_final = None
+                                if success_cnt:
+                                    _pub_final = reserve_publish_yahoo(access_token)
+                                    upload_logs.append(
+                                        "🔄 全反映予約(終了時): "
+                                        + (f"OK {_pub_final.get('reserve_time') or _pub_final.get('note', '')}" if _pub_final['success'] else f"NG {_pub_final['error']}")
+                                    )
                                 if success_cnt == _total_zip:
                                     st.success(
                                         f"✅ 全{_total_zip}件のZIPアップロード成功！ "
-                                        "ストアクリエイターPro > 反映管理 で確認してください。"
+                                        + ("全反映予約済み（反映完了後に商品ページへ表示）。" if _pub_final and _pub_final['success']
+                                           else "⚠️ 全反映予約に失敗したため、ストアクリエイターPro > 反映管理 で手動反映してください。")
                                     )
                                 else:
                                     st.error(f"⚠️ {success_cnt}/{_total_zip}件成功。失敗があります（下記ログ参照）。")
