@@ -68,6 +68,7 @@ manga-trend-radar/cost_log.json
 
 # ops-watch: 生きたWebhook+APIキーを含むためコミットしない（config.example.jsonを参照）
 ops-watch/config.json
+ops-watch/config.json.bak*
 
 # morning-startup: Windows固有のショートカットバックアップ（機械依存ゴミ）
 morning-startup/*.lnk.bak
