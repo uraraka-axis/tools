@@ -81,11 +81,12 @@
     border-radius: 50%;
     box-shadow: 0 6px 18px rgba(0, 0, 0, 0.12);
   }
-  .btn-sub {
-    width: min(19vw, 20dvh, 150px);
-  }
   .btn-main {
-    width: min(28vw, 29dvh, 220px);
+    width: min(23vw, 24dvh, 185px);
+  }
+  .btn-sub {
+    /* btn-main の80% */
+    width: min(18.4vw, 19.2dvh, 148px);
   }
   /* 横向き（landscape）でもバランスを保つ */
   @media (orientation: landscape) {
@@ -106,9 +107,6 @@
   </div>
 
   <nav class="menu" aria-label="メニュー">
-    <a href="https://www.nagasaki-np.co.jp/" class="btn-sub" id="btn-past">
-      <img src="images/past-np.png?v=20260821b" alt="過去の紙面を読む">
-    </a>
     <a href="https://www.nagasaki-np.co.jp/" class="btn-main" id="btn-today">
       <img src="images/today-np.png?v=20260821b" alt="今日の紙面を読む">
     </a>
