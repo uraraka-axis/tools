@@ -174,6 +174,8 @@ TYPE_FOLDER_CONFIG = {
     "yoyaku": {"parent_path": "/comic/comic-yoyaku", "subfolder_prefix": "予約"},
 }
 RAKUTEN_FOLDER_LIMIT = 2000
+# R-Cabinet画像の公開URLベース（{FolderPath(ディレクトリパス)}/{filePath} を連結すると実URLになる）
+RCABINET_IMAGE_BASE = "https://image.rakuten.co.jp/haru-uraraka/cabinet"
 GITHUB_COMIC_LIST_PATH = "comic-lister/data/comic_list.csv"
 GITHUB_FOLDER_HIERARCHY_PATH = "comic-lister/data/folder_hierarchy.xlsx"
 
@@ -617,10 +619,13 @@ def upsert_uploaded_images_to_mirror(uploaded: list) -> dict:
 
     出品コックピットの「画像あり」判定は本ミラーを参照しており、従来は翌日の
     Daily R-Cabinet Syncまで新規アップ分が「なし」と出る時差があった。その解消用。
-    file_url / file_size / file_timestamp は仮値で入れ、次回の日次同期
+    file_size / file_timestamp は仮値で入れ、次回の日次同期
     （sync_images_to_db。timestamp差分で必ず上書き対象になる）が正しい値に直す。
+    file_url は呼び出し元が構築できる場合は実URLを渡すこと（空のままだと
+    ヤフーZIP生成の既存画像取得で対象外＝「画像未取得」になり、次の日次同期
+    （月水金 朝8時）まで取得できない）。
 
-    uploaded: [{"folder_name":..., "file_name":..., "folder_path":...}, ...]
+    uploaded: [{"folder_name":..., "file_name":..., "folder_path":..., "file_url":...(任意)}, ...]
     失敗しても呼び出し元の処理は止めないこと（戻り値dictで結果を返すのみ）。
     """
     supabase = get_supabase_client()
@@ -640,7 +645,7 @@ def upsert_uploaded_images_to_mirror(uploaded: list) -> dict:
                 "folder_name": folder_name,
                 "file_name": file_name,
                 "folder_path": u.get("folder_path", ""),
-                "file_url": "",
+                "file_url": u.get("file_url", "") or "",
                 "file_size": 0,
                 "file_timestamp": ts,
             })
@@ -2999,16 +3004,22 @@ def reserve_publish_yahoo(access_token):
     別途反映処理が必要です」）。ストアクリエイターPro > 反映管理 で「はい」を押すのと同じことをAPIで行う。
     mode=1・reserve_time省略=現在時刻で予約（システムが空いていれば即反映、混雑時は遅延）。
     未反映項目が無い場合は pm-05001 が返るが、反映不要なので成功扱いにする。
+    直前ZIPの反映中は ed-00006 で弾かれる（2026-08-29に発生）ため、15秒×最大8回待って再試行する。
     """
-    try:
-        response = requests.post(
-            YAHOO_PUBLISH_URL,
-            headers={"Authorization": f"Bearer {access_token}"},
-            data={"seller_id": YAHOO_SELLER_ID, "mode": "1"},
-            timeout=60,
-        )
-    except requests.exceptions.RequestException as e:
-        return {"success": False, "error": f"接続エラー: {str(e)}"}
+    for attempt in range(8):
+        try:
+            response = requests.post(
+                YAHOO_PUBLISH_URL,
+                headers={"Authorization": f"Bearer {access_token}"},
+                data={"seller_id": YAHOO_SELLER_ID, "mode": "1"},
+                timeout=60,
+            )
+        except requests.exceptions.RequestException as e:
+            return {"success": False, "error": f"接続エラー: {str(e)}"}
+        if 'ed-00006' in response.text and attempt < 7:
+            time.sleep(15)
+            continue
+        break
     if 'pm-05001' in response.text:
         return {"success": True, "reserve_time": "", "note": "未反映項目なし"}
     if response.status_code != 200:
@@ -5085,6 +5096,12 @@ if mode == "🎨 クリエイティブスタジオ":
                                 f.get('FolderName'): f.get('FolderId')
                                 for f in st.session_state.workflow_data['rakuten_folders']
                             }
+                            # 既存フォルダ名 → ディレクトリパス（画像実URLの構築用）
+                            folder_dir_by_name = {
+                                f.get('FolderName'): f.get('FolderPath')
+                                for f in st.session_state.workflow_data['rakuten_folders']
+                                if f.get('FolderPath')
+                            }
 
                             progress = st.progress(0.0)
                             status = st.empty()
@@ -5102,6 +5119,8 @@ if mode == "🎨 クリエイティブスタジオ":
                                     new_id = res.get('folder_id')
                                     created_folders[c['folder_name']] = new_id
                                     folder_id_by_name[c['folder_name']] = new_id
+                                    if c.get('directory_name'):
+                                        folder_dir_by_name[c['folder_name']] = f"{c['parent_path']}/{c['directory_name']}"
                                     log_lines.append(f"✅ フォルダ作成: {c['parent_path']}/{c['folder_name']} (id={new_id})")
                                 else:
                                     err_msg = res.get('error', '不明なエラー')
@@ -5138,12 +5157,22 @@ if mode == "🎨 クリエイティブスタジオ":
                             # ミラーDB（rcabinet_images）へ即時反映（アップロード成功分のみ）。
                             # 出品コックピットの「画像あり」判定が翌日の日次同期を待たずに緑になる
                             _mirror_failed = set(f['comic_no'] for f in upload_failed)
-                            _mirror_rows = [
-                                {"folder_name": p['target_folder_name'],
-                                 "file_name": p['file_name'],
-                                 "folder_path": f"{p['parent_path']}/{p['target_folder_name']}"}
-                                for p in plan_result['plan'] if p['comic_no'] not in _mirror_failed
-                            ]
+                            _mirror_rows = []
+                            for p in plan_result['plan']:
+                                if p['comic_no'] in _mirror_failed:
+                                    continue
+                                # ディレクトリパスが分かる場合は実URLも登録する。
+                                # 空のままだと次の日次同期までヤフーZIPの既存画像取得で「画像未取得」になるため
+                                _dir_path = folder_dir_by_name.get(p['target_folder_name'])
+                                _file_url = ""
+                                if _dir_path and p.get('file_path_name'):
+                                    _file_url = f"{RCABINET_IMAGE_BASE}{_dir_path}/{p['file_path_name']}"
+                                _mirror_rows.append({
+                                    "folder_name": p['target_folder_name'],
+                                    "file_name": p['file_name'],
+                                    "folder_path": _dir_path or f"{p['parent_path']}/{p['target_folder_name']}",
+                                    "file_url": _file_url,
+                                })
                             if _mirror_rows:
                                 _mirror_result = upsert_uploaded_images_to_mirror(_mirror_rows)
                                 if _mirror_result.get("success"):
@@ -5323,6 +5352,30 @@ if mode == "🎨 クリエイティブスタジオ":
                     existing_available[cno] = r
                 available_comic_nos = missing_comic_nos | set(existing_available.keys())
 
+                # 「存在あり」なのに取得対象外となるコミックNoの内訳（事前に警告表示する）
+                # ・URL未確定: 直近アップロード分のさきがけ登録（次の日次同期=月水金 朝8時でURLが入る）
+                # ・RECのみ: RECフォルダにしか存在しない
+                _exist_rows_by_cno = {}
+                for r in check_results:
+                    if r.get('存在') != '✅ あり':
+                        continue
+                    _c = str(r.get('コミックNo', '')).strip()
+                    if _c:
+                        _exist_rows_by_cno.setdefault(_c, []).append(r)
+                unavailable_nourl = []
+                unavailable_rec = []
+                for _c, _rows in _exist_rows_by_cno.items():
+                    if _c in available_comic_nos:
+                        continue
+                    _has_nourl = any(
+                        'REC' not in ((r.get('フォルダ', '') or '').upper())
+                        and (not r.get('URL') or r.get('URL') == '-')
+                        for r in _rows
+                    )
+                    _row0 = _rows[0]
+                    _info = {'コミックNo': _c, 'フォルダ': _row0.get('フォルダ', ''), '種別': _row0.get('種別', '')}
+                    (unavailable_nourl if _has_nourl else unavailable_rec).append(_info)
+
                 # プレビュー（どちらの読み込み方法でも共通）
                 def _preview_rows(df, col_idx):
                     rows = []
@@ -5356,6 +5409,22 @@ if mode == "🎨 クリエイティブスタジオ":
                         st.caption(
                             f"検索対象の画像: 不足取得済 {len(missing_comic_nos)}件 / 既存取得可 {len(existing_available)}件"
                         )
+
+                if unavailable_nourl or unavailable_rec:
+                    st.warning(
+                        f"⚠️ R-Cabinetに存在するが取得対象外: {len(unavailable_nourl) + len(unavailable_rec)}件"
+                        f"（URL未確定=アップロード直後・日次同期待ち: {len(unavailable_nourl)}件 / "
+                        f"RECフォルダのみ: {len(unavailable_rec)}件）。"
+                        "このままZIP生成すると該当商品は「画像未取得」になります。"
+                        "URL未確定分は日次同期（月・水・金 朝8時）の後にStep①からやり直すと取得できます。"
+                    )
+                    with st.expander("取得対象外の一覧", expanded=False):
+                        if unavailable_nourl:
+                            st.markdown(f"**URL未確定（日次同期待ち）: {len(unavailable_nourl)}件**")
+                            st.dataframe(pd.DataFrame(unavailable_nourl), use_container_width=True, height=150)
+                        if unavailable_rec:
+                            st.markdown(f"**RECフォルダのみ: {len(unavailable_rec)}件**")
+                            st.dataframe(pd.DataFrame(unavailable_rec), use_container_width=True, height=150)
 
                 # 追加画像（_1=透明カバー / _2=セット表記）は商品単位で出品シートの不要欄により制御
                 # （セット品/予約=AG/AH列, 単品=AB/AC列。不要欄に値があれば付けない／空なら付ける）
