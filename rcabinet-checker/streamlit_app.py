@@ -2284,7 +2284,7 @@ def prepare_yahoo_zips(get_image, excel_set_df, excel_tanpin_df, excel_yoyaku_df
 
     追加画像（_1=透明カバー / _2=セット表記）の付与は商品単位で出品シートの「不要欄」で制御:
       - セット品/予約: AG列(32)=不要:透明カバー(_1) / AH列(33)=不要:セット表記(_2)
-      - 単品:          AB列(27)=不要:透明カバー(_1) / AC列(28)=不要:セット表記(_2)
+      - 単品:          セット表記は付けない。透明カバーは「透明カバー」ヘッダー列がある場合のみ不要欄で制御
       不要欄に値（〇等）が入っていれば付けない／空なら付ける。
 
     Args:
@@ -2367,15 +2367,18 @@ def prepare_yahoo_zips(get_image, excel_set_df, excel_tanpin_df, excel_yoyaku_df
                         'code': product_code,
                         'type': type_label,
                         'add_1': not _has_mark(i, skip1_col),  # 不要欄に値→付けない
-                        'add_2': not _has_mark(i, skip2_col),
+                        # 単品はセット表記を付けない（コミック画像＋透明カバーの2枚）
+                        'add_2': type_label != 'tanpin' and not _has_mark(i, skip2_col),
                     })
             except:
                 continue
 
     # 不要欄はヘッダー名で自動検出。検出できない場合のデフォルト列:
-    #   セット品/予約=AG(32)/AH(33) ／ 単品=AB(27)/AC(28)。コミックNoはセット/予約=D(3)・単品=E(4)
+    #   セット品/予約=AG(32)/AH(33) ／ 単品=なし（常に透明カバーを付ける）。コミックNoはセット/予約=D(3)・単品=E(4)
+    #   単品のデフォルトAB/ACは、TP出品データ等でAB=楽天画像ディレクトリ3（全行値あり）になり
+    #   透明カバーが全件「不要」扱いされる事故が起きたため廃止（2026-11-02）
     _build_mapping(excel_set_df, 3, 'set', 32, 33)
-    _build_mapping(excel_tanpin_df, 4, 'tanpin', 27, 28)
+    _build_mapping(excel_tanpin_df, 4, 'tanpin', None, None)
     _build_mapping(excel_yoyaku_df, 3, 'yoyaku', 32, 33)
 
     # 店舗プロファイル（省略時は従来動作＝1プロファイル）
@@ -5427,11 +5430,12 @@ if mode == "🎨 クリエイティブスタジオ":
                             st.dataframe(pd.DataFrame(unavailable_rec), use_container_width=True, height=150)
 
                 # 追加画像（_1=透明カバー / _2=セット表記）は商品単位で出品シートの不要欄により制御
-                # （セット品/予約=AG/AH列, 単品=AB/AC列。不要欄に値があれば付けない／空なら付ける）
+                # （セット品/予約=AG/AH列。単品はセット表記なし・透明カバーのみ）
                 st.divider()
                 st.caption(
                     "追加画像は商品単位で出品シートの不要欄で制御します"
-                    "（セット品/予約=AG・AH列、単品=AB・AC列。〇等の値があれば付けない／空なら付ける）。"
+                    "（セット品/予約=AG・AH列。〇等の値があれば付けない／空なら付ける）。"
+                    "単品はコミック画像＋透明カバーの2枚です（セット表記は付けません）。"
                 )
 
                 # ZIP生成ボタン
