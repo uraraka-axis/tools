@@ -21,6 +21,9 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
 BASE_URL = "https://api.rms.rakuten.co.jp/es/1.0"
 
+# 既存件数に対する削除割合がこれを超えたら同期を中止する
+MASS_DELETE_RATIO = 0.3
+
 # 同期対象のルートパス prefix（この配下のフォルダ・サブフォルダのみ同期対象）
 # 3階層目の連番フォルダ（例: comic-set-set10, dvdblu-dvdblu2 等）は自動で含まれる
 ALLOWED_ROOT_PREFIXES = [
@@ -50,8 +53,40 @@ def get_auth_header():
     return {"Authorization": auth_string}
 
 
+class RmsApiError(Exception):
+    """R-Cabinet APIがリトライ後も失敗した（取得結果が不完全）"""
+
+
+def _rms_get(url: str, params: dict, tries: int = 4, delay: int = 10):
+    """R-Cabinet API GET（リトライ付き）。成功時はXMLルートを返し、失敗時は RmsApiError。
+
+    【2026-11-13障害の教訓】folders/get の5ページ目が 503 SystemError(107) を返した際、
+    旧実装は途中までのフォルダ一覧を「全量」として返し、同期で DB から 99,053件を削除した。
+    取得が不完全なまま同期へ進むことは絶対にしない（失敗は例外で main を止める）。
+    """
+    last = ""
+    for attempt in range(tries):
+        try:
+            response = requests.get(url, headers=get_auth_header(), params=params, timeout=60)
+            if response.status_code == 200:
+                root = ET.fromstring(response.content)
+                status = root.find(".//resultCode")
+                # R-Cabinet APIでは resultCode=0 が成功
+                if status is not None and status.text in ["0", "N000"]:
+                    return root
+                last = f"resultCode={status.text if status is not None else 'None'}"
+            else:
+                last = f"HTTP {response.status_code}: {response.text[:300]}"
+        except Exception as e:
+            last = f"{type(e).__name__}: {e}"
+        print(f"  API失敗({attempt + 1}/{tries}) {params}: {last}")
+        if attempt < tries - 1:
+            time.sleep(delay * (attempt + 1))
+    raise RmsApiError(f"{url} {params}: {last}")
+
+
 def get_all_folders():
-    """全フォルダ一覧を取得"""
+    """全フォルダ一覧を取得（失敗時は RmsApiError）"""
     all_folders = []
     page = 1
 
@@ -60,21 +95,7 @@ def get_all_folders():
         params = {"limit": 100, "offset": page}
 
         print(f"  API Request: {url} (page={page})")
-        response = requests.get(url, headers=get_auth_header(), params=params)
-        print(f"  Response status: {response.status_code}")
-
-        if response.status_code != 200:
-            print(f"Error: {response.status_code}")
-            print(f"Response: {response.text[:500]}")
-            return all_folders
-
-        root = ET.fromstring(response.content)
-        status = root.find(".//resultCode")
-        print(f"  Result code: {status.text if status is not None else 'None'}")
-        # R-Cabinet APIでは resultCode=0 が成功
-        if status is None or status.text not in ["0", "N000"]:
-            print(f"  API Error: {status.text if status else 'None'}")
-            break
+        root = _rms_get(url, params)
 
         folders = root.findall(".//folder")
         if not folders:
@@ -101,7 +122,7 @@ def get_all_folders():
 
 
 def get_folder_files(folder_id: int):
-    """フォルダ内のファイル一覧を取得"""
+    """フォルダ内のファイル一覧を取得（失敗時は RmsApiError）"""
     all_files = []
     offset = 1
 
@@ -109,16 +130,7 @@ def get_folder_files(folder_id: int):
         url = f"{BASE_URL}/cabinet/folder/files/get"
         params = {"folderId": folder_id, "limit": 100, "offset": offset}
 
-        response = requests.get(url, headers=get_auth_header(), params=params)
-
-        if response.status_code != 200:
-            return all_files
-
-        root = ET.fromstring(response.content)
-        status = root.find(".//resultCode")
-        # R-Cabinet APIでは resultCode=0 が成功
-        if status is None or status.text not in ["0", "N000"]:
-            break
+        root = _rms_get(url, params)
 
         files = root.findall(".//file")
         if not files:
@@ -235,6 +247,18 @@ def sync_images_to_db(supabase: Client, images: list) -> dict:
         deleted_keys = set(existing_dict.keys()) - set(records_dict.keys())
         deleted_count = len(deleted_keys)
 
+        # 大量削除の安全弁: 既存の一定割合を超える削除は取得漏れの疑いが強いので止める。
+        # （2026-07-10の家具整理は約22%で正当な削除。意図的な大量削除時は
+        #   環境変数 ALLOW_MASS_DELETE=1 で解除する）
+        if (existing_dict and deleted_count > len(existing_dict) * MASS_DELETE_RATIO
+                and os.environ.get("ALLOW_MASS_DELETE") != "1"):
+            return {
+                "success": False,
+                "error": (f"削除予定 {deleted_count}件 が既存 {len(existing_dict)}件 の"
+                          f"{int(MASS_DELETE_RATIO * 100)}%を超えたため中止（取得漏れの疑い）。"
+                          "意図的な削除なら ALLOW_MASS_DELETE=1 で再実行"),
+            }
+
         # ファイル名重複（複数フォルダに同名）件数
         from collections import Counter
         name_counter = Counter(file_name for _folder, file_name in records_dict.keys())
@@ -323,7 +347,11 @@ def main():
     # フォルダ一覧取得
     print("Fetching folders...")
     print(f"Allowed root prefixes: {ALLOWED_ROOT_PREFIXES}")
-    folders = get_all_folders()
+    try:
+        folders = get_all_folders()
+    except RmsApiError as e:
+        print(f"Error: フォルダ一覧の取得に失敗したため同期を中止（DBは変更していません）: {e}")
+        sys.exit(1)
     print(f"Found {len(folders)} target folders (filtered)")
 
     if not folders:
@@ -335,7 +363,11 @@ def main():
     all_files = []
     for i, folder in enumerate(folders):
         print(f"  [{i+1}/{len(folders)}] {folder['FolderName']} ({folder['FileCount']} files)")
-        files = get_folder_files(int(folder['FolderId']))
+        try:
+            files = get_folder_files(int(folder['FolderId']))
+        except RmsApiError as e:
+            print(f"Error: ファイル一覧の取得に失敗したため同期を中止（DBは変更していません）: {e}")
+            sys.exit(1)
         for f in files:
             f['FolderName'] = folder['FolderName']
             f['FolderPath'] = folder.get('FolderPath', '')
