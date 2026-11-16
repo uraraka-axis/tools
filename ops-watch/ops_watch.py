@@ -168,7 +168,9 @@ def check_target(target, info, defaults, now):
 
     if target.get("log_dir") or target.get("log_file"):
         _, log_mtime = latest_log(target)
-        if log_mtime is not None and log_mtime < last_run - dt.timedelta(minutes=30):
+        # 同日に先行ランのログがあれば許容（例: EssenceMallはログオン時に完走→定時ランは当日実行済みガードでログなし終了）
+        if (log_mtime is not None and log_mtime < last_run - dt.timedelta(minutes=30)
+                and log_mtime.date() != last_run.date()):
             details.append("タスクは %s に走ったがログが更新されていない（最新ログ %s）"
                            % (info["last_run"], log_mtime.strftime("%m/%d %H:%M")))
         details.extend(check_log_content(target, defaults, now))
